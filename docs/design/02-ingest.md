@@ -102,6 +102,10 @@ interval; values below ~5 ms defeat batching entirely.
 | SFTP | Host + path + optional name regex. |
 | HTTP(S) | A URL or a list of URLs. |
 
+Of these, the shipped implementation resolves local paths, directories, globs
+and single-file gzip/bzip2 streams; the remote and nested-archive adapters are
+not built yet ([12-implementation.md §6.3](12-implementation.md)).
+
 Unpacking flattens into a working directory where each extracted file's name
 is prefixed with a short hash of its full original path, so `node1/server.log`
 and `node2/server.log` survive together. The original path is retained as the
@@ -310,6 +314,8 @@ The write client is one per process, shared across shards.
 - **Retry**: exponential backoff with jitter on connection errors, `429`, `503`
   and `504`; honours `Retry-After`. Retries are safe because of the idempotency
   key and the content-addressed row keys.
+- **Checkpoint advance**: acknowledgement is per flush rather than per stream
+  ([12-implementation.md §6.7](12-implementation.md)).
 - **Fatal errors** (`400` schema violation, `401`/`403`, `413` too large,
   `422` unknown set with `strict_sets` on) are counted, logged with the first
   offending sample, and *dropped* — the batch is not retried, because retrying

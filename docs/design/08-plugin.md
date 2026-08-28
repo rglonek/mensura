@@ -99,7 +99,9 @@ do not have to change later.
 
 The editor has two modes with a toggle, exactly like Grafana's own Prometheus
 and Loki editors, and — the point of §1 of [06-query.md](06-query.md) — the
-toggle is never disabled.
+toggle is never disabled. The backend and its `CallResource` endpoints are
+implemented; the React editor is not yet built
+([12-implementation.md §5](12-implementation.md)).
 
 ### 3.1 Builder mode
 

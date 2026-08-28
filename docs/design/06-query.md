@@ -228,10 +228,13 @@ FORMAT heatmap
 
 `HISTOGRAM(name)` expands to the bucket-set's member fields, sums counts per
 bucket per window, and emits a heatmap frame with real numeric bucket edges
-from the declaration. Grouping by a label yields one heatmap per group, so
+from the declaration. Bucket counts are reduced by **sum**, not by the min/max
+walk: a line asks what the extreme was, a heatmap column asks how many fell in
+the bucket ([12-implementation.md §6.4](12-implementation.md)). Grouping by a label yields one heatmap per group, so
 "per host" is a `BY` clause rather than a feature request.
 
-With `FORMAT timeseries`, `HISTOGRAM(hdr24) PERCENTILE 99` emits an estimated
+With `FORMAT timeseries`, `HISTOGRAM(hdr24) PERCENTILE 99` (planned for M5,
+not yet implemented) emits an estimated
 p99 series computed from the cumulative buckets (linear interpolation within
 the containing bucket, edges from the declaration). The estimate's error bound
 is a function of bucket width and is reported in the frame's metadata rather

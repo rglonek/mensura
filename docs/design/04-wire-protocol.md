@@ -29,7 +29,7 @@ write client refuses to start against a store with an incompatible major.
 | Mechanism | Use |
 | --- | --- |
 | Bearer token | Default. A shared secret per client, configured on the store as a list of `{name, hash, scopes}`. Compared in constant time. |
-| mTLS | Preferred for production. Client certificate subject/SAN maps to a client name and scopes via a configured mapping. |
+| mTLS | Preferred for production. Client certificate subject/SAN maps to a client name and scopes via a configured mapping. Not implemented yet — [12-implementation.md §6.2](12-implementation.md). |
 | None | Only permitted when the listener is bound to loopback, and even then it must be explicitly enabled (`auth: none`). Refusing to start otherwise is deliberate. |
 
 Scopes: `write`, `query`, `admin`. Tokens are never logged; the store logs the
@@ -48,7 +48,9 @@ X-Mensura-Client: web1-nginx
 Authorization: Bearer …
 ```
 
-Body (protobuf; the NDJSON form is field-for-field identical):
+Body (protobuf; the NDJSON form is field-for-field identical). The shipped
+implementation speaks the JSON form with gzip — see
+[12-implementation.md §6.1](12-implementation.md):
 
 ```protobuf
 message WriteRequest {
@@ -100,7 +102,8 @@ Notes:
   is reported in `rejected[]`; the accepted remainder is committed.
 - `200` with `duplicate: true` — this `Idempotency-Key` was already committed;
   nothing was written. Keys are remembered for `idempotency_window` (default
-  10 min) in a bounded LRU.
+  10 min) in a bounded LRU. (The shipped bound is on entry count rather than on age —
+[12-implementation.md §6.9](12-implementation.md).)
 - `400` — malformed body, unknown field, bad timestamp.
 - `401`/`403` — auth.
 - `413` — too large.

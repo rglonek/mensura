@@ -73,6 +73,7 @@ flowchart LR
 | 09 | [Operations](09-operations.md) | Configuration, deployment, sizing, security, observability, failure modes |
 | 10 | [Decisions](10-decisions.md) | ADR-style record of the choices, with the alternatives that were rejected |
 | 11 | [Roadmap](11-roadmap.md) | Milestones, test strategy, open questions |
+| 12 | [Implementation](12-implementation.md) | Repository layout, build and run, test coverage, implementation status, and every knowing divergence from documents 01–11 |
 
 ---
 

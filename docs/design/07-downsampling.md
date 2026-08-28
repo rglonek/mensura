@@ -133,7 +133,10 @@ declares how to synthesise its neighbours at ±500 ms:
 | `OFF` | no padding; the single mark stands alone |
 
 ±500 ms is a rendering choice: long enough to be visible at any realistic zoom,
-short enough not to mislead about when the event occurred. The padding points
+short enough not to mislead about when the event occurred. In-window padding
+clamps the offset into the space actually available, because gap detection
+injects its null at `ts − 1` and a flat −500 ms point would land on the far
+side of it and break C1 ([12-implementation.md §6.5](12-implementation.md)). The padding points
 are synthetic by construction (a declared constant or a repeat), never mistaken
 for independent measurements.
 
