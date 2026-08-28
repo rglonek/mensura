@@ -1,0 +1,30 @@
+# Grafana datasource provisioning for Mensura.
+#
+# Embedded topology: Grafana launches the backend, which opens the data
+# directory itself and also serves the write API for ingest. Exactly one
+# process may own a data directory — do not also run a standalone
+# `mensura-store --mode=server` over the same path.
+apiVersion: 1
+
+datasources:
+  - name: Mensura
+    type: mensura-datasource
+    uid: mensura
+    access: proxy
+    isDefault: true
+    jsonData:
+      mode: embedded
+      dataDir: /var/lib/mensura
+      writeListen: 127.0.0.1:9631
+
+  # Standalone topology: the store outlives Grafana and may serve several of
+  # them. The backend runs with no engine and forwards MQL over the query API.
+  # - name: Mensura (remote)
+  #   type: mensura-datasource
+  #   uid: mensura-remote
+  #   access: proxy
+  #   jsonData:
+  #     mode: proxy
+  #     storeURL: https://store.internal:9631
+  #   secureJsonData:
+  #     token: $MENSURA_STORE_TOKEN

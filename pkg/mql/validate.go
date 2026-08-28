@@ -1,0 +1,223 @@
+package mql
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/rglonek/mensura/pkg/model"
+)
+
+// Diag is one diagnostic. Codes are stable so they can be searched for and
+// asserted on; see docs/design/06-query.md section 12.
+type Diag struct {
+	Code string `json:"code"`
+	Msg  string `json:"message"`
+}
+
+func (d Diag) Error() string { return d.Code + ": " + d.Msg }
+
+// FieldInfo is what the catalogue knows about a field. The validator uses
+// it to reject nonsensical modifiers and to warn about the two classic
+// wrong graphs: a counter plotted raw, and an outage drawn as a line.
+type FieldInfo struct {
+	Kind        model.Kind `json:"kind"`
+	Unit        string     `json:"unit,omitempty"`
+	UnitHint    string     `json:"unit_hint,omitempty"`
+	Description string     `json:"description,omitempty"`
+	MaxInterval int64      `json:"max_interval_ms,omitempty"`
+	LimitMin    *float64   `json:"limit_min,omitempty"`
+	LimitMax    *float64   `json:"limit_max,omitempty"`
+	BucketSet   string     `json:"bucket_set,omitempty"`
+	BucketIndex int        `json:"bucket_index,omitempty"`
+	BucketEdge  float64    `json:"bucket_edge,omitempty"`
+	Stale       bool       `json:"stale,omitempty"`
+}
+
+// Schema is the slice of the catalogue the validator needs. The store
+// implements it; tests implement it in a dozen lines.
+type Schema interface {
+	HasSet(set string) bool
+	Sets() []string
+	Field(set, field string) (FieldInfo, bool)
+	HasLabel(set, key string) bool
+	BucketSet(set, name string) ([]string, bool)
+}
+
+// Validate checks a query against the catalogue. Errors make the query
+// unrunnable; warnings travel with the results.
+func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
+	var warns []Diag
+
+	if q.Kind == KindSets {
+		return nil, nil
+	}
+	if q.Kind == KindLabels {
+		return nil, nil
+	}
+	if q.From == "" {
+		return nil, Diag{"E002", "query has no FROM set"}
+	}
+	if s != nil && !s.HasSet(q.From) {
+		return nil, Diag{"E002", fmt.Sprintf("unknown set %q; known sets: %s", q.From, strings.Join(s.Sets(), ", "))}
+	}
+	if q.Kind == KindFields || q.Kind == KindLabelKeys {
+		return nil, nil
+	}
+	if len(q.Select) == 0 {
+		return nil, Diag{"E001", "query selects no fields"}
+	}
+
+	names := map[string]bool{}
+	for _, fe := range q.Select {
+		if names[fe.Name()] {
+			return nil, Diag{"E006", fmt.Sprintf("two selected fields share the display name %q", fe.Name())}
+		}
+		names[fe.Name()] = true
+
+		if fe.Histogram != "" {
+			if s != nil {
+				if _, ok := s.BucketSet(q.From, fe.Histogram); !ok {
+					return nil, Diag{"E009", fmt.Sprintf("unknown bucket set %q on set %q", fe.Histogram, q.From)}
+				}
+			}
+			continue
+		}
+		info, known := FieldInfo{}, false
+		if s != nil {
+			info, known = s.Field(q.From, fe.Field)
+		}
+		if s != nil && !known {
+			if fe.Modifiers.Required {
+				return nil, Diag{"E003", fmt.Sprintf("required field %q does not exist on set %q", fe.Field, q.From)}
+			}
+			warns = append(warns, Diag{"W203", fmt.Sprintf("field %q is not in the catalogue for set %q; the series may be empty", fe.Field, q.From)})
+		}
+		if known {
+			if info.Stale {
+				warns = append(warns, Diag{"W203", fmt.Sprintf("field %q has not been seen recently", fe.Field)})
+			}
+			if info.Kind == model.KindString && (fe.Modifiers.Delta || fe.Modifiers.PerSecond || fe.Modifiers.Negate || fe.Modifiers.Clamp != nil) {
+				return nil, Diag{"E005", fmt.Sprintf("field %q is a string field; numeric modifiers do not apply", fe.Field)}
+			}
+			if info.Kind == model.KindCounter && !fe.Modifiers.Delta {
+				warns = append(warns, Diag{"W102", fmt.Sprintf("field %q is a counter and is plotted raw; consider RATE", fe.Field)})
+			}
+			if fe.Modifiers.GapMs == nil && info.MaxInterval == 0 && q.Format == FormatTimeseries {
+				warns = append(warns, Diag{"W103", fmt.Sprintf("field %q has no GAP and no declared cadence; outages will render as continuous lines", fe.Field)})
+			}
+		}
+		if q.Format == FormatTable || q.Format == FormatLogs {
+			m := fe.Modifiers
+			if m.Delta || m.PerSecond || m.Negate || m.GapMs != nil || m.SSE != nil || m.Clamp != nil {
+				return nil, Diag{"E008", fmt.Sprintf("field %q uses timeseries-only modifiers with FORMAT %s", fe.Field, q.Format)}
+			}
+		}
+	}
+
+	if err := validateExpr(q, q.Where, s, &warns); err != nil {
+		return warns, err
+	}
+	for _, l := range q.By {
+		if s != nil && !s.HasLabel(q.From, l) {
+			warns = append(warns, Diag{"W203", fmt.Sprintf("label %q is not present on set %q; every series will share one group", l, q.From)})
+		}
+	}
+	if q.Limits.Series != nil && maxSeries > 0 && *q.Limits.Series > maxSeries {
+		return warns, Diag{"E007", fmt.Sprintf("LIMIT SERIES %d exceeds the datasource maximum of %d", *q.Limits.Series, maxSeries)}
+	}
+	if q.Limits.Points != nil && maxPoints > 0 && *q.Limits.Points > maxPoints {
+		return warns, Diag{"E007", fmt.Sprintf("LIMIT POINTS %d exceeds the datasource maximum of %d", *q.Limits.Points, maxPoints)}
+	}
+	if q.Format == FormatHeatmap {
+		for _, fe := range q.Select {
+			if fe.Histogram == "" {
+				return warns, Diag{"E008", "FORMAT heatmap requires HISTOGRAM(<bucket set>)"}
+			}
+		}
+	}
+	return warns, nil
+}
+
+func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
+	if e.Empty() {
+		return nil
+	}
+	for _, sub := range e.And {
+		if err := validateExpr(q, sub, s, warns); err != nil {
+			return err
+		}
+	}
+	for _, sub := range e.Or {
+		if err := validateExpr(q, sub, s, warns); err != nil {
+			return err
+		}
+	}
+	if e.Not != nil {
+		if err := validateExpr(q, *e.Not, s, warns); err != nil {
+			return err
+		}
+	}
+	check := func(label string) error {
+		if s != nil && !s.HasLabel(q.From, label) {
+			return Diag{"E004", fmt.Sprintf("unknown label %q on set %q", label, q.From)}
+		}
+		return nil
+	}
+	switch {
+	case e.Eq != nil:
+		return check(e.Eq.Label)
+	case e.Ne != nil:
+		return check(e.Ne.Label)
+	case e.In != nil:
+		return check(e.In.Label)
+	case e.Match != nil, e.NoMatch != nil:
+		m := e.Match
+		if m == nil {
+			m = e.NoMatch
+		}
+		if _, err := regexp.Compile(m.Regex); err != nil {
+			return Diag{"E001", fmt.Sprintf("invalid regex /%s/: %v", m.Regex, err)}
+		}
+		return check(m.Label)
+	}
+	return nil
+}
+
+// Variables lists the Grafana variable names a query references, so the
+// plugin can report dependencies without re-walking the AST.
+func Variables(q *Query) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(e Expr)
+	add := func(v string) {
+		if strings.HasPrefix(v, "$") && !seen[v[1:]] {
+			seen[v[1:]] = true
+			out = append(out, v[1:])
+		}
+	}
+	walk = func(e Expr) {
+		for _, s := range e.And {
+			walk(s)
+		}
+		for _, s := range e.Or {
+			walk(s)
+		}
+		if e.Not != nil {
+			walk(*e.Not)
+		}
+		if e.Eq != nil {
+			add(e.Eq.Value)
+		}
+		if e.Ne != nil {
+			add(e.Ne.Value)
+		}
+		if e.In != nil {
+			for _, v := range e.In.Values {
+				add(v)
+			}
+		}
+	}
+	walk(q.Where)
+	return out
+}

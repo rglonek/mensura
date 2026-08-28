@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "datasource",
+  "name": "Mensura",
+  "id": "mensura-datasource",
+  "backend": true,
+  "alerting": true,
+  "metrics": true,
+  "logs": true,
+  "annotations": true,
+  "streaming": false,
+  "executable": "gpx_mensura",
+  "info": {
+    "description": "Correctness-first operational time-series from logs and pushed metrics",
+    "author": { "name": "Mensura" },
+    "version": "%VERSION%",
+    "updated": "%TODAY%"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=11.0.0",
+    "plugins": []
+  }
+}
