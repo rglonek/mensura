@@ -4,9 +4,8 @@
 
 An **extraction spec** is a YAML document that tells `mensura-ingest` how to
 turn text into samples. It is data, not code: the binary contains no knowledge
-of any product's log format. A spec is the generic descendant of AGI's
-`patterns.yml`, with the Aerospike concepts (`clusterName`, `NodeIdent`,
-collectinfo) replaced by declared stream identity and profiles.
+of any product's log format: the format lives in the spec, and the spec is
+supplied by the operator.
 
 One spec file may be shared by many inputs. Specs compose: `include:` pulls in
 other files, so a deployment can keep one `base.yaml` plus one file per log
@@ -60,8 +59,10 @@ ignored or routed to `default_profile:`, and the decision is counted and
 logged — silently dropping unmatched files is the failure mode that wastes an
 afternoon.
 
-This replaces AGI's `genericLogs` mechanism, which overloaded "cluster name" to
-mean "log dialect". Dialect and identity are now separate concepts.
+Dialect (which profile parses this stream) and identity (which labels the
+stream carries) are separate concepts, and conflating them — using the identity
+label to select the parser — is the mistake this two-key design exists to
+prevent.
 
 ## 3. Timestamps
 
@@ -79,7 +80,7 @@ timestamp:
   on_parse_error: count                       # count | drop-stream | fail
 ```
 
-Behaviour, carried from AGI's `lineGetTimestamp` and made explicit:
+Behaviour:
 
 - Formats are tried in order **once**; the index of the first format that
   matched is cached per stream and tried first on every subsequent line, so
@@ -113,7 +114,7 @@ framing:
       idle_timeout: 30s        # follow mode: flush a stuck partial record
 ```
 
-Multiline semantics (from AGI's `multilineJoins`): a line containing
+Multiline semantics: a line containing
 `start_contains` opens (or replaces) a buffered record; subsequent lines
 matching `continue_regex` have the nominated capture group appended; a new
 start line, a timestamp regression, stream close, or `idle_timeout` flushes it.
@@ -139,7 +140,8 @@ labels: [namespace, device, queue, error_class]   # profile-level
 
 Any named capture whose name appears in the profile's `labels:` list (or in a
 pattern's own `labels:`) becomes a label; every other named capture becomes a
-field. This is AGI's rule, kept, because it is simple and it works.
+field. One list, one rule, and it is visible in the spec rather than inferred
+from a value's shape.
 
 Cardinality guard: the store rejects a label whose distinct-value count exceeds
 `max_label_cardinality` (default 100 000 per label), returning `400` with the
@@ -202,21 +204,22 @@ patterns:
     store_stream_label: worker      # attach the stream's ordinal as a field
 ```
 
-Semantics (all carried from AGI, generalised):
+Semantics:
 
 1. `search` is a literal substring used as a prefilter. All `search` strings in
    a profile compile into one Aho-Corasick automaton; the lowest-index pattern
    whose literal appears wins. A pattern with no `search` is always evaluated
    (and is slow — `check` warns).
 2. `replace` runs before extraction, in order, on the record text. This is how
-   irregular shapes are normalised into one regex (AGI used it to turn
-   `migrations: complete` into the same shape as `migrations: remaining …`).
+   irregular shapes are normalised into one regex — for instance rewriting a
+   terse `migration: complete` line into the same shape as the periodic
+   `migration: remaining …` line, so one extraction regex covers both.
 3. `extract` is a list of regexes tried in order; the first with a match wins.
    Named captures become labels or fields per §5. Numeric-looking string
    captures are coerced to integers, then to floats, and left as strings only
    if neither parses.
-4. `route:` (the generalisation of AGI's `exportAdvanced`) lets one pattern
-   fan out to different sets depending on which regex matched:
+4. `route:` lets one pattern fan out to different sets depending on which
+   regex matched:
 
 ```yaml
   - set: hist               # default set
@@ -234,8 +237,9 @@ Semantics (all carried from AGI, generalised):
 
 ## 8. Bucket sets (histograms / heatmaps)
 
-AGI hard-coded 25 HDR buckets and a power-of-two mapping in the plugin.
-Mensura declares them:
+Histogram layouts are declared, not compiled in. A tool that hard-codes "24
+power-of-two buckets" in the query layer cannot render anything else; a
+declaration costs nothing and renders everything:
 
 ```yaml
 bucket_sets:
@@ -257,9 +261,8 @@ Rules:
 - `edges` gives each bucket a numeric lower bound so the plugin can render a
   real heatmap axis instead of an ordinal one. `pow2` means bucket *k* covers
   `[2^(k-2), 2^(k-1))` with the first three buckets mapping to 0/1/2, matching
-  the HDR layout AGI hard-coded — but now it is a declaration, and
-  `explicit:[0,1,2,4,8,…]` is available for anything else.
-- `cumulative: true` reproduces AGI's `<bucket>plus` fields (`03plus` = count of
+  the common HDR-style layout; `explicit:[0,1,2,4,8,…]` covers anything else.
+- `cumulative: true` emits `<bucket>plus` fields (`03plus` = count of
   everything at or above bucket 03), computed at ingest so the query path stays
   a scan.
 - `tail` captures counts beyond the declared buckets.

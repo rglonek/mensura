@@ -33,7 +33,7 @@ next milestone to be useful.
 - `pkg/mql`: lexer, parser, AST, printer, validator, JSON Schema, lints.
 - `CallResource` catalogue endpoints; the visual builder; Monaco code mode with
   completion; `Explain`.
-- AGI dashboard converter.
+- Flag-payload dashboard converter ([06-query.md §10](06-query.md)).
 - **Exit criteria**: `parse(print(ast)) == ast` fuzz test green; a dashboard
   built entirely in the builder with no text editing.
 
@@ -120,8 +120,8 @@ its weaker guarantees asserted as *documented* rather than as *equal* to local.
 
 ### 2.4 Engine
 
-Carry AGI's suite: codec round-trip, index semantics, concurrency, iterator
-close/leak detection, crash-and-reopen, storage-version mismatch. Add:
+Codec round-trip, index semantics, concurrency, iterator close/leak detection,
+crash-and-reopen, storage-version mismatch. Plus:
 shard-routing correctness at boundaries (a sample exactly on a shard edge lands
 in exactly one shard), retention deletion completeness (no `I/` entry survives
 its `D/` pointer), and cross-shard query merge.

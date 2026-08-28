@@ -57,11 +57,10 @@ flowchart TB
   PR["progress tracker"] -. samples .-> BUF
 ```
 
-Stage-by-stage, this is AGI's `init → download → unpack → preprocess →
-dbconnect → processLogs` with `dbconnect` replaced by the write client and
-`processcf` (collectinfo pairing) dropped. The parallelism structure is
-retained: bounded per-file concurrency feeding a bounded worker pool feeding a
-sharded batcher.
+The parallelism structure is bounded at every stage: bounded per-file
+concurrency feeds a bounded worker pool, which feeds a sharded batcher. No
+stage may grow an unbounded queue, so memory is a function of configuration
+rather than of input size.
 
 ### 3.1 Concurrency
 
@@ -73,11 +72,10 @@ sharded batcher.
 | Sample prep (enrich, coerce) | worker pool draining the results channel | 128 (parked goroutines are free; a deep pool buys in-flight buffering) |
 | Batch flush | sharded by `maphash(setName)` | `min(GOMAXPROCS, 8)` |
 
-These numbers are carried from AGI's measured defaults and the reasoning
-behind them is preserved in [09-operations.md](09-operations.md). The one
-change is that the flush shards now perform HTTP requests rather than Pebble
-commits, so the shard count is also the write-API concurrency and interacts
-with the store's `MaxConcurrentWrites` gate.
+These defaults come from measured ingest profiles; the reasoning is in
+[09-operations.md](09-operations.md). Note that the flush shards perform HTTP
+requests, so the shard count is also the write-API concurrency and interacts
+with the store's `max_concurrent_writes` gate.
 
 ### 3.2 Batching
 
@@ -127,8 +125,10 @@ Stream identity is then resolved in this order, first match wins:
 4. Fallback: `host` = the ingest host name for local input, the SSH host for
    remote, the peer address for receive; `source` = the file's base name.
 
-This is the generic form of AGI's "read the first few hundred lines to extract
-cluster name and node identifier; the filename is not trusted".
+The rule behind the ordering: file names are the least trustworthy source of
+identity (they are rewritten by rotation, by unpacking, and by whoever
+assembled the bundle), so content-derived identity outranks path-derived
+identity, and both are outranked by an explicit operator declaration.
 
 ### 4.3 Time-range filter
 
@@ -285,8 +285,8 @@ The pieces that live in ingest rather than in the spec:
   from the linear scan it replaces.
 - **Multiline join buffers**, keyed by the multiline rule's start marker, with a
   flush on stream close, on timestamp regression (an error, not silent), and on
-  a configurable idle timeout (new: AGI had no timeout, which is fine for batch
-  and wrong for follow, where a partial multiline could sit in memory forever).
+  a configurable idle timeout — without one, a partial multiline record on a
+  quiet follow stream would sit in memory indefinitely.
 - **Window aggregators**, keyed by the aggregation's unique label value, holding
   a partially built sample until its window closes. Windows close on a sample
   whose timestamp is at or past the window end, and on stream close. In follow

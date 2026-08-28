@@ -179,10 +179,9 @@ The store assigns each row a primary key. Two schemes, selected per set (spec
 | `content` (default) | `xxh3-128(set ‖ ts_ms ‖ canonical(labels) ‖ canonical(fields))` | Re-ingesting identical data is a no-op. Two identical samples in the same millisecond from the same stream collapse into one row. |
 | `offset` | `xxh3-128(set ‖ ts_ms ‖ canonical(labels) ‖ key_hint)` where `key_hint` is `(stream_id, byte_offset)` | Every occurrence is a distinct row. Replays after an unclean stop may duplicate rows for the replayed span. |
 
-This is AGI's hashed-PK contract (`xxh3-128` of cluster::node::line) made
-explicit and generic: the same idempotency win (re-running ingest does not
-double-count), the same known collapse of identical lines, and now an opt-out
-for streams where occurrences must be counted individually.
+The idempotency win (re-running ingest does not double-count) and the known
+collapse of identical lines are two faces of the same property; `offset` keying
+is the opt-out for streams where occurrences must be counted individually.
 
 Collision probability for xxh3-128 at 1 TiB of typical log-derived rows is
 ≈1.5 × 10⁻¹⁹ — orders of magnitude below the host's other failure modes.
@@ -258,8 +257,8 @@ concept all the way to the renderer (whitepaper P2).
 ## 9. Partial results
 
 A query that trips a safety gate returns `200` with both `series` (what was
-collected so far) and `error` set — never a bare error. This is AGI's
-behaviour, and it is right: an operator narrowing filters wants to see the
+collected so far) and `error` set — never a bare error: an operator narrowing
+filters wants to see the
 partial shape plus the reason, not an empty panel. The plugin surfaces `error`
 as a panel-level notice and still draws the frames.
 
@@ -277,5 +276,5 @@ as a panel-level notice and still draws the frames.
 | `GET /v1/debug/plan` | Explain a query: shards touched, index range, pushdown expression, projection |
 | `GET /metrics` | Prometheus exposition |
 
-`/v1/debug/*` binds to the loopback listener only, mirroring AGI's decision to
-keep the debug surface off the public path.
+`/v1/debug/*` binds to the loopback listener only: the debug surface is never
+reachable from whatever proxies the public path.

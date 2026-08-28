@@ -4,12 +4,13 @@
 
 The engine is an embedded, single-process, sparse-column store over a
 [Pebble](https://github.com/cockroachdb/pebble) LSM, with a covering range
-index on a timestamp column. It is a near-verbatim carry-over of AGI's
-`pkg/agi/db`, whose design was validated at just over 20 GiB ingested in under
-10 minutes with interactive range scans on the read side. The changes are (a) a
-network write path in front of it, (b) time-sharded sets so data can be
-expired, and (c) a durability posture that is configurable rather than
-hard-wired to "throwaway".
+index on a timestamp column. The design target is the shape this workload
+actually has: a burst of tens of GiB written in minutes, then interactive
+range-scan reads — validated in prior production use of this design at just
+over 20 GiB ingested in under 10 minutes. Three properties are specific to
+Mensura: a network write path in front of the engine, time-sharded sets so data
+can be expired, and a configurable durability posture rather than a hard-wired
+"throwaway" one.
 
 Non-goals, unchanged: no network protocol *inside* the engine, no replication,
 no backup, no TTL per row, no compound secondary indexes.
@@ -54,7 +55,7 @@ columns out of 200 costs `O(columns)` varint decodes rather than `O(bytes)`.
 
 ## 4. Time sharding and retention
 
-This is the one structural addition to the AGI engine.
+This is the one structural addition to the engine described above.
 
 Continuous ingest needs expiry, and per-row TTL in an LSM means tombstones,
 which means compaction debt exactly where the read path lives. Instead, sets
@@ -106,7 +107,7 @@ flowchart LR
   (`IndexCanHaveOrphans`) stays off, which is worth ~6× on scan time.
 - Writes to distinct keys proceed in parallel; same-key writes serialise on a
   256-way striped mutex so index maintenance is consistent.
-- The column catalogue (AGI's `BINLIST`) is maintained lock-free on the hot
+- The column catalogue is maintained lock-free on the hot
   path: an atomic pointer to an immutable presence map, with rare additions
   taking a lock, copying, and publishing. Persisted at every checkpoint and at
   clean shutdown.
@@ -141,9 +142,9 @@ engine wraps every iterator in a deferred close and the store exports
 
 ## 7. Durability
 
-AGI ran WAL-off, fsync-off, because the log files were the source of truth and
-re-ingest was cheap. Mensura keeps that as *a* mode, not *the* mode, because
-follow and receive ingest have no replayable source.
+Batch import can safely run WAL-off and fsync-off, because the source files are
+the truth and re-ingest is cheap. That is *a* mode, not *the* mode: follow and
+receive ingest have no replayable source, so they get a WAL.
 
 | Profile | `EnableWAL` | `SyncWrites` | Rationale |
 | --- | --- | --- | --- |
@@ -171,8 +172,8 @@ with the dual-run recipe.
 
 ## 9. Tunings
 
-Carried from AGI's measured defaults, with the reasoning intact, because these
-numbers were derived from real ingest profiles rather than from taste.
+These numbers come from measured ingest and scan profiles, not from taste; the
+reasoning is recorded next to each so a future change can argue with it.
 
 | Option | Default | Why |
 | --- | --- | --- |
@@ -218,3 +219,39 @@ sublevels). These are also exported as Prometheus metrics. Two are worth
 alerting on: `open_iterators` trending up (a leak, and a space-reclamation
 stall) and L0 sublevel count approaching `L0StopWritesThreshold` (writes are
 about to stall).
+
+## 12. Naming and reserved identifiers
+
+Identifiers are validated at the write path, not at query time, so a bad name
+fails at the source rather than confusing a panel author later.
+
+| Kind | Rule |
+| --- | --- |
+| Set name | `[A-Za-z_][A-Za-z0-9_.-]{0,127}`; case-sensitive |
+| Field name | `[A-Za-z_][A-Za-z0-9_.-]{0,127}`; case-sensitive |
+| Label key | same as field name |
+| Label value | any UTF-8, ≤ 1 KiB, not empty |
+| Reserved prefix | `_mensura` on sets, fields and label keys; rejected from clients |
+| Reserved field | `timestamp` — the indexed column on every metric set; a spec that produces a `timestamp` field is a validation error |
+
+Shard suffixes are appended by the store, never by clients: `set@YYYYMMDD` for
+day shards, `set@YYYYMMDDHH` for hour shards, `set@all` for `retention: none`.
+`@` is therefore excluded from the set-name charset, which is what keeps the
+physical and logical namespaces from colliding.
+
+Internal sets, all under the reserved prefix and all writable only by the store
+itself:
+
+| Set | Contents |
+| --- | --- |
+| `_mensura_catalogue` | Sets, fields, field metadata, bucket sets, conflicts, `catalogue_version` |
+| `_mensura_labels` | One row per label key: the ordered dictionary of its values |
+| `_mensura_ingest` | Ingest progress samples (see below) |
+
+`_mensura_ingest` is a normal metric set, so ingest health is queryable with
+ordinary MQL. Its labels are `client`, `input`, `stream`; its fields are
+`bytes_read`, `records`, `samples`, `unmatched_lines`, `ts_parse_errors`,
+`batches_sent`, `batches_retried`, `batches_dropped`, `lag_bytes`,
+`udp_dropped`, `files_total`, `files_done`. Clients may write it despite the
+reserved prefix — it is the one exception, and it is allowed only for samples
+carrying the client's own `client` label.

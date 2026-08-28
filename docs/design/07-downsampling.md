@@ -240,7 +240,7 @@ so the mapping is stated explicitly:
 - Series name goes into the value field's `DisplayNameFromDS`, so Grafana's
   legend, colour assignment and overrides behave natively.
 - Frames are returned sorted by series name, so colour assignment is stable
-  across reloads (AGI sorted the response for the same reason).
+  across reloads.
 
 ## 9. What this pipeline deliberately does not do
 

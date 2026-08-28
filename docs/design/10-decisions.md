@@ -11,9 +11,9 @@ Status is `accepted` unless stated otherwise.
 batch, follow, remote follow, receive — delivers samples through the store's
 `/v1/write` API.
 
-**Alternatives.** (a) AGI's model: ingest linked into the same process as the
-plugin, writing to Pebble directly. (b) A hybrid: direct writes when local,
-network writes when remote.
+**Alternatives.** (a) Ingest linked into the same process as the plugin,
+writing to the LSM directly. (b) A hybrid: direct writes when local, network
+writes when remote.
 
 **Why.** Follow, remote and receive ingest are all inherently remote; the moment
 one mode is remote, the network path must exist and be correct. Keeping a second
@@ -22,10 +22,10 @@ backpressure, auth and error handling — and the direct path would be the
 better-tested one, so the network path would rot exactly where it matters.
 
 **Cost.** One-shot import of a local bundle pays serialisation, compression and
-an HTTP round trip that AGI did not. Mitigated by batching (1024 samples or
-4 MiB per request), zstd-1, HTTP/2 keep-alive, and loopback with compression
-off. Expected to land within a small factor of AGI's ingest rate; the benchmark
-gate in [11-roadmap.md](11-roadmap.md) makes that a measured claim, not a hope.
+an HTTP round trip that a direct writer would not. Mitigated by batching (1024
+samples or 4 MiB per request), zstd-1, HTTP/2 keep-alive, and loopback with
+compression off. The benchmark gate in [11-roadmap.md](11-roadmap.md) pins the
+acceptable overhead to a measured number rather than a hope.
 
 ---
 
@@ -49,13 +49,13 @@ loud startup failure naming the holder, not corruption.
 
 ---
 
-## ADR-003 — Keep the AGI engine, add time-sharded sets for retention
+## ADR-003 — Sparse-column LSM engine, with time-sharded sets for retention
 
-**Decision.** Reuse the Pebble-backed sparse-column engine and its tunings.
+**Decision.** A Pebble-backed sparse-column engine with a covering time index.
 Shard sets by time window; retention drops whole shards with a range delete.
 
 **Alternatives.** (a) Per-row TTL with point tombstones. (b) Multiple Pebble
-instances, one per day. (c) No retention (AGI's position).
+instances, one per day. (c) No retention at all.
 
 **Why.** Point tombstones put compaction debt precisely where the read path
 lives. Multiple instances multiply file handles, caches and open-iterator
@@ -73,9 +73,9 @@ override.
 **Decision.** Ingest sends label strings; the store interns them into integer
 indices.
 
-**Alternatives.** (a) Ingest assigns indices (AGI, where ingest and store were
-one process). (b) A negotiated dictionary with client-side caching and delta
-updates.
+**Alternatives.** (a) Ingest assigns indices, which is only safe when ingest
+and store are one process. (b) A negotiated dictionary with client-side caching
+and delta updates.
 
 **Why.** With many independent ingesters, a single writer is the only way to keep
 the dictionary consistent without a coordination protocol. Strings on the wire
@@ -96,8 +96,8 @@ scheme keyed on `(stream, byte offset)` per set.
 **Alternatives.** (a) Always offset-based. (b) Monotonic sequence numbers.
 
 **Why.** Content addressing makes at-least-once delivery behave as exactly-once
-for the common case: a replayed line overwrites itself. This is AGI's
-idempotency contract, and it is what makes crash recovery and retries boring.
+for the common case: a replayed line overwrites itself, which is what makes
+crash recovery and retries boring.
 
 **Cost.** Two identical records in the same millisecond from the same stream
 collapse into one row. Real for occurrence-counting patterns, hence the opt-out,
@@ -132,16 +132,17 @@ ingest.
 **Decision.** `label = "v"` does not match rows lacking the label, and a value
 absent from the dictionary yields an empty result with a warning.
 
-**Alternatives.** AGI's default: a filter without `MustExist` matched rows
-missing the column, and a clause naming an unknown value was dropped.
+**Alternatives.** The permissive defaults common in this space: a filter
+matches rows missing the column, and a clause naming an unknown value is
+dropped.
 
 **Why.** Both behaviours were there to keep dashboards rendering during
 ingestion, and both make the graph mean something other than what it says.
 Rendering something wrong during an incident is worse than rendering nothing
 with an explanation.
 
-**Cost.** Dashboards ported from AGI may need `OR MISSING label` in a few places.
-The converter emits it automatically.
+**Cost.** Dashboards ported from a permissive datasource may need
+`OR MISSING label` in a few places. The converter emits it automatically.
 
 ---
 
@@ -179,7 +180,7 @@ Grafana. Irrelevant next to the scan.
 extraction spec, stored in the catalogue, and used as *defaults* in the query
 builder.
 
-**Alternatives.** (a) No metadata (AGI: every per-bin flag typed per panel).
+**Alternatives.** (a) No metadata: every per-field flag typed per panel.
 (b) Metadata applied automatically at query time.
 
 **Why.** The most common wrong graphs — a counter plotted raw, a gap drawn as a
@@ -230,8 +231,8 @@ directly — that path is open, just not the documented default.
 
 ## ADR-013 — Aho-Corasick prefilter with first-match-wins
 
-**Decision.** Keep AGI's automaton over pattern `search` literals; the
-lowest-index matching pattern wins.
+**Decision.** One Aho-Corasick automaton over every pattern's `search` literal;
+the lowest-index matching pattern wins.
 
 **Why.** It turns per-line cost from N substring scans into one `O(len(line))`
 pass, and preserves the linear scan's semantics exactly, so pattern files behave

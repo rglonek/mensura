@@ -3,11 +3,11 @@
 Mensura is a standalone, self-contained system for turning **operational text
 logs and pushed metrics into interactive Grafana time-series**, built around
 one idea: *the operator must be able to trust the plot*. It is a generic
-re-implementation of the ingest → store → render loop originally shipped as
-the `agi` subcommand of aerolab, with the Aerospike-specific and
-deployment/orchestration parts removed, and with three capabilities the
-original did not have: continuous file-follow ingest with log rotation,
-remote-host ingest, and a network receive path.
+product-agnostic ingest → store → render loop: no deployment or orchestration
+concerns, no knowledge of any particular server's log format, and three
+capabilities that incident-triage tooling in this space usually lacks —
+continuous file-follow ingest with log rotation, remote-host ingest, and a
+network receive path.
 
 The render-time algorithm is specified in *A Correctness-First, Single-Pass
 Downsampling Pipeline for Operational Time-Series* (Glonek, 2026,
@@ -64,7 +64,7 @@ flowchart LR
 | --- | --- | --- |
 | 01 | [Architecture](01-architecture.md) | Components, process/ownership model, topologies, end-to-end flows |
 | 02 | [Ingest](02-ingest.md) | The `mensura-ingest` binary: acquisition modes, pipeline, rotation, checkpoints, backpressure |
-| 03 | [Extraction spec](03-extraction.md) | The generic pattern/metric-definition file that replaces AGI's `patterns.yml` |
+| 03 | [Extraction spec](03-extraction.md) | The declarative pattern/metric-definition file format |
 | 04 | [Wire protocol](04-wire-protocol.md) | Ingest → store write API, receive-side line protocols, idempotency, auth |
 | 05 | [Storage engine](05-storage.md) | Keyspace, codec, schema, label dictionary, retention, durability, tunings |
 | 06 | [Query language](06-query.md) | MQL: grammar, JSON AST, semantics, planning, safety gates |
@@ -96,10 +96,10 @@ flowchart LR
 
 **Out of scope**
 
-- Provisioning, deploying or managing infrastructure (this is not aerolab).
-  Mensura ships binaries, a systemd unit example and a container image; where
-  they run is the operator's business.
-- Any product-specific knowledge. Nothing in the core knows what an Aerospike,
+- Provisioning, deploying or managing infrastructure. Mensura ships binaries, a
+  systemd unit example and a container image; where they run is the operator's
+  business.
+- Any product-specific knowledge. Nothing in the core knows what a database,
   a Kafka or an nginx is; product knowledge lives entirely in extraction spec
   files and dashboards, which are data, not code.
 - Full-text log search. Mensura extracts structured samples from logs; it is
@@ -120,11 +120,13 @@ information outside this repository.
 
 1. **Implementation language is Go** for both binaries, matching the origin
    code, the Grafana plugin SDK, and Pebble.
-2. **Storage engine is [Pebble](https://github.com/cockroachdb/pebble)**, as in
-   AGI, with the tunings carried over verbatim (see [05-storage.md](05-storage.md)).
+2. **Storage engine is [Pebble](https://github.com/cockroachdb/pebble)**, with
+   the tunings in [05-storage.md](05-storage.md), which were derived from
+   measured burst-ingest and range-scan workloads.
 3. **Grafana 11 or later**, which is the baseline for the current backend plugin
    SDK, data-frame contract, and the builder/code query-editor pattern.
 4. **License is Apache-2.0**, matching the `LICENSE` file already in this
    repository.
-5. Where AGI behaviour and the whitepaper disagree in detail, the **whitepaper
-   is normative** and the difference is called out explicitly.
+5. The **whitepaper is normative** for the render pipeline; any deviation in
+   these documents or in the code is a defect, and is called out explicitly
+   where one is knowingly accepted.

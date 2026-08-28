@@ -74,8 +74,8 @@ flowchart TB
 ```
 
 Properties: no hop between plugin and storage; a panel query is a range seek;
-the store's lifecycle is Grafana's lifecycle. This is the shape AGI used and
-the one the whitepaper's latency argument assumes.
+the store's lifecycle is Grafana's lifecycle. This is the shape the
+whitepaper's latency argument assumes.
 
 Cost: Grafana owns the process lifetime, so a Grafana restart bounces the
 store, and the store cannot outlive Grafana to keep accepting writes. That is
@@ -122,7 +122,7 @@ plugin), so it gets an explicit, actionable failure.
 The P1-triage flow: a pile of logs exists, and dashboards must render in
 minutes.
 
-1. Operator runs `mensura-ingest batch --spec aerospike.yaml --source ./bundle.tgz --store https://localhost:9631`.
+1. Operator runs `mensura-ingest batch --spec server.yaml --source ./bundle.tgz --store https://localhost:9631`.
 2. Ingest resolves the source (local path, S3 prefix, SFTP dir), downloads if
    remote, and recursively unpacks archives into a working directory keyed by
    a hash of each original path, so identically-named files from different
@@ -190,9 +190,9 @@ stream can be pattern-matched exactly like a tailed file.
 
 ## 4. Identity model
 
-The single largest generalisation from AGI is identity. AGI hard-coded
-`(ClusterName, NodeIdent)`; Mensura has *stream identity*, an ordered set of
-operator-declared labels.
+Identity is declared, never hard-coded. Tools in this space commonly bake in a
+fixed pair such as `(cluster, node)`; Mensura instead has *stream identity*, an
+ordered set of operator-declared labels.
 
 - **Stream** — the smallest unit of ordered data: one log file on one host, one
   TCP connection, one UDP source, one SSH-followed path.
@@ -200,13 +200,12 @@ operator-declared labels.
   stream. `host` and `source` are always present (synthesised if not
   configured); anything else is declared in the spec or on the command line
   (`--label dc=eu-west-1 --label app=api`).
-- **Discovered labels** — extracted from record content by the spec (the
-  generalisation of AGI's "cluster name and node ID discovered by reading the
-  first few hundred lines").
-- **Field** — a named numeric (or string, for tables) column on a sample. This
-  is AGI's "bin".
+- **Discovered labels** — extracted from record content by the spec, typically
+  by reading the first few hundred lines of a file rather than trusting its
+  name.
+- **Field** — a named numeric (or string, for tables) column on a sample.
 - **Set** — a named collection of samples sharing a shape; the query `FROM`
-  target. This is AGI's "set", kept.
+  target.
 
 Series identity at query time is `(sorted BY-label values, field display
 name)` — see [06-query.md §7](06-query.md).
@@ -230,15 +229,15 @@ Both binaries link the same packages; the split is enforced by making
 `mensura-ingest query` (a debugging client), and tests can round-trip AST →
 text → AST without a running store.
 
-## 6. What was dropped from AGI, and why
+## 6. Explicitly excluded, and why
 
-| AGI concern | Disposition |
+| Concern | Disposition |
 | --- | --- |
 | Cluster/node deployment, templates, instance sizing, auto-scale monitor | Dropped — not this tool's job |
-| Aerospike log patterns, collectinfo, `asadm`/`asinfo` | Dropped from core; shippable as an example spec file |
-| Web proxy, ttyd, filebrowser, Grafana provisioning fixups | Dropped; optional dashboard provisioning helper only (see [09-operations.md](09-operations.md)) |
-| SimpleJson datasource (`simpod-json-datasource`) | Replaced by a native backend datasource |
-| In-process ingest writing straight to Pebble | Replaced by the network write API — the enabling change for follow/remote/receive |
-| `ClusterName` / `NodeIdent` hard-coded identity | Replaced by generic stream labels |
-| Hard-coded 25-bucket HDR histogram endpoint | Replaced by declared bucket sets and a heatmap query format |
-| Throwaway store, no retention | Retention added (time-sharded sets); throwaway remains the batch-mode default |
+| Product-specific log patterns and diagnostic-bundle formats | Not in core; expressible as example spec files |
+| Web proxy, web terminal, file browser, Grafana provisioning reconciliation | Dropped; optional dashboard provisioning helper only (see [09-operations.md](09-operations.md)) |
+| Generic JSON-over-HTTP datasource bridges | Replaced by a native backend datasource |
+| In-process ingest writing straight to the LSM | Replaced by the network write API — the enabling change for follow/remote/receive |
+| Hard-coded two-level identity | Replaced by declared stream labels |
+| Hard-coded fixed-bucket histogram endpoint | Replaced by declared bucket sets and a heatmap query format |
+| No retention at all | Retention (time-sharded sets); unbounded remains the batch-mode default |

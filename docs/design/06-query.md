@@ -2,20 +2,20 @@
 
 ## 1. Why a new language
 
-AGI had no query language. A panel was a JSON payload of sets, bins, filters,
-group-bys and per-bin flags, hand-edited inside a SimpleJson datasource. That
-was workable for a fixed dashboard library and hostile to anyone building a
-panel from scratch.
+The obvious cheap option is to have no query language at all: let a panel carry
+a JSON payload of sets, fields, filters, group-bys and per-field flags, typed
+by hand into a generic JSON datasource. That is workable for a fixed dashboard
+library and hostile to anyone building a panel from scratch.
 
-MQL replaces it with three requirements:
+MQL exists instead, under three requirements:
 
 1. **Lossless builder round-trip.** Every query expressible in text is
    expressible in the visual builder and vice versa. There is no "you have used
    an advanced feature, the builder is now disabled" cliff.
 2. **No hidden behaviour.** Nothing about how a series is transformed is
-   implicit. In particular the looseness AGI had — a filter that silently
-   matched rows missing the column, a dropped filter clause when a dictionary
-   value was unknown — becomes explicit syntax.
+   implicit. The two classic forms of convenient looseness — a filter that
+   silently matches rows missing the column, and a filter clause quietly dropped
+   because its value is unknown — become explicit syntax instead.
 3. **Declarative modifiers, fixed execution order.** Transform order is part of
    the correctness contract (whitepaper §5.6). MQL therefore does *not* offer a
    composable function algebra where `rate(clamp(x))` differs from
@@ -118,8 +118,7 @@ nothing (sparse rows are the norm).
 
 `AS` sets the display name; the default is the field name. Legend composition
 is `BY`-values joined with the configured separator, with the display name
-first or last per datasource setting — carried from AGI so existing dashboard
-conventions survive.
+first or last per datasource setting.
 
 ### 4.3 Modifiers
 
@@ -149,17 +148,17 @@ order produces the lint `W101: modifiers are applied in canonical order
 Predicates address **labels** (interned strings) and field presence.
 
 - `label = "v"` matches rows that carry `label` with that value. A row missing
-  the label does **not** match. This is the change from AGI, where a filter
-  without `MustExist` matched rows lacking the column; that looseness was there
-  to keep panels rendering during ingest, and it silently widened queries. To
-  ask for it explicitly: `host = "web1" OR MISSING host`.
+  the label does **not** match. The looser reading — matching rows that lack the
+  label — keeps panels rendering while ingest is still populating, and silently
+  widens every query that uses it. To ask for it explicitly:
+  `host = "web1" OR MISSING host`.
 - `label =~ /re/` is a regex match, evaluated against the dictionary once per
   query (producing an `IN` of the matching indices), not per row. An unanchored
   pattern that matches every value is folded away entirely.
 - A value not present in the dictionary makes that comparison a constant
   `false`, which is propagated: `host = "typo"` returns an empty result with the
-  warning `W201: no values match host = "typo"`. AGI dropped the clause and
-  returned everything, which is a wrong graph and a bad night.
+  warning `W201: no values match host = "typo"`. The alternative — dropping the
+  clause and returning everything — turns a typo into a wrong graph at 03:00.
 - `HAS field` / `MISSING field` map to the engine's `Exists` predicate.
 - Everything is pushed down to the engine's filter evaluator; nothing is
   filtered in the render layer.
@@ -229,9 +228,8 @@ FORMAT heatmap
 
 `HISTOGRAM(name)` expands to the bucket-set's member fields, sums counts per
 bucket per window, and emits a heatmap frame with real numeric bucket edges
-from the declaration. Grouping by a label yields one heatmap per group — AGI
-merged all nodes into one histogram and documented it as a limitation; here it
-is just a `BY`.
+from the declaration. Grouping by a label yields one heatmap per group, so
+"per host" is a `BY` clause rather than a feature request.
 
 With `FORMAT timeseries`, `HISTOGRAM(hdr24) PERCENTILE 99` emits an estimated
 p99 series computed from the cumulative buckets (linear interpolation within
@@ -303,16 +301,16 @@ flowchart TB
 2. **Interpolate** — Grafana variables become literal values. A multi-value
    variable becomes `IN (…)`; a variable resolving to `All` removes its
    comparison entirely; a variable resolving to the sentinel `NONE` short-
-   circuits the whole query to an empty result (carried from AGI, where
-   dashboards use `NONE` as a deliberate "draw nothing" choice).
+   circuits the whole query to an empty result, which is how a dashboard offers
+   "draw nothing" as a deliberate dropdown choice.
 3. **Plan** — resolve shards, build one pushdown expression, and compute the
    projection: timestamp column + selected fields + `BY` labels + labels
    referenced by predicates. Nothing else is decoded.
 4. **Scan** — one iterator per shard, in parallel, each honouring the request
    context so a Grafana disconnect unwinds immediately.
 5. **Group** — a stable hash over the sorted `BY` values plus the display name.
-   Series are looked up in a map (AGI used a linear scan; at 1 000 series that
-   is measurable).
+   Series are looked up in a map: a linear scan over the response slice is
+   measurable at the 1 000-series safety limit.
 6. **Render** — sort each series by timestamp, run the ten-stage walk.
 7. **Emit** — one frame per series, plus stats and warnings.
 
@@ -327,7 +325,7 @@ the language tells the truth about what it does.
 
 ## 9. Safety gates
 
-Carried from AGI, with the partial-result behaviour intact:
+The partial-result behaviour is part of the contract:
 
 | Gate | Default | On trip |
 | --- | --- | --- |
@@ -337,14 +335,15 @@ Carried from AGI, with the partial-result behaviour intact:
 | `LIMIT POINTS` (table/logs) | 1 000 | Truncate, flag `truncated: true` |
 
 Both size gates can be disabled per query via datasource-level toggles exposed
-as dashboard variables, exactly as AGI did, because during an incident the
-operator sometimes genuinely wants the expensive query.
+as dashboard variables, because during an incident the operator sometimes
+genuinely wants the expensive query.
 
-## 10. Mapping from AGI payloads
+## 10. Mapping from flag-style panel payloads
 
-For anyone porting an AGI dashboard:
+For anyone porting a dashboard from a datasource whose panels carry per-field
+flags as JSON, the correspondence is mechanical:
 
-| AGI payload field | MQL |
+| Payload field | MQL |
 | --- | --- |
 | `target` (set name) | `FROM set` |
 | `bins[].name` | `SELECT field` |
@@ -362,5 +361,51 @@ For anyone porting an AGI dashboard:
 | `payload.type` | `FORMAT …` |
 | `/histogram` endpoint | `HISTOGRAM(bucketset)` + `FORMAT heatmap` |
 
-A `mensura-ingest convert --agi-dashboard f.json` helper performs this
-mechanically and reports anything it could not translate, rather than guessing.
+A `mensura-store convert-dashboard f.json` helper performs this translation and
+reports anything it could not translate, rather than guessing.
+
+## 11. Lexical rules
+
+- **Strings** are double-quoted, with `\\`, `\"`, `\n`, `\t`, `\r` and
+  `\uXXXX` escapes. Single quotes are not string delimiters.
+- **Regexes** are delimited by `/…/` (with `\/` escaping) and use RE2 syntax —
+  linear time, no backreferences, no lookaround. They are implicitly
+  **unanchored**; write `/^web-/` when you mean anchored.
+- **Numbers** are decimal integers or floats; underscores are not permitted.
+- **Durations** are `<number><unit>` with unit `ms|s|m|h|d`, no compound forms
+  (`90s`, not `1m30s`).
+- **Identifiers** are `[A-Za-z_][A-Za-z0-9_.-]*`; anything else, including
+  anything colliding with a keyword, must be double-quoted.
+- **Keywords** are case-insensitive; identifiers, label values and display
+  names are case-sensitive.
+- **Comments** run from `--` to end of line, except inside a string or regex.
+- **Whitespace and newlines** are insignificant.
+
+## 12. Diagnostics
+
+Every diagnostic has a stable code, so it can be searched for and asserted on
+in tests. Warnings never fail a query; errors always do.
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `E001` | error | Parse error (position and expected-token set included) |
+| `E002` | error | Unknown set |
+| `E003` | error | Unknown field on set, and the field is `REQUIRED` |
+| `E004` | error | Unknown label key referenced in `WHERE` or `BY` |
+| `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
+| `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
+| `E007` | error | `LIMIT` above the datasource maximum |
+| `E008` | error | `FORMAT logs` or `table` combined with a timeseries-only modifier |
+| `E009` | error | `HISTOGRAM()` names an unknown bucket set |
+| `W101` | warning | Modifiers written in non-canonical order; canonical order applies |
+| `W102` | warning | Counter-kind field selected without `RATE`/`DELTA` |
+| `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |
+| `W201` | warning | A comparison matches no dictionary value; result will be empty |
+| `W202` | warning | Regex matches every value of the label; clause folded away |
+| `W203` | warning | Field is `stale` in the catalogue (not seen recently) |
+| `W301` | warning | No `BY` clause while multiple streams are in range; series will interleave |
+| `W302` | warning | Query used in an alert rule without `EVERY` |
+| `W401` | warning | Safety gate tripped; results are partial (accompanies the response error) |
+
+Diagnostics travel with the response (`warnings[]`) and are surfaced as panel
+notices by the plugin; `E`-codes come back as the response error.

@@ -95,8 +95,7 @@ progress:
 
 Grafana + `mensura-store` in embedded (plugin) mode + one-shot
 `mensura-ingest batch`. Everything on loopback; auth may be `none` on a
-loopback-bound write listener. This is the AGI-shaped workflow: point ingest at
-a bundle, open the dashboard.
+loopback-bound write listener. Point ingest at a bundle, open the dashboard.
 
 ### 2.2 Central store, many followers
 
@@ -186,7 +185,7 @@ silent:
 4. `store_l0_sublevels` approaching `l0_stop_writes_threshold` — writes are
    about to stall.
 
-**Logs**: levelled (`0=none … 6=detail`, carried from AGI), structured, with the
+**Logs**: levelled (`0=none … 6=detail`), structured, with the
 rule that any dropped datum is logged at most `N` times per minute per reason
 with a running count, so a broken spec produces a summary rather than a
 log-flood that is itself an outage.

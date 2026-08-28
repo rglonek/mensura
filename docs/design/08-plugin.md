@@ -2,11 +2,11 @@
 
 ## 1. What "native" means here
 
-AGI shipped a SimpleJson datasource: a generic JSON-over-HTTP bridge where the
-query was a blob of JSON typed by hand into a text area. Everything Grafana can
-do for a datasource — typed query models, a builder UI, variable support,
-annotations, alerting, the query inspector, provisioning — had to be faked or
-was simply absent.
+The cheap way to put a store behind Grafana is a generic JSON-over-HTTP bridge
+datasource, where the query is a blob of JSON typed into a text area.
+Everything Grafana can do for a datasource — typed query models, a builder UI,
+variable support, annotations, alerting, the query inspector, provisioning —
+then has to be faked or is simply absent.
 
 Mensura ships a **native datasource plugin**: a signed plugin package with a
 React frontend and a Go backend built on `grafana-plugin-sdk-go`, registered as
@@ -54,8 +54,7 @@ for each Grafana query:
   ([07-downsampling.md §2](07-downsampling.md)) untouched.
 - The request context is propagated all the way into the engine iterator, so a
   panel navigation that cancels an in-flight query unwinds the scan instead of
-  finishing it. This was already true in AGI and is one of the reasons panel
-  spam does not melt the store.
+  finishing it. This is one of the reasons panel spam does not melt the store.
 - Partial results are returned as frames *plus* `response.Error`, so Grafana
   shows the red banner and still draws what was collected
   ([04-wire-protocol.md §9](04-wire-protocol.md)).
@@ -161,8 +160,8 @@ variable can be defined without typing MQL.
 - `All` removes the comparison rather than expanding to every value — cheaper
   and semantically identical given §4.4's strict matching.
 - A `NONE` sentinel value may be added per label (a datasource setting, carried
-  from AGI's `AddNoneToLabels`); selecting it short-circuits the query to an
-  empty result, which is how AGI dashboards offer "draw nothing" as an explicit
+  `add_none_to_labels`); selecting it short-circuits the query to an empty
+  result, which is how a dashboard offers "draw nothing" as an explicit
   choice.
 - Chained variables work because `/label-values` accepts the already-chosen
   filters.
@@ -205,9 +204,8 @@ The plugin ships:
   driven entirely by variables, so a fresh deployment has something to look at
   before anyone writes a dashboard;
 - an optional `mensura-store dashboards install` command that writes those
-  files into Grafana's provisioning directory. This is a convenience, not a
-  reconciliation daemon — AGI's `grafanafix` existed because AGI managed the
-  whole box, which Mensura explicitly does not.
+  files into Grafana's provisioning directory. This is a one-shot convenience,
+  not a reconciliation daemon: Mensura does not manage the Grafana install.
 
 ## 8. Packaging and signing
 
