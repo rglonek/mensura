@@ -58,7 +58,9 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	}
 	warns = append(warns, planWarns...)
 
-	resp := &wire.QueryResponse{Warnings: warns}
+	// Series is always a list, never null: a client should not have to
+	// special-case "no results" differently from "no series".
+	resp := &wire.QueryResponse{Warnings: warns, Series: []wire.Series{}}
 	if plan.impossible {
 		resp.Stats.DurationMs = time.Since(started).Milliseconds()
 		return resp, nil

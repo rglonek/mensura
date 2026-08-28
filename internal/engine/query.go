@@ -36,23 +36,26 @@ func (q *QueryBuilder) Between(col string, lo, hi int64) *QueryBuilder {
 	return q
 }
 
-func (q *QueryBuilder) Where(e Expr) *QueryBuilder    { q.where = e; return q }
-func (q *QueryBuilder) Project(c ...string) *QueryBuilder { q.project = append(q.project, c...); return q }
-func (q *QueryBuilder) Limit(n int) *QueryBuilder     { q.limit = n; return q }
+func (q *QueryBuilder) Where(e Expr) *QueryBuilder { q.where = e; return q }
+func (q *QueryBuilder) Project(c ...string) *QueryBuilder {
+	q.project = append(q.project, c...)
+	return q
+}
+func (q *QueryBuilder) Limit(n int) *QueryBuilder { q.limit = n; return q }
 
 // Iter walks query results. It pins a snapshot for its lifetime, so it
 // observes a consistent point-in-time view while writers run — and so it
 // must be closed, or the LSM cannot reclaim space.
 type Iter struct {
-	db       *DB
-	snap     *pebble.Snapshot
-	it       *pebble.Iterator
-	ctx      context.Context
-	where    Expr
-	proj     map[string]struct{}
-	indexed  bool
-	limit    int
-	returned int
+	db          *DB
+	snap        *pebble.Snapshot
+	it          *pebble.Iterator
+	ctx         context.Context
+	where       Expr
+	proj        map[string]struct{}
+	indexed     bool
+	limit       int
+	returned    int
 	key         [16]byte
 	row         Row
 	err         error
@@ -198,8 +201,8 @@ func (i *Iter) Next() bool {
 
 // started/markStarted keep the "first call positions the iterator" logic
 // explicit rather than hiding it in a sentinel value.
-func (i *Iter) started() bool     { return i.startedFlag }
-func (i *Iter) markStarted()      { i.startedFlag = true }
+func (i *Iter) started() bool { return i.startedFlag }
+func (i *Iter) markStarted()  { i.startedFlag = true }
 
 func (i *Iter) Record() ([16]byte, Row) { return i.key, i.row }
 func (i *Iter) Err() error {

@@ -40,10 +40,10 @@ type Value struct {
 	B bool
 }
 
-func Int(v int64) Value      { return Value{T: TypeInt, I: v} }
-func Float(v float64) Value  { return Value{T: TypeFloat, F: v} }
-func String(v string) Value  { return Value{T: TypeString, S: v} }
-func Bool(v bool) Value      { return Value{T: TypeBool, B: v} }
+func Int(v int64) Value     { return Value{T: TypeInt, I: v} }
+func Float(v float64) Value { return Value{T: TypeFloat, F: v} }
+func String(v string) Value { return Value{T: TypeString, S: v} }
+func Bool(v bool) Value     { return Value{T: TypeBool, B: v} }
 
 func (v Value) Valid() bool { return v.T != TypeInvalid }
 

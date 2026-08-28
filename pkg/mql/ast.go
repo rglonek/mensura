@@ -30,14 +30,14 @@ const (
 // Query is the whole AST. Panels store this, never the text, so a grammar
 // change can never break a saved dashboard.
 type Query struct {
-	Kind   Kind        `json:"kind,omitempty"`
-	From   string      `json:"from"`
-	Select []FieldExpr `json:"select,omitempty"`
-	Where  Expr        `json:"where,omitempty"`
-	By     []string    `json:"by,omitempty"`
-	EveryMs *int64     `json:"everyMs,omitempty"`
-	Format Format      `json:"format,omitempty"`
-	Limits Limits      `json:"limits,omitempty"`
+	Kind    Kind        `json:"kind,omitempty"`
+	From    string      `json:"from"`
+	Select  []FieldExpr `json:"select,omitempty"`
+	Where   Expr        `json:"where,omitempty"`
+	By      []string    `json:"by,omitempty"`
+	EveryMs *int64      `json:"everyMs,omitempty"`
+	Format  Format      `json:"format,omitempty"`
+	Limits  Limits      `json:"limits,omitempty"`
 
 	// Label is the target of a LABELS query.
 	Label string `json:"label,omitempty"`

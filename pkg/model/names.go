@@ -23,7 +23,7 @@ const (
 const maxIdentLen = 128
 const maxLabelValueLen = 1024
 
-func validIdent(s string) bool {
+func validIdent(s string, allowLeadingDigit bool) bool {
 	if s == "" || len(s) > maxIdentLen {
 		return false
 	}
@@ -31,6 +31,7 @@ func validIdent(s string) bool {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
 		case i > 0 && (r >= '0' && r <= '9' || r == '.' || r == '-'):
+		case i == 0 && allowLeadingDigit && r >= '0' && r <= '9':
 		default:
 			return false
 		}
@@ -41,15 +42,20 @@ func validIdent(s string) bool {
 // ValidateSetName enforces the set charset. '@' is excluded because the
 // store appends shard suffixes with it.
 func ValidateSetName(s string) error {
-	if !validIdent(s) {
+	if !validIdent(s, false) {
 		return fmt.Errorf("invalid set name %q: expected [A-Za-z_][A-Za-z0-9_.-]{0,127}", s)
 	}
 	return nil
 }
 
+// ValidateFieldName is deliberately looser than the set and label rules:
+// a field may start with a digit, because histogram bucket columns are
+// conventionally named "00".."23" (and "03plus" for the cumulative form).
+// Such a name is not a bare MQL identifier, so a query quotes it:
+// SELECT "00". Set names and label keys stay strict.
 func ValidateFieldName(s string) error {
-	if !validIdent(s) {
-		return fmt.Errorf("invalid field name %q: expected [A-Za-z_][A-Za-z0-9_.-]{0,127}", s)
+	if !validIdent(s, true) {
+		return fmt.Errorf("invalid field name %q: expected [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", s)
 	}
 	if s == TimestampField {
 		return fmt.Errorf("field name %q is reserved for the indexed timestamp column", s)
@@ -58,7 +64,7 @@ func ValidateFieldName(s string) error {
 }
 
 func ValidateLabelKey(s string) error {
-	if !validIdent(s) {
+	if !validIdent(s, false) {
 		return fmt.Errorf("invalid label key %q: expected [A-Za-z_][A-Za-z0-9_.-]{0,127}", s)
 	}
 	return nil

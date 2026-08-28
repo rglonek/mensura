@@ -228,7 +228,7 @@ fails at the source rather than confusing a panel author later.
 | Kind | Rule |
 | --- | --- |
 | Set name | `[A-Za-z_][A-Za-z0-9_.-]{0,127}`; case-sensitive |
-| Field name | `[A-Za-z_][A-Za-z0-9_.-]{0,127}`; case-sensitive |
+| Field name | `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`; case-sensitive. A leading digit is permitted because histogram bucket columns are conventionally `00`…`23` (and `03plus` for the cumulative form); such a name is not a bare MQL identifier, so a query quotes it (`SELECT "00"`) |
 | Label key | same as field name |
 | Label value | any UTF-8, ≤ 1 KiB, not empty |
 | Reserved prefix | `_mensura` on sets, fields and label keys; rejected from clients |

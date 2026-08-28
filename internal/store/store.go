@@ -35,11 +35,11 @@ type Config struct {
 	StorageProfile string
 
 	// Retention defaults, overridable per set.
-	Retention       time.Duration
-	Shard           time.Duration
-	SetRetention    map[string]time.Duration
-	SetShard        map[string]time.Duration
-	RetentionSweep  time.Duration
+	Retention      time.Duration
+	Shard          time.Duration
+	SetRetention   map[string]time.Duration
+	SetShard       map[string]time.Duration
+	RetentionSweep time.Duration
 
 	MaxSeriesPerGraph     int
 	MaxDataPointsReceived int
@@ -87,13 +87,13 @@ type Store struct {
 
 // setEntry is the catalogue record for one logical set.
 type setEntry struct {
-	Name       string                     `json:"name"`
-	Fields     map[string]*fieldEntry     `json:"fields"`
-	Labels     map[string]struct{}        `json:"labels"`
+	Name       string                        `json:"name"`
+	Fields     map[string]*fieldEntry        `json:"fields"`
+	Labels     map[string]struct{}           `json:"labels"`
 	BucketSets map[string]wire.BucketSetInfo `json:"bucket_sets,omitempty"`
-	KeyScheme  model.KeyScheme            `json:"key_scheme,omitempty"`
-	FirstTSMs  int64                      `json:"first_ts_ms,omitempty"`
-	LastTSMs   int64                      `json:"last_ts_ms,omitempty"`
+	KeyScheme  model.KeyScheme               `json:"key_scheme,omitempty"`
+	FirstTSMs  int64                         `json:"first_ts_ms,omitempty"`
+	LastTSMs   int64                         `json:"last_ts_ms,omitempty"`
 }
 
 type fieldEntry struct {
@@ -114,7 +114,7 @@ type fieldEntry struct {
 // it because with many independent ingesters a single writer is the only
 // way to keep indices consistent without a coordination protocol.
 type dictionary struct {
-	Entries []string       `json:"entries"`
+	Entries []string `json:"entries"`
 	index   map[string]int32
 }
 
@@ -193,9 +193,9 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) DB() *engine.DB   { return s.db }
-func (s *Store) Config() Config   { return s.cfg }
-func (s *Store) Uptime() time.Duration { return time.Since(s.started) }
+func (s *Store) DB() *engine.DB          { return s.db }
+func (s *Store) Config() Config          { return s.cfg }
+func (s *Store) Uptime() time.Duration   { return time.Since(s.started) }
 func (s *Store) CatalogueVersion() int64 { return s.catVer.Load() }
 
 // ---------- catalogue persistence ----------
@@ -208,9 +208,9 @@ func (s *Store) loadCatalogue() error {
 		return err
 	}
 	var stored struct {
-		Version   int64                     `json:"version"`
-		Sets      map[string]*setEntry      `json:"sets"`
-		Conflicts []wire.CatalogueConflict  `json:"conflicts"`
+		Version   int64                    `json:"version"`
+		Sets      map[string]*setEntry     `json:"sets"`
+		Conflicts []wire.CatalogueConflict `json:"conflicts"`
 	}
 	if err := json.Unmarshal(b, &stored); err != nil {
 		return fmt.Errorf("store: catalogue is unreadable: %w", err)

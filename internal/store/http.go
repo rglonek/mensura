@@ -46,7 +46,7 @@ type APIConfig struct {
 	AuthMode string
 	Clients  []ClientAuth
 
-	MaxRequestBytes int64
+	MaxRequestBytes     int64
 	MaxConcurrentWrites int
 
 	// Mode is reported by /v1/hello: server, plugin or proxy.

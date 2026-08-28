@@ -59,14 +59,14 @@ type mlBuffer struct {
 }
 
 type aggregator struct {
-	value           float64
-	start, end      time.Time
-	labels          map[string]string
-	fields          map[string]model.Value
-	set             string
-	line            string
-	field           string
-	mode            string
+	value      float64
+	start, end time.Time
+	labels     map[string]string
+	fields     map[string]model.Value
+	set        string
+	line       string
+	field      string
+	mode       string
 }
 
 // StreamOptions configure a new stream.

@@ -1,0 +1,76 @@
+# An example extraction spec. Nothing in the binaries knows this format:
+# the format lives here, and this file is data.
+version: 1
+
+defaults:
+  timestamp:
+    timezone: UTC
+    assume_year: file-mtime
+  labels: [host, source]
+
+identity:
+  # Content beats path, path beats nothing, and an explicit --label beats
+  # both: a file name is the least trustworthy thing about a log.
+  - match_path: '(?P<host>[^/]+)/[^/]+\.log$'
+
+profiles:
+  - name: appserver
+    select:
+      path_glob: ['*app*.log', '*app*.log.*']
+    timestamp:
+      formats:
+        - layout: '2006-01-02 15:04:05.000'
+          regex: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'
+      anchor: prefix
+      strip: true
+    labels: [pool, error_class, op]
+    fields:
+      requests_total:
+        kind: counter
+        unit: requests
+        unit_hint: short
+        max_interval: 20s
+        description: requests served since worker start
+        limits: {min: 0}
+      inflight:
+        kind: gauge
+        max_interval: 20s
+      heap_bytes:
+        kind: gauge
+        unit_hint: bytes
+        max_interval: 20s
+      errors:
+        kind: delta
+    patterns:
+      - set: app
+        search: 'stats: '
+        extract:
+          - 'stats: pool=(?P<pool>\S+) reqs=(?P<requests_total>\d+) inflight=(?P<inflight>\d+) heap=(?P<heap_bytes>\d+)'
+
+      - set: app_errors
+        search: 'ERROR '
+        extract:
+          - 'ERROR (?P<error_class>[A-Za-z.]+): '
+        # Counting occurrences per window rather than storing one row each.
+        aggregate: {every: 10s, on: [error_class], field: errors, mode: increment}
+
+      - set: app_latency
+        search: 'latency histogram'
+        bucket_set: hdr8
+        extract:
+          - 'latency histogram (?P<op>\S+) \((?P<total>\d+) total\) (?P<buckets>.*)'
+
+    bucket_sets:
+      - name: hdr8
+        parse: paren_pairs
+        buckets: ['00','01','02','03','04','05','06','07']
+        edges: pow2
+        edge_unit: ms
+        total_field: total
+        cumulative: true
+        tail: true
+
+sets:
+  app:         {retention: 30d, shard: 24h}
+  app_errors:  {retention: 90d, shard: 24h}
+  app_latency: {retention: 7d,  shard: 24h}

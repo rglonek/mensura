@@ -28,13 +28,13 @@ type betweenExpr struct {
 }
 type existsExpr struct{ col string }
 
-func And(sub ...Expr) Expr                       { return &andExpr{sub} }
-func Or(sub ...Expr) Expr                        { return &orExpr{sub} }
-func Not(e Expr) Expr                            { return &notExpr{e} }
-func Eq(col string, v model.Value) Expr          { return &eqExpr{col, v} }
-func In(col string, vals ...model.Value) Expr    { return &inExpr{col, vals} }
+func And(sub ...Expr) Expr                            { return &andExpr{sub} }
+func Or(sub ...Expr) Expr                             { return &orExpr{sub} }
+func Not(e Expr) Expr                                 { return &notExpr{e} }
+func Eq(col string, v model.Value) Expr               { return &eqExpr{col, v} }
+func In(col string, vals ...model.Value) Expr         { return &inExpr{col, vals} }
 func BetweenExpr(col string, lo, hi model.Value) Expr { return &betweenExpr{col, lo, hi} }
-func Exists(col string) Expr                     { return &existsExpr{col} }
+func Exists(col string) Expr                          { return &existsExpr{col} }
 
 func (e *andExpr) eval(r *lazyRow) bool {
 	for _, s := range e.sub {
@@ -64,8 +64,8 @@ func (e *orExpr) columns(into map[string]struct{}) {
 	}
 }
 
-func (e *notExpr) eval(r *lazyRow) bool              { return !e.sub.eval(r) }
-func (e *notExpr) columns(into map[string]struct{})  { e.sub.columns(into) }
+func (e *notExpr) eval(r *lazyRow) bool             { return !e.sub.eval(r) }
+func (e *notExpr) columns(into map[string]struct{}) { e.sub.columns(into) }
 
 func (e *existsExpr) eval(r *lazyRow) bool             { _, ok := r.get(e.col); return ok }
 func (e *existsExpr) columns(into map[string]struct{}) { into[e.col] = struct{}{} }
@@ -124,6 +124,6 @@ func valueEqual(a, b model.Value) bool {
 type constExpr struct{ v bool }
 
 // Const returns an expression that always evaluates to v.
-func Const(v bool) Expr                              { return &constExpr{v} }
-func (e *constExpr) eval(*lazyRow) bool              { return e.v }
-func (e *constExpr) columns(map[string]struct{})     {}
+func Const(v bool) Expr                          { return &constExpr{v} }
+func (e *constExpr) eval(*lazyRow) bool          { return e.v }
+func (e *constExpr) columns(map[string]struct{}) {}

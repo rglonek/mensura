@@ -37,7 +37,9 @@ type ErrFatal struct {
 	Msg    string
 }
 
-func (e *ErrFatal) Error() string { return fmt.Sprintf("store rejected the batch (%d): %s", e.Status, e.Msg) }
+func (e *ErrFatal) Error() string {
+	return fmt.Sprintf("store rejected the batch (%d): %s", e.Status, e.Msg)
+}
 
 // ErrRetryable marks a transient failure; the caller should back off.
 type ErrRetryable struct {

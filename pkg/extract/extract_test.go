@@ -270,13 +270,13 @@ func TestIdentityDiscovery(t *testing.T) {
 
 func TestCompileRejectsBadSpecs(t *testing.T) {
 	cases := map[string]string{
-		"unknown field":    "version: 1\nwat: true\n",
-		"bad version":      "version: 9\n",
-		"reserved set":     "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: _mensura_x\n        search: a\n        extract: ['(?P<v>x)']\n",
-		"no extract":       "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n",
-		"bad regex":        "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>']\n",
-		"unknown bucket":   "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>x)']\n        bucket_set: nope\n",
-		"no ts formats":    "version: 1\nprofiles:\n  - name: p\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>x)']\n",
+		"unknown field":  "version: 1\nwat: true\n",
+		"bad version":    "version: 9\n",
+		"reserved set":   "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: _mensura_x\n        search: a\n        extract: ['(?P<v>x)']\n",
+		"no extract":     "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n",
+		"bad regex":      "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>']\n",
+		"unknown bucket": "version: 1\nprofiles:\n  - name: p\n    timestamp:\n      formats: [{layout: epoch_ms, regex: 'x'}]\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>x)']\n        bucket_set: nope\n",
+		"no ts formats":  "version: 1\nprofiles:\n  - name: p\n    patterns:\n      - set: s\n        search: a\n        extract: ['(?P<v>x)']\n",
 	}
 	for name, src := range cases {
 		if _, err := Parse([]byte(src)); err == nil {

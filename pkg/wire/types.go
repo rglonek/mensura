@@ -118,31 +118,31 @@ type QueryStats struct {
 
 // Hello is the response of GET /v1/hello.
 type Hello struct {
-	Product         string `json:"product"`
-	Version         string `json:"version"`
-	Protocol        int    `json:"protocol"`
-	Mode            string `json:"mode"`
-	DataDir         string `json:"data_dir,omitempty"`
-	CatalogueVersion int64 `json:"catalogue_version"`
-	UptimeSeconds   int64  `json:"uptime_seconds"`
+	Product          string `json:"product"`
+	Version          string `json:"version"`
+	Protocol         int    `json:"protocol"`
+	Mode             string `json:"mode"`
+	DataDir          string `json:"data_dir,omitempty"`
+	CatalogueVersion int64  `json:"catalogue_version"`
+	UptimeSeconds    int64  `json:"uptime_seconds"`
 }
 
 // Catalogue is the response of GET /v1/catalogue: everything the query
 // builder needs to offer good defaults.
 type Catalogue struct {
-	Version   int64                 `json:"version"`
-	Sets      []SetInfo             `json:"sets"`
-	Conflicts []CatalogueConflict   `json:"conflicts,omitempty"`
+	Version   int64               `json:"version"`
+	Sets      []SetInfo           `json:"sets"`
+	Conflicts []CatalogueConflict `json:"conflicts,omitempty"`
 }
 
 type SetInfo struct {
-	Name       string                    `json:"name"`
-	Fields     map[string]mql.FieldInfo  `json:"fields"`
-	Labels     []string                  `json:"labels"`
-	BucketSets map[string]BucketSetInfo  `json:"bucket_sets,omitempty"`
-	FirstTSMs  int64                     `json:"first_ts_ms,omitempty"`
-	LastTSMs   int64                     `json:"last_ts_ms,omitempty"`
-	Shards     []string                  `json:"shards,omitempty"`
+	Name       string                   `json:"name"`
+	Fields     map[string]mql.FieldInfo `json:"fields"`
+	Labels     []string                 `json:"labels"`
+	BucketSets map[string]BucketSetInfo `json:"bucket_sets,omitempty"`
+	FirstTSMs  int64                    `json:"first_ts_ms,omitempty"`
+	LastTSMs   int64                    `json:"last_ts_ms,omitempty"`
+	Shards     []string                 `json:"shards,omitempty"`
 }
 
 type BucketSetInfo struct {

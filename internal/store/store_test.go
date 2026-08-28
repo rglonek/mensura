@@ -288,7 +288,7 @@ func TestCardinalityGuard(t *testing.T) {
 func TestReservedSetsRejected(t *testing.T) {
 	s := openTestStore(t)
 	resp, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{
-		Set: "_mensura_catalogue",
+		Set:     "_mensura_catalogue",
 		Samples: []model.Sample{{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}}},
 	}}}, "", "test")
 	if err != nil {

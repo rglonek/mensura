@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -597,6 +598,72 @@ func collectNamed(re *regexp.Regexp, m []string, into map[string]string) {
 		}
 		into[name] = m[i]
 	}
+}
+
+// SetDeclaration is what a profile promises about one destination set:
+// the metadata of the fields that set actually carries, and any bucket
+// sets its patterns populate. Metadata is declared per set because the
+// catalogue is per set, and a profile may write several.
+type SetDeclaration struct {
+	Set        string
+	Fields     map[string]FieldSpec
+	BucketSets []*BucketSet
+}
+
+// Declarations resolves the profile's field metadata onto the sets its
+// patterns write. A field is attributed to a set when a pattern writing
+// that set captures it.
+func (p *Profile) Declarations() []SetDeclaration {
+	bySet := map[string]*SetDeclaration{}
+	get := func(set string) *SetDeclaration {
+		d, ok := bySet[set]
+		if !ok {
+			d = &SetDeclaration{Set: set, Fields: map[string]FieldSpec{}}
+			bySet[set] = d
+		}
+		return d
+	}
+	for _, pat := range p.Patterns {
+		sets := []string{pat.Set}
+		for _, r := range pat.Route {
+			sets = append(sets, r.Set)
+		}
+		var captures []string
+		for _, re := range pat.extract {
+			captures = append(captures, re.SubexpNames()...)
+		}
+		for i := range pat.Route {
+			captures = append(captures, pat.Route[i].re.SubexpNames()...)
+		}
+		for k := range pat.DefaultValues {
+			captures = append(captures, k)
+		}
+		if pat.Aggregate != nil {
+			captures = append(captures, pat.Aggregate.Field)
+		}
+		for _, set := range sets {
+			d := get(set)
+			for _, name := range captures {
+				if name == "" {
+					continue
+				}
+				if fs, ok := p.Fields[name]; ok {
+					d.Fields[name] = fs
+				}
+			}
+			if pat.BucketSet != "" {
+				if bs, ok := p.buckets[pat.BucketSet]; ok {
+					d.BucketSets = append(d.BucketSets, bs)
+				}
+			}
+		}
+	}
+	out := make([]SetDeclaration, 0, len(bySet))
+	for _, d := range bySet {
+		out = append(out, *d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Set < out[j].Set })
+	return out
 }
 
 // FieldMeta exposes the declared metadata for one field.
