@@ -118,3 +118,12 @@ func valueEqual(a, b model.Value) bool {
 	bf, ok2 := b.AsFloat()
 	return ok1 && ok2 && af == bf
 }
+
+// constExpr is a folded constant, which is how the query planner expresses
+// "this comparison can never match" without inventing a sentinel value.
+type constExpr struct{ v bool }
+
+// Const returns an expression that always evaluates to v.
+func Const(v bool) Expr                              { return &constExpr{v} }
+func (e *constExpr) eval(*lazyRow) bool              { return e.v }
+func (e *constExpr) columns(map[string]struct{})     {}

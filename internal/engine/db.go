@@ -53,7 +53,11 @@ type DB struct {
 	nextID uint32
 
 	writeOpts *pebble.WriteOptions
-	stats     Stats
+	// metaOpts is used for schema and version records. It syncs only when
+	// the WAL is enabled: Pebble rejects a sync write outright when the
+	// WAL is off, and with no WAL there is nothing for a sync to flush.
+	metaOpts *pebble.WriteOptions
+	stats    Stats
 }
 
 // Stats are cheap counters plus the engine's own view of the LSM.
@@ -102,6 +106,10 @@ func Open(opts Options) (*DB, error) {
 	if opts.EnableWAL && opts.SyncWrites {
 		d.writeOpts = pebble.Sync
 	}
+	d.metaOpts = pebble.NoSync
+	if opts.EnableWAL {
+		d.metaOpts = pebble.Sync
+	}
 	if err := d.loadMeta(); err != nil {
 		_ = pdb.Close()
 		return nil, err
@@ -116,7 +124,7 @@ func (d *DB) loadMeta() error {
 	case err == pebble.ErrNotFound:
 		var b [4]byte
 		binary.BigEndian.PutUint32(b[:], currentStorageVersion)
-		if err := d.pdb.Set(verKey, b[:], pebble.Sync); err != nil {
+		if err := d.pdb.Set(verKey, b[:], d.metaOpts); err != nil {
 			return err
 		}
 	case err != nil:
@@ -158,7 +166,7 @@ func (d *DB) persistSet(sm *setMeta) error {
 	if err != nil {
 		return err
 	}
-	return d.pdb.Set(metaKey("set", sm.Name), b, pebble.Sync)
+	return d.pdb.Set(metaKey("set", sm.Name), b, d.metaOpts)
 }
 
 // RegisterSet declares a set up front. Calling it again with more columns
@@ -388,7 +396,7 @@ func (d *DB) DropSet(name string) error {
 	if err := b.Delete(metaKey("set", name), nil); err != nil {
 		return err
 	}
-	return d.pdb.Apply(b, pebble.Sync)
+	return d.pdb.Apply(b, d.metaOpts)
 }
 
 // PutDict and GetDict hold the label dictionaries under their own prefix,
@@ -471,6 +479,14 @@ func (d *DB) Close() error {
 	}
 	if n := d.stats.OpenIterators.Load(); n > 0 {
 		d.opts.Logger.Printf("WARNING closing with %d iterators still open", n)
+	}
+	// Flush explicitly: with the WAL off, anything still in a memtable is
+	// lost on close, so a clean shutdown has to push it down itself. This
+	// is what makes "a graceful stop is durable in every profile" true.
+	if err := d.pdb.Flush(); err != nil {
+		d.opts.Logger.Printf("ERROR flushing on close: %v", err)
+		_ = d.pdb.Close()
+		return err
 	}
 	return d.pdb.Close()
 }
