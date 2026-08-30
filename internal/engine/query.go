@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"math"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/rglonek/mensura/pkg/model"
@@ -73,9 +74,7 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
-	d.mu.RLock()
-	sm, ok := d.sets[q.set]
-	d.mu.RUnlock()
+	sm, ok := d.setRef(q.set)
 	if !ok {
 		return nil, ErrUnknownSet
 	}
@@ -91,17 +90,17 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 
 	var lower, upper []byte
 	indexed := false
-	if q.hasBet && q.betCol == sm.Indexed && sm.Indexed != "" {
+	if q.hasBet && sm.indexed != "" && q.betCol == sm.indexed {
 		indexed = true
-		lower = indexBound(sm.ID, sm.IndexCol, q.betLo)
+		lower = indexBound(sm.id, sm.indexCol, q.betLo)
 		hi := q.betHi
-		if hi == int64(^uint64(0)>>1) {
-			upper = prefixEnd(indexPrefix(sm.ID, sm.IndexCol))
+		if hi == math.MaxInt64 {
+			upper = prefixEnd(indexPrefix(sm.id, sm.indexCol))
 		} else {
-			upper = indexBound(sm.ID, sm.IndexCol, hi+1)
+			upper = indexBound(sm.id, sm.indexCol, hi+1)
 		}
-	} else if sm.Indexed != "" {
-		p := indexPrefix(sm.ID, sm.IndexCol)
+	} else if sm.indexed != "" {
+		p := indexPrefix(sm.id, sm.indexCol)
 		lower, upper = p, prefixEnd(p)
 		indexed = true
 		if q.hasBet {
@@ -117,7 +116,7 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 			}
 		}
 	} else {
-		p := dataPrefix(sm.ID)
+		p := dataPrefix(sm.id)
 		lower, upper = p, prefixEnd(p)
 	}
 
@@ -184,7 +183,12 @@ func (i *Iter) Next() bool {
 		i.db.stats.RowsScanned.Add(1)
 		if i.where != nil {
 			lr := newLazyRow(payload)
-			if !i.where.eval(lr) {
+			match := i.where.eval(lr)
+			if lr.err != nil {
+				i.err = lr.err
+				return false
+			}
+			if !match {
 				continue
 			}
 		}

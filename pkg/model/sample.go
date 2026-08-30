@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 )
 
@@ -51,9 +52,15 @@ func (s *Sample) Validate() error {
 	if len(s.Fields) == 0 {
 		return ErrNoFields
 	}
-	for k := range s.Labels {
+	for k, v := range s.Labels {
 		if err := ValidateLabelKey(k); err != nil {
 			return err
+		}
+		// The value is checked here too, not only where it is interned,
+		// so a bad label is named as a rejection rather than surfacing
+		// later as an opaque write failure.
+		if err := ValidateLabelValue(v); err != nil {
+			return fmt.Errorf("label %q: %w", k, err)
 		}
 	}
 	for k, v := range s.Fields {

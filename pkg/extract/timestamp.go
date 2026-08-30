@@ -83,17 +83,25 @@ func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, pre
 		return time.Time{}, err
 	}
 	// A year-less layout (classic syslog) parses into year 0. Resolve it
-	// against the declared reference year, then roll back a year if the
-	// result jumped implausibly far ahead of the previous record, which is
-	// what a December-to-January boundary looks like.
+	// against the declared reference year, then roll back a year only for
+	// the shape a December-to-January wrap actually has: a jump of most
+	// of a year forward. A plain multi-day gap — a weekly cron log, a
+	// host that was off over a weekend — is ordinary and must not be
+	// thrown a year into the past.
 	if ts.Year() == 0 {
 		ts = ts.AddDate(assumeYear, 0, 0)
-		if !prev.IsZero() && ts.Sub(prev) > 24*time.Hour {
+		if !prev.IsZero() && ts.Sub(prev) > yearWrapThreshold {
 			ts = ts.AddDate(-1, 0, 0)
 		}
 	}
 	return ts, nil
 }
+
+// yearWrapThreshold is how far ahead of the previous record a year-less
+// timestamp must land before it is read as last year's date rather than a
+// gap in the log. Half a year splits the two cases cleanly: a real wrap
+// lands ~11 months ahead, a gap almost never does.
+const yearWrapThreshold = 183 * 24 * time.Hour
 
 func trimSpace(s string) string {
 	i, j := 0, len(s)

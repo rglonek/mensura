@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +46,11 @@ type Config struct {
 	MaxSeriesPerGraph     int
 	MaxDataPointsReceived int
 	MaxLabelCardinality   int
-	MaxConcurrentJobs     int
+
+	// MaxConcurrentJobs bounds how many queries may execute at once. A
+	// query buffers its series in memory, so an unbounded number of them
+	// is an unbounded memory footprint.
+	MaxConcurrentJobs int
 
 	Logger *log.Logger
 }
@@ -78,11 +84,21 @@ type Store struct {
 	dictMu sync.RWMutex
 	dict   map[string]*dictionary
 
+	// Spec-supplied retention and shard overrides. They are separate from
+	// cfg because cfg is read without a lock on the write path.
+	retentionMu  sync.RWMutex
+	setRetention map[string]time.Duration
+	setShard     map[string]time.Duration
+
 	idem *idempotencyCache
 
-	started time.Time
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	// jobs bounds concurrent query execution.
+	jobs chan struct{}
+
+	started  time.Time
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // setEntry is the catalogue record for one logical set.
@@ -157,13 +173,16 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		cfg:       cfg,
-		db:        db,
-		catalogue: map[string]*setEntry{},
-		dict:      map[string]*dictionary{},
-		idem:      newIdempotencyCache(4096),
-		started:   time.Now(),
-		stopCh:    make(chan struct{}),
+		cfg:          cfg,
+		db:           db,
+		catalogue:    map[string]*setEntry{},
+		dict:         map[string]*dictionary{},
+		setRetention: map[string]time.Duration{},
+		setShard:     map[string]time.Duration{},
+		idem:         newIdempotencyCache(4096),
+		jobs:         make(chan struct{}, cfg.MaxConcurrentJobs),
+		started:      time.Now(),
+		stopCh:       make(chan struct{}),
 	}
 	if err := s.loadCatalogue(); err != nil {
 		_ = db.Close()
@@ -173,19 +192,36 @@ func Open(cfg Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if cfg.RetentionSweep > 0 && cfg.Retention > 0 {
+	s.warnInexactShardWidths()
+	// A per-set retention with no global default still needs a sweep, so
+	// the trigger is "anything is retained", not "the default is set".
+	if cfg.RetentionSweep > 0 && s.hasAnyRetention() {
 		s.wg.Add(1)
 		go s.retentionLoop()
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error {
-	select {
-	case <-s.stopCh:
-	default:
-		close(s.stopCh)
+// warnInexactShardWidths says so when a configured shard width is not one
+// the suffix encoding can express, rather than rounding in silence.
+func (s *Store) warnInexactShardWidths() {
+	report := func(what string, w time.Duration) {
+		if w <= 0 {
+			return
+		}
+		if hours, exact := normaliseShardWidth(w); !exact {
+			s.cfg.Logger.Printf("WARNING %s shard width %s is not a whole number of days or an hour count dividing a day; using %dh",
+				what, w, hours)
+		}
 	}
+	report("default", s.cfg.Shard)
+	for name, w := range s.cfg.SetShard {
+		report("set "+name, w)
+	}
+}
+
+func (s *Store) Close() error {
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	s.wg.Wait()
 	if err := s.saveCatalogue(); err != nil {
 		s.cfg.Logger.Printf("ERROR saving catalogue on close: %v", err)
@@ -246,13 +282,47 @@ func (s *Store) saveCatalogue() error {
 
 // ---------- label dictionary ----------
 
+// dictEntryPrefix marks a single interned value. One record per value, so
+// adding the n-th value costs one small write rather than a rewrite of the
+// whole array; DictKeys returns them sorted, and the zero-padded index in
+// the key makes that sort the insertion order.
+const dictEntryPrefix = "labelv:"
+
+// dictPackedPrefix is the original whole-array form. It is still read so a
+// data directory written by an earlier build opens, but never written.
+const dictPackedPrefix = "label:"
+
+func dictEntryKey(label string, idx int32) string {
+	return fmt.Sprintf("%s%s\x00%010d", dictEntryPrefix, label, idx)
+}
+
+// splitDictEntryKey recovers the label key from a per-value record name.
+func splitDictEntryKey(k string) (string, bool) {
+	rest, ok := strings.CutPrefix(k, dictEntryPrefix)
+	if !ok {
+		return "", false
+	}
+	label, _, ok := strings.Cut(rest, "\x00")
+	return label, ok
+}
+
 func (s *Store) loadDictionaries() error {
 	keys, err := s.db.DictKeys()
 	if err != nil {
 		return err
 	}
+	get := func(label string) *dictionary {
+		d, ok := s.dict[label]
+		if !ok {
+			d = &dictionary{index: map[string]int32{}}
+			s.dict[label] = d
+		}
+		return d
+	}
+	// Legacy packed arrays first, so per-value records written afterwards
+	// append to them rather than shadowing them.
 	for _, k := range keys {
-		if !strings.HasPrefix(k, "label:") {
+		if !strings.HasPrefix(k, dictPackedPrefix) {
 			continue
 		}
 		b, ok, err := s.db.GetDict(k)
@@ -267,7 +337,24 @@ func (s *Store) loadDictionaries() error {
 		for i, e := range d.Entries {
 			d.index[e] = int32(i)
 		}
-		s.dict[strings.TrimPrefix(k, "label:")] = &d
+		s.dict[strings.TrimPrefix(k, dictPackedPrefix)] = &d
+	}
+	for _, k := range keys {
+		label, ok := splitDictEntryKey(k)
+		if !ok {
+			continue
+		}
+		b, found, err := s.db.GetDict(k)
+		if err != nil || !found {
+			continue
+		}
+		d := get(label)
+		v := string(b)
+		if _, dup := d.index[v]; dup {
+			continue
+		}
+		d.index[v] = int32(len(d.Entries))
+		d.Entries = append(d.Entries, v)
 	}
 	return nil
 }
@@ -301,15 +388,14 @@ func (s *Store) intern(key, value string) (int32, error) {
 		return 0, fmt.Errorf("label %q exceeds the cardinality limit of %d distinct values", key, s.cfg.MaxLabelCardinality)
 	}
 	idx := int32(len(d.Entries))
+	// One record for the new value only. Rewriting the whole array here
+	// would make interning the n-th value cost O(n) bytes, so filling a
+	// 100k-value dictionary would write ~5 GB under the dictionary lock.
+	if err := s.db.PutDict(dictEntryKey(key, idx), []byte(value)); err != nil {
+		return 0, err
+	}
 	d.Entries = append(d.Entries, value)
 	d.index[value] = idx
-	b, err := json.Marshal(d)
-	if err != nil {
-		return 0, err
-	}
-	if err := s.db.PutDict("label:"+key, b); err != nil {
-		return 0, err
-	}
 	return idx, nil
 }
 
@@ -354,14 +440,43 @@ func (s *Store) LabelValues(key string) []string {
 
 const shardAll = "all"
 
+// subDayShardHours are the sub-day widths the suffix encoding can express
+// exactly: whole hours that divide a day, so a shard never straddles a day
+// boundary.
+var subDayShardHours = []int{1, 2, 3, 4, 6, 8, 12}
+
+// normaliseShardWidth rounds a configured width down onto the nearest
+// width the encoding can represent, and reports whether that was exact.
+// Returning the width in whole hours keeps the boundary arithmetic in
+// integers.
+func normaliseShardWidth(w time.Duration) (hours int, exact bool) {
+	if w >= 24*time.Hour {
+		days := int(w / (24 * time.Hour))
+		return days * 24, w == time.Duration(days)*24*time.Hour
+	}
+	want := int(w / time.Hour)
+	best := 1
+	for _, h := range subDayShardHours {
+		if h <= want {
+			best = h
+		}
+	}
+	return best, time.Duration(best)*time.Hour == w
+}
+
 func (s *Store) shardWidth(set string) time.Duration {
-	if w, ok := s.cfg.SetShard[set]; ok && w > 0 {
+	s.retentionMu.RLock()
+	w, ok := s.setShard[set]
+	s.retentionMu.RUnlock()
+	if !ok {
+		w, ok = s.cfg.SetShard[set]
+	}
+	if ok && w > 0 {
 		return w
 	}
-	if s.cfg.Retention == 0 && len(s.cfg.SetRetention) == 0 {
-		return 0
-	}
-	if r, ok := s.cfg.SetRetention[set]; ok && r == 0 {
+	// Sharding exists so retention can be a range delete. A set that is
+	// never dropped gains nothing from being split.
+	if s.retentionFor(set) <= 0 {
 		return 0
 	}
 	return s.cfg.Shard
@@ -370,30 +485,61 @@ func (s *Store) shardWidth(set string) time.Duration {
 // shardName routes a timestamp to its physical set. '@' is excluded from
 // the set-name charset precisely so this suffix cannot collide with a
 // caller-chosen name.
+//
+// The suffix carries its own width for anything but the two original
+// granularities, because the width is what decides whether a shard
+// overlaps a query range and when retention may drop it: deriving it from
+// the suffix length would silently mis-size every other configured width.
 func (s *Store) shardName(set string, tsMs int64) string {
 	w := s.shardWidth(set)
 	if w <= 0 {
 		return set + "@" + shardAll
 	}
+	hours, _ := normaliseShardWidth(w)
 	t := time.UnixMilli(tsMs).UTC()
-	if w >= 24*time.Hour {
-		return set + "@" + t.Format("20060102")
+	if hours%24 == 0 {
+		days := hours / 24
+		day := t.Unix() / 86400
+		start := time.Unix((day-mod(day, int64(days)))*86400, 0).UTC()
+		if days == 1 {
+			return set + "@" + start.Format("20060102")
+		}
+		return set + "@" + start.Format("20060102") + "-" + strconv.Itoa(days) + "d"
 	}
-	return set + "@" + t.Format("2006010215")
+	start := time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-t.Hour()%hours, 0, 0, 0, time.UTC)
+	if hours == 1 {
+		return set + "@" + start.Format("2006010215")
+	}
+	return set + "@" + start.Format("2006010215") + "-" + strconv.Itoa(hours) + "h"
+}
+
+// mod is a non-negative modulo, so a pre-epoch timestamp still floors onto
+// a bucket boundary rather than jumping forward.
+func mod(a, b int64) int64 {
+	m := a % b
+	if m < 0 {
+		m += b
+	}
+	return m
 }
 
 // shardsFor lists the physical shards of a logical set that overlap a time
 // range, oldest first.
 func (s *Store) shardsFor(set string, fromMs, toMs int64) []string {
 	prefix := set + "@"
-	var out []string
+	type shard struct {
+		name  string
+		start int64
+	}
+	var found []shard
 	for _, name := range s.db.Sets() {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
 		suffix := name[len(prefix):]
 		if suffix == shardAll {
-			out = append(out, name)
+			// The unsharded shard covers everything, so it sorts first.
+			found = append(found, shard{name, math.MinInt64})
 			continue
 		}
 		start, width, err := parseShardSuffix(suffix)
@@ -404,38 +550,63 @@ func (s *Store) shardsFor(set string, fromMs, toMs int64) []string {
 		if end.UnixMilli() <= fromMs || start.UnixMilli() > toMs {
 			continue
 		}
-		out = append(out, name)
+		found = append(found, shard{name, start.UnixMilli()})
 	}
-	sort.Strings(out)
-	return out
-}
-
-func parseShardSuffix(suffix string) (time.Time, time.Duration, error) {
-	switch len(suffix) {
-	case 8:
-		t, err := time.ParseInLocation("20060102", suffix, time.UTC)
-		return t, 24 * time.Hour, err
-	case 10:
-		t, err := time.ParseInLocation("2006010215", suffix, time.UTC)
-		return t, time.Hour, err
-	}
-	return time.Time{}, 0, fmt.Errorf("store: unrecognised shard suffix %q", suffix)
-}
-
-// logicalSets lists the logical set names behind the physical shards.
-func (s *Store) logicalSets() []string {
-	seen := map[string]struct{}{}
-	for _, name := range s.db.Sets() {
-		if i := strings.LastIndex(name, "@"); i > 0 {
-			seen[name[:i]] = struct{}{}
+	// Chronological, not lexicographic: "all" sorts after digits, so a set
+	// that has both forms would otherwise be scanned out of time order.
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].start != found[j].start {
+			return found[i].start < found[j].start
 		}
+		return found[i].name < found[j].name
+	})
+	out := make([]string, 0, len(found))
+	for _, f := range found {
+		out = append(out, f.name)
 	}
-	out := make([]string, 0, len(seen))
-	for n := range seen {
-		out = append(out, n)
-	}
-	sort.Strings(out)
 	return out
+}
+
+// parseShardSuffix recovers a shard's start and width. The bare forms are
+// the original 1-hour and 1-day granularities; anything else carries an
+// explicit "-<n>h" or "-<n>d" width.
+func parseShardSuffix(suffix string) (time.Time, time.Duration, error) {
+	stamp, unit, hasUnit := strings.Cut(suffix, "-")
+	var (
+		t     time.Time
+		err   error
+		width time.Duration
+	)
+	switch len(stamp) {
+	case 8:
+		t, err = time.ParseInLocation("20060102", stamp, time.UTC)
+		width = 24 * time.Hour
+	case 10:
+		t, err = time.ParseInLocation("2006010215", stamp, time.UTC)
+		width = time.Hour
+	default:
+		return time.Time{}, 0, fmt.Errorf("store: unrecognised shard suffix %q", suffix)
+	}
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	if !hasUnit {
+		return t, width, nil
+	}
+	if len(unit) < 2 {
+		return time.Time{}, 0, fmt.Errorf("store: unrecognised shard width %q", suffix)
+	}
+	n, cerr := strconv.Atoi(unit[:len(unit)-1])
+	if cerr != nil || n <= 0 {
+		return time.Time{}, 0, fmt.Errorf("store: unrecognised shard width %q", suffix)
+	}
+	switch unit[len(unit)-1] {
+	case 'h':
+		return t, time.Duration(n) * time.Hour, nil
+	case 'd':
+		return t, time.Duration(n) * 24 * time.Hour, nil
+	}
+	return time.Time{}, 0, fmt.Errorf("store: unrecognised shard width %q", suffix)
 }
 
 // ---------- retention ----------
@@ -463,6 +634,7 @@ func (s *Store) retentionLoop() {
 // point tombstones.
 func (s *Store) RunRetention(now time.Time) (int, error) {
 	dropped := 0
+	emptied := map[string]struct{}{}
 	for _, name := range s.db.Sets() {
 		i := strings.LastIndex(name, "@")
 		if i <= 0 {
@@ -472,10 +644,7 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		if suffix == shardAll {
 			continue
 		}
-		retention := s.cfg.Retention
-		if r, ok := s.cfg.SetRetention[logical]; ok {
-			retention = r
-		}
+		retention := s.retentionFor(logical)
 		if retention <= 0 {
 			continue
 		}
@@ -488,7 +657,20 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 				return dropped, err
 			}
 			dropped++
+			emptied[logical] = struct{}{}
 		}
+	}
+	// A set whose every shard has aged out is gone; leaving its catalogue
+	// entry behind would keep advertising fields and a time range that no
+	// longer have any data under them.
+	for logical := range emptied {
+		if len(s.shardsFor(logical, math.MinInt64, math.MaxInt64)) > 0 {
+			continue
+		}
+		s.mu.Lock()
+		delete(s.catalogue, logical)
+		s.mu.Unlock()
+		s.catVer.Add(1)
 	}
 	return dropped, nil
 }
@@ -580,7 +762,7 @@ func (s *Store) Catalogue() wire.Catalogue {
 			Fields:    map[string]mql.FieldInfo{},
 			FirstTSMs: e.FirstTSMs,
 			LastTSMs:  e.LastTSMs,
-			Shards:    s.shardsFor(name, 0, 1<<62),
+			Shards:    s.shardsFor(name, math.MinInt64, math.MaxInt64),
 		}
 		for f, fe := range e.Fields {
 			info.Fields[f] = mql.FieldInfo{

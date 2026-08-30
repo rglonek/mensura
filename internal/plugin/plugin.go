@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -127,9 +129,16 @@ func (d *Datasource) runOne(ctx context.Context, q backend.DataQuery, fromAlert 
 func toFrames(resp *wire.QueryResponse, executed string) data.Frames {
 	frames := make(data.Frames, 0, len(resp.Series)+1)
 	for _, s := range resp.Series {
-		times := make([]time.Time, len(s.TSMs))
-		values := make([]*float64, len(s.TSMs))
-		for i := range s.TSMs {
+		// The arrays travel separately on the wire; in proxy mode they
+		// come from another process, so their lengths are checked rather
+		// than assumed.
+		n := len(s.TSMs)
+		if len(s.Values) < n {
+			n = len(s.Values)
+		}
+		times := make([]time.Time, n)
+		values := make([]*float64, n)
+		for i := 0; i < n; i++ {
 			times[i] = time.UnixMilli(s.TSMs[i])
 			if i < len(s.IsNull) && s.IsNull[i] {
 				continue // a nil value is the connect-break
@@ -335,36 +344,17 @@ func (d *Datasource) CallResource(ctx context.Context, req *backend.CallResource
 	return send(http.StatusNotFound, map[string]string{"error": "unknown resource " + req.Path})
 }
 
+// queryParam reads one query parameter, percent-decoded. A hand-rolled
+// scan that skipped decoding would hand "my%20set" to the catalogue and
+// report it as an unknown set.
 func queryParam(rawURL, key string) string {
-	i := indexByte(rawURL, '?')
+	i := strings.IndexByte(rawURL, '?')
 	if i < 0 {
 		return ""
 	}
-	for _, pair := range splitAll(rawURL[i+1:], '&') {
-		if j := indexByte(pair, '='); j > 0 && pair[:j] == key {
-			return pair[j+1:]
-		}
+	vals, err := url.ParseQuery(rawURL[i+1:])
+	if err != nil {
+		return ""
 	}
-	return ""
-}
-
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
-
-func splitAll(s string, sep byte) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	return append(out, s[start:])
+	return vals.Get(key)
 }

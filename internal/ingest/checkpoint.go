@@ -28,6 +28,8 @@ type Checkpoint struct {
 type CheckpointStore struct {
 	dir string
 	mu  sync.Mutex
+	// Log, when set, reports a checkpoint that could not be read.
+	Log Logger
 }
 
 func NewCheckpointStore(dir string) (*CheckpointStore, error) {
@@ -50,23 +52,37 @@ func (c *CheckpointStore) file(stream string) string {
 	return filepath.Join(c.dir, stream+".json")
 }
 
+// Load reads a checkpoint. A missing file is a normal first run; an
+// unreadable one is not, and is reported rather than silently treated as
+// "start from the beginning".
 func (c *CheckpointStore) Load(stream string) (*Checkpoint, bool) {
 	if c.dir == "" {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, err := os.ReadFile(c.file(stream))
+	path := c.file(stream)
+	b, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) && c.Log != nil {
+			c.Log.Printf("WARNING checkpoint %s is unreadable (%v); this stream will be re-read", path, err)
+		}
 		return nil, false
 	}
 	var cp Checkpoint
-	if json.Unmarshal(b, &cp) != nil {
+	if err := json.Unmarshal(b, &cp); err != nil {
+		if c.Log != nil {
+			c.Log.Printf("WARNING checkpoint %s is corrupt (%v); this stream will be re-read", path, err)
+		}
 		return nil, false
 	}
 	return &cp, true
 }
 
+// Save writes a checkpoint atomically and durably: the temporary file is
+// fsynced before the rename and the directory afterwards, because a
+// checkpoint that survives only in the page cache is of no use for the one
+// event it exists for.
 func (c *CheckpointStore) Save(cp *Checkpoint) error {
 	if c.dir == "" {
 		return nil
@@ -78,8 +94,31 @@ func (c *CheckpointStore) Save(cp *Checkpoint) error {
 		return err
 	}
 	tmp := c.file(cp.Stream) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.file(cp.Stream))
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, c.file(cp.Stream)); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if d, derr := os.Open(c.dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

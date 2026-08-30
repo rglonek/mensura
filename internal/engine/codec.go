@@ -147,6 +147,7 @@ func decodeRow(payload []byte, projection map[string]struct{}) (Row, error) {
 type lazyRow struct {
 	payload []byte
 	cache   map[string]model.Value
+	err     error
 }
 
 func newLazyRow(payload []byte) *lazyRow {
@@ -158,7 +159,7 @@ func (l *lazyRow) get(name string) (model.Value, bool) {
 		return v, v.Valid()
 	}
 	var found model.Value
-	_ = walkRow(l.payload, func(n string, t model.ValueType, raw []byte) bool {
+	if err := walkRow(l.payload, func(n string, t model.ValueType, raw []byte) bool {
 		if n != name {
 			return true
 		}
@@ -166,7 +167,12 @@ func (l *lazyRow) get(name string) (model.Value, bool) {
 			found = v
 		}
 		return false
-	})
+	}); err != nil {
+		// A corrupt payload must not read as "the column is absent": a
+		// pushdown filter would then quietly exclude the row instead of
+		// letting the scan report the corruption.
+		l.err = err
+	}
 	l.cache[name] = found
 	return found, found.Valid()
 }

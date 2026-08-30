@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"net/url"
 
 	"github.com/rglonek/mensura/internal/store"
 	"github.com/rglonek/mensura/pkg/mql"
@@ -25,11 +26,14 @@ func (l *localService) LabelValues(_ context.Context, key string) ([]string, err
 }
 
 func (l *localService) Hello(context.Context) (wire.Hello, error) {
+	cfg := l.store.Config()
 	return wire.Hello{
 		Product: "mensura-store", Version: store.Version, Protocol: wire.ProtocolVersion,
-		Mode: "plugin", DataDir: l.store.Config().DataDir,
-		CatalogueVersion: l.store.CatalogueVersion(),
-		UptimeSeconds:    int64(l.store.Uptime().Seconds()),
+		Mode: "plugin", DataDir: cfg.DataDir,
+		CatalogueVersion:      l.store.CatalogueVersion(),
+		UptimeSeconds:         int64(l.store.Uptime().Seconds()),
+		MaxSeriesPerGraph:     cfg.MaxSeriesPerGraph,
+		MaxDataPointsReceived: cfg.MaxDataPointsReceived,
 	}, nil
 }
 
@@ -59,7 +63,10 @@ func (r *remoteService) Catalogue(ctx context.Context) (wire.Catalogue, error) {
 
 func (r *remoteService) LabelValues(ctx context.Context, key string) ([]string, error) {
 	var out wire.LabelValues
-	if err := r.client.GetJSON(ctx, "/v1/labels?key="+key, &out); err != nil {
+	// The key is escaped: an unescaped '&' or '#' would truncate the
+	// query string or silently add a parameter.
+	path := "/v1/labels?" + url.Values{"key": {key}}.Encode()
+	if err := r.client.GetJSON(ctx, path, &out); err != nil {
 		return nil, err
 	}
 	return out.Values, nil
@@ -83,7 +90,13 @@ func (r *remoteService) Parse(ctx context.Context, text string) (*mql.Query, []m
 	if err != nil {
 		return q, nil, nil
 	}
-	warns, verr := mql.Validate(q, catalogueSchema{cat}, 0, 0)
+	// The upstream store's ceilings, so proxy mode validates a LIMIT the
+	// same way embedded mode does rather than accepting anything.
+	maxSeries, maxPoints := 0, 0
+	if h, herr := r.Hello(ctx); herr == nil {
+		maxSeries, maxPoints = h.MaxSeriesPerGraph, h.MaxDataPointsReceived
+	}
+	warns, verr := mql.Validate(q, catalogueSchema{cat}, maxSeries, maxPoints)
 	return q, warns, verr
 }
 

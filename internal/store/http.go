@@ -1,19 +1,25 @@
 package store
 
 import (
+	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/rglonek/mensura/pkg/model"
 	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
 )
@@ -105,13 +111,32 @@ func (a *API) Handler() http.Handler {
 }
 
 // DebugHandler is the loopback-only surface: it explains plans and dumps
-// statistics, and it is never mounted on a listener that anything else can
-// reach.
+// statistics.
+//
+// "Loopback-only" is enforced here rather than assumed. The startup check
+// refuses a non-loopback debug bind, and every request is additionally
+// required to come from a loopback peer, so a reverse proxy or a
+// misconfigured listener cannot turn the debug API into a public one.
 func (a *API) DebugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/debug/plan", a.handleExplain)
 	mux.HandleFunc("/v1/debug/stats", func(w http.ResponseWriter, r *http.Request) { a.handleStats(w, r, "debug") })
-	return mux
+	return loopbackOnly(mux, a.store.cfg.Logger)
+}
+
+// loopbackOnly rejects any request whose peer is not on the loopback
+// interface.
+func loopbackOnly(h http.Handler, logger *log.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := remoteHost(r)
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			logger.Printf("WARNING rejected debug request %s %s from non-loopback %s", r.Method, r.URL.Path, host)
+			writeErr(w, http.StatusForbidden, "the debug API is loopback-only")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // MetricsHandler serves Prometheus text exposition on its own listener, so
@@ -191,8 +216,10 @@ func (a *API) handleHello(w http.ResponseWriter, r *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, wire.Hello{
 		Product: "mensura-store", Version: Version, Protocol: wire.ProtocolVersion,
 		Mode: a.cfg.Mode, DataDir: a.store.cfg.DataDir,
-		CatalogueVersion: a.store.CatalogueVersion(),
-		UptimeSeconds:    int64(a.store.Uptime().Seconds()),
+		CatalogueVersion:      a.store.CatalogueVersion(),
+		UptimeSeconds:         int64(a.store.Uptime().Seconds()),
+		MaxSeriesPerGraph:     a.store.cfg.MaxSeriesPerGraph,
+		MaxDataPointsReceived: a.store.cfg.MaxDataPointsReceived,
 	})
 }
 
@@ -201,6 +228,24 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 		writeErr(w, http.StatusMethodNotAllowed, "use POST")
 		return
 	}
+	// The body is read before a write slot is taken. Holding a slot across
+	// the read would let MaxConcurrentWrites slow clients occupy the whole
+	// pool without ever presenting a batch.
+	body, err := readBody(r, a.cfg.MaxRequestBytes)
+	if err != nil {
+		a.writeErrs.Add(1)
+		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	var req wire.WriteRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields() // a typo must fail loudly, not silently
+	if err := dec.Decode(&req); err != nil {
+		a.writeErrs.Add(1)
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	select {
 	case a.writeSlots <- struct{}{}:
 		defer func() { <-a.writeSlots }()
@@ -209,21 +254,6 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 		// its readers, which stops its sources.
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, http.StatusServiceUnavailable, "write queue is full")
-		return
-	}
-
-	body, err := readBody(r, a.cfg.MaxRequestBytes)
-	if err != nil {
-		a.writeErrs.Add(1)
-		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
-		return
-	}
-	var req wire.WriteRequest
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields() // a typo must fail loudly, not silently
-	if err := dec.Decode(&req); err != nil {
-		a.writeErrs.Add(1)
-		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	resp, err := a.store.Write(&req, r.Header.Get("Idempotency-Key"), client)
@@ -248,7 +278,7 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	var req wire.QueryRequest
-	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -258,13 +288,18 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 	resp, err := a.store.Query(r.Context(), &req)
 	if err != nil {
 		a.queryErrs.Add(1)
-		code := http.StatusBadRequest
 		var d mql.Diag
-		if ok := asDiag(err, &d); ok {
-			writeJSONErr(w, code, d.Msg, d.Code)
+		if asDiag(err, &d) {
+			writeJSONErr(w, http.StatusBadRequest, d.Msg, d.Code)
 			return
 		}
-		writeErr(w, code, err.Error())
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// The client went away; there is nobody to read a body.
+			return
+		}
+		// Anything else came from the engine, not from the request. A 400
+		// would tell the caller to fix a query that is not the problem.
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -300,10 +335,17 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
+	// Every body-reading handler goes through readBody, so none of them
+	// can be used to make the store buffer an unbounded request.
+	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	if rerr != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		return
+	}
 	var body struct {
 		Text string `json:"text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -326,8 +368,13 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
+	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	if rerr != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		return
+	}
 	var q mql.Query
-	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+	if err := json.Unmarshal(raw, &q); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -335,8 +382,13 @@ func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
+	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	if rerr != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		return
+	}
 	var req wire.QueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(raw, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -353,6 +405,9 @@ func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleCompact(w http.ResponseWriter, r *http.Request, _ string) {
+	if !requirePost(w, r) {
+		return
+	}
 	if err := a.store.Compact(); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -361,6 +416,9 @@ func (a *API) handleCompact(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleRetention(w http.ResponseWriter, r *http.Request, _ string) {
+	if !requirePost(w, r) {
+		return
+	}
 	n, err := a.store.RunRetention(time.Now())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -373,6 +431,9 @@ func (a *API) handleRetention(w http.ResponseWriter, r *http.Request, _ string) 
 // directory is meaningful. Copying a live directory without this yields an
 // LSM in an unknown state.
 func (a *API) handleQuiesce(w http.ResponseWriter, r *http.Request, _ string) {
+	if !requirePost(w, r) {
+		return
+	}
 	if err := a.store.SaveCatalogue(); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -394,8 +455,12 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusBadRequest, "set name is required")
 		return
 	}
+	if err := model.ValidateSetName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	dropped := 0
-	for _, shard := range a.store.shardsFor(name, 0, 1<<62) {
+	for _, shard := range a.store.shardsFor(name, math.MinInt64, math.MaxInt64) {
 		if err := a.store.db.DropSet(shard); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -409,6 +474,19 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, map[string]any{"shards_dropped": dropped})
 }
 
+// requirePost keeps a state-changing admin endpoint off GET, so it cannot
+// be triggered by anything that merely follows a link.
+func requirePost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		return true
+	}
+	writeErr(w, http.StatusMethodNotAllowed, "use POST")
+	return false
+}
+
+// readBody reads at most max bytes, before and after decompression. It
+// reports an oversized body as an error rather than silently handing back
+// a truncated prefix that would then fail to parse for the wrong reason.
 func readBody(r *http.Request, max int64) ([]byte, error) {
 	var reader io.Reader = http.MaxBytesReader(nil, r.Body, max)
 	if r.Header.Get("Content-Encoding") == "gzip" {
@@ -417,9 +495,18 @@ func readBody(r *http.Request, max int64) ([]byte, error) {
 			return nil, err
 		}
 		defer zr.Close()
-		reader = io.LimitReader(zr, max)
+		// One byte past the limit, so a body that fills it exactly is
+		// distinguishable from one that overran it.
+		reader = io.LimitReader(zr, max+1)
 	}
-	return io.ReadAll(reader)
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("request body exceeds the %d byte limit", max)
+	}
+	return b, nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -436,18 +523,6 @@ func writeJSONErr(w http.ResponseWriter, status int, msg, code string) {
 	writeJSON(w, status, wire.APIError{Error: msg, Code: code})
 }
 
-func asDiag(err error, out *mql.Diag) bool {
-	d, ok := err.(mql.Diag)
-	if ok {
-		*out = d
-	}
-	return ok
-}
+func asDiag(err error, out *mql.Diag) bool { return errors.As(err, out) }
 
-func asParseError(err error, out **mql.ParseError) bool {
-	pe, ok := err.(*mql.ParseError)
-	if ok {
-		*out = pe
-	}
-	return ok
-}
+func asParseError(err error, out **mql.ParseError) bool { return errors.As(err, out) }

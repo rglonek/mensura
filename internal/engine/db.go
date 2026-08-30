@@ -40,6 +40,32 @@ type setMeta struct {
 	IndexCol uint32 // column id of the indexed column within this set
 }
 
+// indexedColumnID is the column id given to a set's indexed column. It is
+// a constant rather than a position in the column map, whose iteration
+// order is random: the id lands in every index key, so deriving it from
+// anything unstable would make the keyspace depend on map ordering.
+const indexedColumnID uint32 = 1
+
+// setRef is an immutable snapshot of the schema fields the read paths
+// need. They take one under the lock and then work from the copy, because
+// reading the live *setMeta after unlocking races with the first write
+// that widens the schema.
+type setRef struct {
+	id       uint32
+	indexed  string
+	indexCol uint32
+}
+
+func (d *DB) setRef(name string) (setRef, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	sm, ok := d.sets[name]
+	if !ok {
+		return setRef{}, false
+	}
+	return setRef{id: sm.ID, indexed: sm.Indexed, indexCol: sm.IndexCol}, true
+}
+
 // DB is the store. It is safe for concurrent use; iterators are not safe
 // to share across goroutines.
 type DB struct {
@@ -93,6 +119,11 @@ func Open(opts Options) (*DB, error) {
 	}
 	po := opts.pebbleOptions()
 	pdb, err := pebble.Open(opts.Path, po)
+	if po.Cache != nil {
+		// Open has taken its own reference; release ours either way, or
+		// the cache outlives every DB that ever used it.
+		po.Cache.Unref()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("engine: open %s: %w", opts.Path, err)
 	}
@@ -130,6 +161,10 @@ func (d *DB) loadMeta() error {
 	case err != nil:
 		return err
 	default:
+		if len(v) < 4 {
+			_ = closer.Close()
+			return fmt.Errorf("%w: version record is %d bytes", ErrStorageVersionMismatch, len(v))
+		}
 		got := binary.BigEndian.Uint32(v)
 		_ = closer.Close()
 		if got != currentStorageVersion {
@@ -200,7 +235,7 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 			changed = true
 			if c.Indexed && sm.Indexed == "" {
 				sm.Indexed = c.Name
-				sm.IndexCol = uint32(len(sm.Columns))
+				sm.IndexCol = indexedColumnID
 			}
 			continue
 		}
@@ -331,13 +366,11 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 		return nil, false, ErrClosed
 	}
 	d.stats.Gets.Add(1)
-	d.mu.RLock()
-	sm, ok := d.sets[set]
-	d.mu.RUnlock()
+	sm, ok := d.setRef(set)
 	if !ok {
 		return nil, false, ErrUnknownSet
 	}
-	val, closer, err := d.pdb.Get(dataKey(sm.ID, pk))
+	val, closer, err := d.pdb.Get(dataKey(sm.id, pk))
 	if err == pebble.ErrNotFound {
 		return nil, false, nil
 	}
@@ -347,23 +380,27 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 	payload := append([]byte(nil), val...)
 	_ = closer.Close()
 
-	if sm.Indexed != "" {
-		if len(payload) != 8 {
-			return nil, false, errCorruptRow
-		}
+	// On an indexed set the D/ value is normally an 8-byte forward
+	// pointer, but PutBatch also stores a row that carries no indexed
+	// column there, payload and all. Follow the pointer when it leads
+	// somewhere and fall back to reading the bytes as a row when it does
+	// not, so such a row is returned rather than reported corrupt.
+	if sm.indexed != "" && len(payload) == 8 {
 		ts := unbiasInt(binary.BigEndian.Uint64(payload))
-		v2, c2, err := d.pdb.Get(indexKey(sm.ID, sm.IndexCol, ts, pk))
-		if err == pebble.ErrNotFound {
-			return nil, false, nil
-		}
-		if err != nil {
+		v2, c2, err := d.pdb.Get(indexKey(sm.id, sm.indexCol, ts, pk))
+		switch {
+		case err == nil:
+			payload = append([]byte(nil), v2...)
+			_ = c2.Close()
+		case err != pebble.ErrNotFound:
 			return nil, false, err
 		}
-		payload = append([]byte(nil), v2...)
-		_ = c2.Close()
 	}
 	row, err := decodeRow(payload, projectionSet(projection))
-	return row, err == nil, err
+	if err != nil {
+		return nil, false, err
+	}
+	return row, true, nil
 }
 
 // DropSet removes a set and everything in it with two range deletes, which
@@ -379,17 +416,18 @@ func (d *DB) DropSet(name string) error {
 		d.mu.Unlock()
 		return ErrUnknownSet
 	}
+	setID, indexCol := sm.ID, sm.IndexCol
 	delete(d.sets, name)
 	delete(d.byID, sm.ID)
 	d.mu.Unlock()
 
 	b := d.pdb.NewBatch()
 	defer b.Close()
-	dp := dataPrefix(sm.ID)
+	dp := dataPrefix(setID)
 	if err := b.DeleteRange(dp, prefixEnd(dp), nil); err != nil {
 		return err
 	}
-	ip := indexPrefix(sm.ID, sm.IndexCol)
+	ip := indexPrefix(setID, indexCol)
 	if err := b.DeleteRange(ip, prefixEnd(ip), nil); err != nil {
 		return err
 	}
@@ -425,6 +463,9 @@ func (d *DB) GetDict(name string) ([]byte, bool, error) {
 
 // DictKeys lists every dictionary name.
 func (d *DB) DictKeys() ([]string, error) {
+	if d.closed.Load() {
+		return nil, ErrClosed
+	}
 	prefix := []byte{prefixDict}
 	it, err := d.pdb.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 	if err != nil {
@@ -451,7 +492,12 @@ func (d *DB) Compact() error {
 
 // Flush pushes memtables to disk, which is what makes a quiesced snapshot
 // meaningful.
-func (d *DB) Flush() error { return d.pdb.Flush() }
+func (d *DB) Flush() error {
+	if d.closed.Load() {
+		return ErrClosed
+	}
+	return d.pdb.Flush()
+}
 
 func (d *DB) Snapshot() StatsSnapshot {
 	s := StatsSnapshot{
@@ -461,6 +507,11 @@ func (d *DB) Snapshot() StatsSnapshot {
 		Queries:       d.stats.Queries.Load(),
 		RowsScanned:   d.stats.RowsScanned.Load(),
 		OpenIterators: d.stats.OpenIterators.Load(),
+	}
+	if d.closed.Load() {
+		// Pebble's metrics are not available after Close; the counters
+		// above still are, and are what the admin endpoint mostly wants.
+		return s
 	}
 	m := d.pdb.Metrics()
 	s.DiskBytes = m.DiskSpaceUsage()

@@ -127,6 +127,10 @@ func (o *Options) pebbleOptions() *pebble.Options {
 	maxCompactions := o.MaxConcurrentCompactions
 	po.MaxConcurrentCompactions = func() int { return maxCompactions }
 	if o.CacheBytes > 0 {
+		// Pebble's cache is reference counted and Open takes its own
+		// reference, so the one held here is released by the caller once
+		// the DB is open. Dropping it on the floor leaks the whole cache
+		// for the lifetime of the process.
 		po.Cache = pebble.NewCache(o.CacheBytes)
 	}
 	if o.MaxOpenFiles > 0 {

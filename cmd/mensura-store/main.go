@@ -123,6 +123,11 @@ func runWithEngine(ctx context.Context, cfg *fileConfig) error {
 	if cfg.DataDir == "" {
 		return fmt.Errorf("a data directory is required in %s mode (--data-dir)", cfg.Mode)
 	}
+	// Checked before the data directory is opened, so a refusal does not
+	// take the directory lock on the way out.
+	if err := checkAuthPosture(cfg); err != nil {
+		return err
+	}
 	sc, err := cfg.toStoreConfig()
 	if err != nil {
 		return err
@@ -140,9 +145,6 @@ func runWithEngine(ctx context.Context, cfg *fileConfig) error {
 	defer s.Close()
 
 	api := store.NewAPI(s, cfg.toAPIConfig(cfg.Mode))
-	if err := checkAuthPosture(cfg); err != nil {
-		return err
-	}
 
 	servers := startListeners(ctx, cfg, api, sc.Logger)
 	defer shutdown(servers)
@@ -168,6 +170,7 @@ func runWithEngine(ctx context.Context, cfg *fileConfig) error {
 		sc.Logger.Printf("serving Grafana over the plugin protocol; write API on %s", cfg.Listen.Write.Addr)
 		return plugin.ServeLocal(s)
 	}
+
 	sc.Logger.Printf("mensura-store %s listening on %s (data dir %s)", store.Version, cfg.Listen.Write.Addr, cfg.DataDir)
 	<-ctx.Done()
 	sc.Logger.Printf("shutting down")
@@ -183,25 +186,59 @@ func runProxy(ctx context.Context, cfg *fileConfig) error {
 	return plugin.ServeRemote(client)
 }
 
+// isLoopbackAddr reports whether a listen address is bound to loopback and
+// nothing else.
+//
+// A name is not resolved and not trusted: "myhost:9631" may well resolve
+// to a routable address, so anything that is not a loopback IP literal is
+// treated as public. Guessing the other way would leave an open API.
+func isLoopbackAddr(addr string) (bool, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false, fmt.Errorf("listen address %q: %w", addr, err)
+	}
+	if host == "" {
+		return false, nil // ":9631" binds every interface
+	}
+	if host == "localhost" {
+		return true, nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false, nil // a hostname may resolve anywhere
+	}
+	return ip.IsLoopback(), nil
+}
+
 // checkAuthPosture refuses to run unauthenticated on anything but
 // loopback. Convenience on a laptop must not become an open write API on a
 // shared network.
+//
+// The debug listener is checked unconditionally: it carries no
+// authentication of its own in any mode, so it may only ever be bound to
+// loopback.
 func checkAuthPosture(cfg *fileConfig) error {
+	if cfg.Listen.Debug.Addr != "" {
+		ok, err := isLoopbackAddr(cfg.Listen.Debug.Addr)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("debug listener %s is not loopback-bound: the debug API has no authentication, so bind it to 127.0.0.1 or leave it unset", cfg.Listen.Debug.Addr)
+		}
+	}
 	if cfg.Auth.Mode != "" && cfg.Auth.Mode != "none" {
 		return nil
 	}
-	for _, l := range []listenSpec{cfg.Listen.Write, cfg.Listen.Query} {
+	for _, l := range []listenSpec{cfg.Listen.Write, cfg.Listen.Query, cfg.Listen.Metrics} {
 		if l.Addr == "" {
 			continue
 		}
-		host, _, err := net.SplitHostPort(l.Addr)
+		ok, err := isLoopbackAddr(l.Addr)
 		if err != nil {
-			return fmt.Errorf("listen address %q: %w", l.Addr, err)
+			return err
 		}
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			return fmt.Errorf("listener %s is not loopback-bound and auth is disabled: set auth.mode: bearer, or bind to 127.0.0.1", l.Addr)
-		}
-		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+		if !ok {
 			return fmt.Errorf("listener %s is not loopback-bound and auth is disabled: set auth.mode: bearer, or bind to 127.0.0.1", l.Addr)
 		}
 	}
@@ -214,7 +251,17 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 		if addr == "" {
 			return
 		}
-		srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+		srv := &http.Server{
+			Addr:    addr,
+			Handler: h,
+			// A body read must not be allowed to run forever: without
+			// these a handful of slow clients hold connections open
+			// indefinitely.
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       2 * time.Minute,
+			WriteTimeout:      5 * time.Minute,
+			IdleTimeout:       2 * time.Minute,
+		}
 		servers = append(servers, srv)
 		go func() {
 			var err error

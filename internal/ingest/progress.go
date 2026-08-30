@@ -51,7 +51,6 @@ func (p *Progress) Unmatched()          { p.mu.Lock(); p.c.UnmatchedLines++; p.m
 func (p *Progress) TSError()            { p.mu.Lock(); p.c.TSParseErrors++; p.mu.Unlock() }
 func (p *Progress) ExtractError()       { p.mu.Lock(); p.c.ExtractErrors++; p.mu.Unlock() }
 func (p *Progress) SkipBinary()         { p.mu.Lock(); p.c.BinarySkipped++; p.mu.Unlock() }
-func (p *Progress) AddSamples(n int64)  { p.mu.Lock(); p.c.Samples += n; p.mu.Unlock() }
 func (p *Progress) SetLag(n int64)      { p.mu.Lock(); p.c.LagBytes = n; p.mu.Unlock() }
 func (p *Progress) UDPDrop()            { p.mu.Lock(); p.c.UDPDropped++; p.mu.Unlock() }
 

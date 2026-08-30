@@ -35,21 +35,39 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 		return s.queryLabelValues(q.Label), nil
 	}
 
-	maxSeries := s.cfg.MaxSeriesPerGraph
+	// The datasource ceilings, with a disabled gate expressed as 0. The
+	// validator and the executor must agree on these, or a query that
+	// switched a gate off is still rejected for exceeding it.
+	seriesCeiling := s.cfg.MaxSeriesPerGraph
 	if req.Options.DisableSeriesSafety {
-		maxSeries = 0
+		seriesCeiling = 0
 	}
-	maxPointsIn := s.cfg.MaxDataPointsReceived
+	pointsCeiling := s.cfg.MaxDataPointsReceived
 	if req.Options.DisableSizeSafety {
-		maxPointsIn = 0
+		pointsCeiling = 0
 	}
 
-	warns, verr := mql.Validate(q, s.Schema(), s.cfg.MaxSeriesPerGraph, s.cfg.MaxDataPointsReceived)
+	warns, verr := mql.Validate(q, s.Schema(), seriesCeiling, pointsCeiling)
 	if verr != nil {
 		return nil, verr
 	}
+
+	// LIMIT may only narrow, never widen — Validate has already refused a
+	// limit above the ceiling — so it is applied on top.
+	maxSeries := narrower(seriesCeiling, q.Limits.Series)
+	maxPointsIn := narrower(pointsCeiling, q.Limits.Points)
 	if req.Options.FromAlert && q.EveryMs == nil {
 		warns = append(warns, mql.Diag{Code: "W302", Msg: "alert rules should set EVERY; a pixel-derived window is not a stable basis for a rule"})
+	}
+
+	// One execution slot per query. A scan buffers every point it groups,
+	// so letting an unbounded number of them run is how a busy dashboard
+	// turns into an out-of-memory kill.
+	select {
+	case s.jobs <- struct{}{}:
+		defer func() { <-s.jobs }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	plan, planWarns, err := s.plan(q, req)
@@ -79,6 +97,18 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	}
 	resp.Stats.DurationMs = time.Since(started).Milliseconds()
 	return resp, nil
+}
+
+// narrower applies a per-query LIMIT on top of a datasource ceiling. Zero
+// means "no gate", so a limit always wins over an absent ceiling.
+func narrower(ceiling int, limit *int) int {
+	if limit == nil || *limit <= 0 {
+		return ceiling
+	}
+	if ceiling == 0 || *limit < ceiling {
+		return *limit
+	}
+	return ceiling
 }
 
 // queryPlan is what the planner produced: which shards to scan, what to
@@ -444,6 +474,9 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 // for a line; a heatmap wants totals, so this path aggregates rather than
 // running the min/max walk.
 func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryRequest, p *queryPlan, resp *wire.QueryResponse) error {
+	if len(q.Select) == 0 {
+		return fmt.Errorf("query: FORMAT heatmap requires HISTOGRAM(<bucket set>)")
+	}
 	s.mu.RLock()
 	entry, ok := s.catalogue[q.From]
 	var bs wire.BucketSetInfo
@@ -709,26 +742,35 @@ func (s *Store) querySets() *wire.QueryResponse {
 }
 
 func (s *Store) queryFields(set string) (*wire.QueryResponse, error) {
+	// Everything the rows are built from is copied out under the lock: a
+	// concurrent write widening this set's field map would otherwise be a
+	// concurrent map read and write, which is fatal, not merely racy.
+	type fieldRow struct {
+		name        string
+		kind        string
+		unit        string
+		maxInterval int64
+	}
 	s.mu.RLock()
 	e, ok := s.catalogue[set]
+	var rows []fieldRow
+	if ok {
+		rows = make([]fieldRow, 0, len(e.Fields))
+		for n, f := range e.Fields {
+			rows = append(rows, fieldRow{n, string(f.Kind), f.Unit, f.MaxInterval})
+		}
+	}
 	s.mu.RUnlock()
 	if !ok {
 		return nil, mql.Diag{Code: "E002", Msg: fmt.Sprintf("unknown set %q", set)}
 	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
 	resp := &wire.QueryResponse{Columns: []wire.Column{
 		{Name: "field", Type: "string"}, {Name: "kind", Type: "string"},
 		{Name: "unit", Type: "string"}, {Name: "max_interval_ms", Type: "number"},
 	}}
-	names := make([]string, 0, len(e.Fields))
-	s.mu.RLock()
-	for n := range e.Fields {
-		names = append(names, n)
-	}
-	s.mu.RUnlock()
-	sort.Strings(names)
-	for _, n := range names {
-		f := e.Fields[n]
-		resp.Rows = append(resp.Rows, wire.Row{Values: []any{n, string(f.Kind), f.Unit, float64(f.MaxInterval)}})
+	for _, r := range rows {
+		resp.Rows = append(resp.Rows, wire.Row{Values: []any{r.name, r.kind, r.unit, float64(r.maxInterval)}})
 	}
 	return resp, nil
 }

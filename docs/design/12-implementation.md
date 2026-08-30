@@ -92,6 +92,20 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Follow resumes from the acknowledged offset | `…:TestFollowResumesFromCheckpoint` |
 | A shedding store costs no data | `…:TestFollowSurvivesStoreShedding` |
 | Line protocol parsing, quoting, escaping, rejection | `internal/ingest/receive_test.go` |
+| An idempotency key is spent only by a write that committed | `internal/store/regression_test.go:TestIdempotencyKeySurvivesAFailedWrite` |
+| A label named `timestamp` is rejected, not silently hidden | `…:TestTimestampLabelIsRejected` |
+| `LIMIT SERIES` binds at execution, not only at validation | `…:TestLimitSeriesIsEnforced` |
+| A hostile `bucket_index` is bounded, not allocated | `…:TestHostileBucketIndexIsBounded` |
+| Catalogue reads and writes do not race | `…:TestConcurrentCatalogueReadAndWrite` |
+| A shard suffix carries the width it was written with | `…:TestShardSuffixCarriesItsWidth` |
+| Per-set retention sweeps without a global default | `…:TestPerSetRetentionSweepsWithoutAGlobalDefault` |
+| The spec's `sets:` block reaches the store | `…:TestSetMetaIsApplied` |
+| The debug API refuses a non-loopback peer | `…:TestDebugHandlerRefusesNonLoopback` |
+| A line read before its newline arrives is delivered once, intact | `internal/ingest/regression_test.go:TestFollowDeliversASplitLineOnceAndIntact` |
+| A file growing past the fingerprint window is not re-read | `…:TestFollowDoesNotReReadAGrowingShortFile` |
+| A genuine rewrite in place is still detected | `…:TestFollowStillDetectsARewriteInPlace` |
+| Printed MQL always re-parses (large floats, unicode, regexes) | `pkg/mql/regression_test.go:TestRoundTripSurvivesExtremeNumbersAndUnicode` |
+| An unsubstituted `$variable` is an error | `…:TestUnsubstitutedVariableIsAnError` |
 | Extraction: patterns, labels vs fields, multiline, routes, buckets, aggregation | `pkg/extract/extract_test.go` |
 
 ## 5. Implementation status
@@ -147,9 +161,15 @@ that returns `503` with `Retry-After` when full.
 implemented. mTLS and token-bucket limits are configuration surface that can
 be added without changing any semantics.
 
-*Consequence*: `auth.mode: mtls` is not accepted yet. A non-loopback listener
-with auth disabled is refused at startup rather than quietly serving an open
-write API.
+*Consequence*: `auth.mode: mtls` is not accepted yet, and
+`listen.*.tls.client_ca` is *refused* at startup rather than accepted and
+ignored — an operator must not be able to believe client certificates are
+being verified when they are not. A non-loopback listener with auth
+disabled is refused at startup rather than quietly serving an open write
+API, and a hostname that is not a loopback literal counts as non-loopback
+because it may resolve anywhere. The debug listener has no credential of
+its own in any mode, so it is refused on a non-loopback bind and
+additionally rejects any non-loopback peer at request time.
 
 ### 6.3 Batch sources are local only
 
@@ -163,7 +183,9 @@ is a small adapter in front of it. Getting the pipeline, rotation and delivery
 semantics right mattered more than the number of download adapters.
 
 *Consequence*: fetch a bundle with the operator's usual tool and point
-`--source` at the unpacked directory.
+`--source` at the unpacked directory. Note that binary sniffing runs on
+*decompressed* bytes: sniffing the compressed stream would classify every
+`.bz2` as binary and skip it, which is what happened before.
 
 ### 6.4 Heatmaps sum, they do not run the render walk
 
@@ -214,6 +236,15 @@ provenance on the wire. The effect on the contract is a slightly larger replay
 window after an unclean stop (at most one flush interval), which
 at-least-once delivery and content-addressed keys already absorb.
 
+The rule is still "only acknowledged bytes move the resume point", and that
+now holds on both follow paths: a tailer's read offset is promoted to
+`pending` only once every sample from those bytes has reached the sink, and
+`pending` becomes `acked` only in the flush callback. The SSH follower
+follows the same rule rather than adding its consumed byte count
+unconditionally, and counts bytes from the raw framing so a CRLF stream or
+an unterminated final line cannot drift the offset across a reconnect.
+Checkpoints are fsynced before the rename and the directory after it.
+
 ### 6.8 Compression, storage profiles and Pebble
 
 `Compression: balanced` is implemented directly against the Pebble version in
@@ -229,6 +260,65 @@ that is a shorter window; when idle it is a longer one. Content-addressed row
 keys make an expired key harmless, which is why the bound is on memory rather
 than on time.
 
+### 6.10 Shard suffixes carry their own width
+
+[05](05-storage.md) §5 describes a configurable shard width. The suffix
+originally encoded only the timestamp, and the width was inferred from the
+suffix *length* — so every width below a day behaved as one hour and every
+width at or above a day behaved as one day. A `shard: 6h` silently produced
+hourly shards, and retention then measured them as an hour wide.
+
+The suffix now carries the width for anything but the two original
+granularities: `set@2026082812-6h`, `set@20260828-7d`. The bare
+`set@2026082812` and `set@20260828` forms still parse as one hour and one
+day, so a directory written by an earlier build opens unchanged.
+
+Widths are snapped to what the encoding can express — whole days, or an
+hour count that divides a day — and a width that is not exactly
+representable is reported at startup rather than rounded in silence.
+
+### 6.11 Label keys may not be named `timestamp`
+
+Labels and fields share one column namespace on a stored row.
+`ValidateFieldName` already reserved `timestamp`; `ValidateLabelKey` did
+not, so a label with that name overwrote the indexed column with a
+dictionary index and put the row at a time no range scan could reach — the
+sample was accepted and then invisible. The name is now reserved on both
+sides and such a sample is rejected by name.
+
+### 6.12 Set-level spec options travel on the write API
+
+[02](02-ingest.md) §3 has the spec declare per-set retention, shard width
+and key scheme. Nothing carried them to the store, so the `sets:` block was
+parsed and ignored — `key: offset` in particular could never take effect,
+and every set was content-keyed.
+
+`WriteRequest` now carries `set_meta` alongside `field_meta`, on the same
+"sent once per process start, not per sample" footing. Note that the store
+decodes write bodies with `DisallowUnknownFields`, so an ingest of this
+version against an older store is refused rather than silently dropping the
+declarations.
+
+### 6.13 The rotation fingerprint uses a fixed window
+
+Rotation is detected by hashing the head of the file. The hash was taken
+over "however many bytes exist", which for a file shorter than the window
+changes on *every append* — so a young log was diagnosed as rewritten on
+each poll and re-read from the start.
+
+The window is now a fixed 256 bytes, and a fingerprint taken over a
+shorter file is marked provisional and not compared. Below the window only
+a shrinking file counts as a rewrite; once the file is long enough the
+fingerprint is adopted and rewrites are detected as before.
+
+### 6.14 An unsubstituted `$variable` is an error
+
+A `$name` that reaches execution is compared against the dictionary as a
+literal, matches nothing, and draws an empty panel with a warning. Since
+the whole point of the project is that a plot may not mislead, validation
+now rejects it with `E010`: an unsubstituted variable is a configuration
+fault, not a value.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
@@ -237,6 +327,10 @@ than on time.
   implements a second parser.
 - **`route:` can create unbounded sets.** Open question 3 in
   [11](11-roadmap.md) is unresolved; there is no `max_sets` guard yet.
+- **`store_stream_label:` is refused, not ignored.** The key was accepted by
+  the spec decoder and acted on nowhere. Compiling a spec that sets it now
+  fails, on the same principle as `tls.client_ca`: a declaration that does
+  nothing is worse than one that is rejected.
 - **Sub-millisecond timestamps are truncated**, per open question 1.
 - **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
   is the only mitigation for a query with no `BY`.

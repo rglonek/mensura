@@ -5,6 +5,7 @@ package extract
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,7 +55,15 @@ type SetOpt struct {
 	Retention string `yaml:"retention"`
 	Shard     string `yaml:"shard"`
 	Key       string `yaml:"key"` // content | offset
+
+	retentionMs *int64
+	shardMs     *int64
 }
+
+// RetentionMs and ShardMs return the compiled durations, or nil when the
+// spec did not declare one.
+func (o SetOpt) RetentionMs() *int64 { return o.retentionMs }
+func (o SetOpt) ShardMs() *int64     { return o.shardMs }
 
 // Profile is one log dialect: how to find timestamps, how to frame
 // records, and what to extract.
@@ -193,10 +202,15 @@ type BucketSet struct {
 	edges []float64
 }
 
+// maxPow2Buckets bounds a pow2 bucket set. Beyond this the doubling edge
+// exceeds what a float64 can represent exactly, so the labels would stop
+// meaning anything.
+const maxPow2Buckets = 64
+
 // Load reads and compiles a spec, following includes relative to the
 // including file.
 func Load(path string) (*Spec, error) {
-	s, err := load(path, map[string]bool{})
+	s, err := load(path, map[string]bool{}, map[string]bool{})
 	if err != nil {
 		return nil, err
 	}
@@ -206,15 +220,23 @@ func Load(path string) (*Spec, error) {
 	return s, nil
 }
 
-func load(path string, seen map[string]bool) (*Spec, error) {
+// load reads one spec and its includes. stack holds the chain currently
+// being loaded, so a genuine cycle is caught; done holds everything
+// already loaded, so a diamond — two profiles including one common base —
+// is skipped rather than mistaken for a cycle.
+func load(path string, stack map[string]bool, done map[string]bool) (*Spec, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	if seen[abs] {
+	if stack[abs] {
 		return nil, fmt.Errorf("extract: include cycle at %s", abs)
 	}
-	seen[abs] = true
+	if done[abs] {
+		return &Spec{path: abs}, nil
+	}
+	stack[abs] = true
+	defer delete(stack, abs)
 	b, err := os.ReadFile(abs)
 	if err != nil {
 		return nil, err
@@ -231,9 +253,12 @@ func load(path string, seen map[string]bool) (*Spec, error) {
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(filepath.Dir(abs), p)
 		}
-		sub, err := load(p, seen)
+		sub, err := load(p, stack, done)
 		if err != nil {
 			return nil, err
+		}
+		if sub.Version != 0 && sub.Version != 1 {
+			return nil, fmt.Errorf("extract: %s: unsupported spec version %d (expected 1)", p, sub.Version)
 		}
 		s.Profiles = append(s.Profiles, sub.Profiles...)
 		s.Identity = append(s.Identity, sub.Identity...)
@@ -246,6 +271,7 @@ func load(path string, seen map[string]bool) (*Spec, error) {
 			}
 		}
 	}
+	done[abs] = true
 	return &s, nil
 }
 
@@ -285,6 +311,33 @@ func (s *Spec) Compile() error {
 		if r.ScanLines == 0 {
 			r.ScanLines = 500
 		}
+	}
+	// The `sets:` block is compiled here so a bad duration or key scheme
+	// is a spec error rather than something the store discovers later.
+	for name, opt := range s.Sets {
+		if err := model.ValidateSetName(name); err != nil {
+			return fmt.Errorf("extract: sets: %w", err)
+		}
+		if opt.Retention != "" {
+			ms, err := mql.ParseDuration(opt.Retention)
+			if err != nil {
+				return fmt.Errorf("extract: set %s retention: %w", name, err)
+			}
+			opt.retentionMs = &ms
+		}
+		if opt.Shard != "" {
+			ms, err := mql.ParseDuration(opt.Shard)
+			if err != nil {
+				return fmt.Errorf("extract: set %s shard: %w", name, err)
+			}
+			opt.shardMs = &ms
+		}
+		switch opt.Key {
+		case "", "content", "offset":
+		default:
+			return fmt.Errorf("extract: set %s key %q: expected content or offset", name, opt.Key)
+		}
+		s.Sets[name] = opt
 	}
 	names := map[string]bool{}
 	for _, p := range s.Profiles {
@@ -411,6 +464,12 @@ func (p *Profile) compile(s *Spec) error {
 		if len(pat.extract) == 0 && len(pat.Route) == 0 {
 			return fmt.Errorf("pattern for set %q has neither extract nor route", pat.Set)
 		}
+		if pat.StoreStreamLabel != "" {
+			// The key is accepted by the YAML decoder but nothing acts on
+			// it. Failing is better than letting an operator believe a
+			// label is being stored when it is not.
+			return fmt.Errorf("pattern for set %q sets store_stream_label, which is not implemented; remove it", pat.Set)
+		}
 		if pat.BucketSet != "" {
 			if _, ok := p.buckets[pat.BucketSet]; !ok {
 				return fmt.Errorf("pattern references unknown bucket set %q", pat.BucketSet)
@@ -447,6 +506,10 @@ func (b *BucketSet) compile() error {
 	case b.Edges == "" || b.Edges == "pow2":
 		// The common HDR-style layout: the first three buckets are 0, 1, 2
 		// and each later bucket doubles.
+		if len(b.Buckets) > maxPow2Buckets {
+			return fmt.Errorf("bucket set %s: %d buckets exceeds the %d that a pow2 layout can label",
+				b.Name, len(b.Buckets), maxPow2Buckets)
+		}
 		for i := range b.Buckets {
 			switch i {
 			case 0:
@@ -454,7 +517,10 @@ func (b *BucketSet) compile() error {
 			case 1:
 				b.edges[i] = 1
 			default:
-				b.edges[i] = float64(int64(1) << uint(i-1))
+				// math.Ldexp rather than a shift: 1<<62 is the last value
+				// an int64 shift can hold, and silently wrapping to a
+				// negative edge would mislabel the whole heatmap.
+				b.edges[i] = math.Ldexp(1, i-1)
 			}
 		}
 	case strings.HasPrefix(b.Edges, "linear:"):
@@ -484,8 +550,8 @@ func (b *BucketSet) compile() error {
 	return nil
 }
 
-// Edges exposes the numeric lower bound of each bucket.
-func (b *BucketSet) Edges2() []float64 { return b.edges }
+// EdgeValues exposes the numeric lower bound of each bucket.
+func (b *BucketSet) EdgeValues() []float64 { return b.edges }
 
 // Profile returns a profile by name.
 func (s *Spec) Profile(name string) *Profile {
@@ -541,7 +607,7 @@ func (p *Profile) matches(path string, head []byte, labels map[string]string, li
 	}
 	if len(sel.ContentContains) > 0 {
 		n := sel.ScanBytes
-		if n == 0 || n > len(head) {
+		if n <= 0 || n > len(head) {
 			n = len(head)
 		}
 		h := string(head[:n])
