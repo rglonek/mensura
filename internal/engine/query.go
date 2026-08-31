@@ -22,6 +22,7 @@ type QueryBuilder struct {
 	where   Expr
 	project []string
 	limit   int
+	reverse bool
 	err     error
 }
 
@@ -44,6 +45,12 @@ func (q *QueryBuilder) Project(c ...string) *QueryBuilder {
 }
 func (q *QueryBuilder) Limit(n int) *QueryBuilder { q.limit = n; return q }
 
+// Reverse walks the range newest-first. A logs view wants the most recent
+// records, and reading forward to a limit hands back the oldest ones
+// instead; iterating backwards lets the scan stop after the limit without
+// buffering the whole range.
+func (q *QueryBuilder) Reverse(v bool) *QueryBuilder { q.reverse = v; return q }
+
 // Iter walks query results. It pins a snapshot for its lifetime, so it
 // observes a consistent point-in-time view while writers run — and so it
 // must be closed, or the LSM cannot reclaim space.
@@ -55,6 +62,7 @@ type Iter struct {
 	where       Expr
 	proj        map[string]struct{}
 	indexed     bool
+	reverse     bool
 	limit       int
 	returned    int
 	key         [16]byte
@@ -130,6 +138,7 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 	return &Iter{
 		db: d, snap: snap, it: it, ctx: ctx,
 		where: q.where, proj: proj, indexed: indexed, limit: q.limit,
+		reverse: q.reverse,
 	}, nil
 }
 
@@ -156,10 +165,17 @@ func (i *Iter) Next() bool {
 			}
 		}
 		var ok bool
-		if i.returned == 0 && !i.started() {
-			ok = i.it.First()
+		switch {
+		case !i.started():
 			i.markStarted()
-		} else {
+			if i.reverse {
+				ok = i.it.Last()
+			} else {
+				ok = i.it.First()
+			}
+		case i.reverse:
+			ok = i.it.Prev()
+		default:
 			ok = i.it.Next()
 		}
 		if !ok {

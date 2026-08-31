@@ -124,6 +124,7 @@ func walkRow(payload []byte, fn func(name string, t model.ValueType, raw []byte)
 // columns are decoded; the rest are skipped by their length prefix.
 func decodeRow(payload []byte, projection map[string]struct{}) (Row, error) {
 	out := Row{}
+	var bad error
 	err := walkRow(payload, func(name string, t model.ValueType, raw []byte) bool {
 		if projection != nil {
 			if _, want := projection[name]; !want {
@@ -131,13 +132,23 @@ func decodeRow(payload []byte, projection map[string]struct{}) (Row, error) {
 			}
 		}
 		v, err := decodeValue(t, raw)
-		if err == nil {
-			out[name] = v
+		if err != nil {
+			// A value that will not decode is reported, not dropped.
+			// Skipping it made the column read as absent, so the same
+			// corruption surfaced as an error when a pushdown filter
+			// touched the column (lazyRow.get records it) and as a
+			// silently missing field when nothing did.
+			bad = err
+			return false
 		}
+		out[name] = v
 		return true
 	})
 	if err != nil {
 		return nil, err
+	}
+	if bad != nil {
+		return nil, bad
 	}
 	return out, nil
 }

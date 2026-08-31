@@ -51,12 +51,14 @@ type Sink struct {
 
 	Stats SinkStats
 
-	// onFlush is called after a successful write with the number of
-	// samples committed; the follow driver uses it to advance checkpoints
-	// only for bytes the store has actually accepted. It is guarded
-	// because it is registered after the flush loop is already running.
-	flushMu sync.Mutex
-	onFlush func(int)
+	// observers are told when a delivery begins and how it ended. They are
+	// guarded because they are registered after the flush loop is already
+	// running, and they are a slice rather than a single callback: every
+	// followed path registers one, and a single slot silently kept only
+	// the last registration, so every other path's checkpoint was never
+	// written at all.
+	flushMu   sync.Mutex
+	observers []DeliveryObserver
 
 	// sendMu serialises delivery so callbacks fire in commit order: two
 	// concurrent flushes would otherwise let a later batch acknowledge
@@ -113,19 +115,56 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 	return s
 }
 
-// OnFlush registers a callback invoked after each successful write.
-func (s *Sink) OnFlush(fn func(int)) {
+// DeliveryObserver is how a driver that tracks byte offsets learns which
+// bytes a write actually committed.
+//
+// Two calls, not one, because a single "flush succeeded" callback cannot
+// express either half of the problem it needs to solve:
+//
+//   - BeginFlush runs while the sink still holds the buffer it is about to
+//     send. Everything handed to the sink before this point is in the
+//     batch and nothing handed to it afterwards is, so this is the only
+//     moment at which a driver can snapshot a correct high-water mark. A
+//     driver that instead read its own live offset after the write
+//     acknowledged bytes whose samples were still sitting in the next
+//     buffer.
+//   - EndFlush reports the outcome, including the case the sink gave up
+//     on. A dropped batch is a hole, and a checkpoint that is a single
+//     resume offset can never advance past a hole without losing it.
+type DeliveryObserver interface {
+	// BeginFlush is called with the sink's buffer lock held, immediately
+	// after the batch is taken. It must not call back into the sink.
+	BeginFlush()
+	// EndFlush is called after the write, in commit order. dropped is
+	// true when the batch was abandoned rather than committed.
+	EndFlush(accepted int, dropped bool)
+}
+
+// Observe registers a delivery observer. Registrations accumulate.
+func (s *Sink) Observe(o DeliveryObserver) {
+	if o == nil {
+		return
+	}
 	s.flushMu.Lock()
-	s.onFlush = fn
+	s.observers = append(s.observers, o)
 	s.flushMu.Unlock()
 }
 
-func (s *Sink) notifyFlush(n int) {
+func (s *Sink) snapshotObservers() []DeliveryObserver {
 	s.flushMu.Lock()
-	fn := s.onFlush
-	s.flushMu.Unlock()
-	if fn != nil {
-		fn(n)
+	defer s.flushMu.Unlock()
+	return append([]DeliveryObserver(nil), s.observers...)
+}
+
+func (s *Sink) beginFlush(obs []DeliveryObserver) {
+	for _, o := range obs {
+		o.BeginFlush()
+	}
+}
+
+func (s *Sink) endFlush(obs []DeliveryObserver, accepted int, dropped bool) {
+	for _, o := range obs {
+		o.EndFlush(accepted, dropped)
 	}
 }
 
@@ -236,6 +275,7 @@ func (s *Sink) DeclareSets(spec *extract.Spec) {
 func (s *Sink) Flush(ctx context.Context) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	obs := s.snapshotObservers()
 	s.mu.Lock()
 	if s.pending == 0 {
 		s.mu.Unlock()
@@ -254,6 +294,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 		delete(s.buffers, set)
 	}
 	s.pending = 0
+	// Under the buffer lock: the batch is now fixed, and any Add racing
+	// this flush is either already in it or blocked until it is not.
+	s.beginFlush(obs)
 	s.mu.Unlock()
 
 	s.metaMu.Lock()
@@ -275,11 +318,26 @@ func (s *Sink) Flush(ctx context.Context) error {
 			drops := s.Stats.FatalDrop
 			s.Stats.mu.Unlock()
 			s.log.Printf("ERROR store rejected %d samples: %v (first set %q)", count, fatal, firstSet(batches))
+			// The samples are gone. Telling the observers so is what stops
+			// a later successful flush from advancing a checkpoint over
+			// the hole they left.
+			s.endFlush(obs, 0, true)
 			if s.cfg.MaxFatalDrops > 0 && drops >= int64(s.cfg.MaxFatalDrops) {
 				return err
 			}
 			s.requeueMeta(meta, sets)
 			return nil
+		}
+		// A cancelled context is not a delivery failure: the caller is
+		// shutting down and will flush again on a live context, so the
+		// batch goes back in the buffer instead of being counted as
+		// lost. Dropping it here made an ordinary Ctrl-C lose whatever
+		// was in flight, and -- once a dropped batch started freezing
+		// checkpoints -- froze them on every clean shutdown too.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.requeueBatches(batches, count)
+			s.requeueMeta(meta, sets)
+			return err
 		}
 		// The batch was taken out of the buffer before the write, so a
 		// retryable failure that ran out of retries loses it. Say so and
@@ -288,6 +346,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		s.Stats.Dropped += int64(count)
 		s.Stats.mu.Unlock()
 		s.log.Printf("ERROR gave up delivering %d samples after retries: %v (first set %q)", count, err, firstSet(batches))
+		s.endFlush(obs, 0, true)
 		s.requeueMeta(meta, sets)
 		return err
 	}
@@ -299,8 +358,20 @@ func (s *Sink) Flush(ctx context.Context) error {
 	if len(resp.Rejected) > 0 {
 		s.log.Printf("WARNING store rejected %d sample(s): %s", len(resp.Rejected), resp.Rejected[0].Reason)
 	}
-	s.notifyFlush(resp.Accepted)
+	s.endFlush(obs, resp.Accepted, false)
 	return nil
+}
+
+// requeueBatches puts an undelivered batch back at the head of its set's
+// buffer, ahead of anything queued since, so the retry preserves the order
+// the records were read in.
+func (s *Sink) requeueBatches(batches []model.Batch, count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range batches {
+		s.buffers[b.Set] = append(b.Samples, s.buffers[b.Set]...)
+	}
+	s.pending += count
 }
 
 // requeueMeta puts undelivered field metadata back at the head of the

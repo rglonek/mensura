@@ -18,20 +18,22 @@ func numCPU() int { return runtime.GOMAXPROCS(0) }
 // Snapshot is the pipeline's telemetry at one instant: a plain value with
 // no lock, so it can be marshalled and passed around freely.
 type Snapshot struct {
-	FilesTotal     int       `json:"files_total"`
-	FilesDone      int       `json:"files_done"`
-	BytesRead      int64     `json:"bytes_read"`
-	Records        int64     `json:"records"`
-	Samples        int64     `json:"samples"`
-	UnmatchedLines int64     `json:"unmatched_lines"`
-	TSParseErrors  int64     `json:"ts_parse_errors"`
-	ExtractErrors  int64     `json:"extract_errors"`
-	BinarySkipped  int64     `json:"binary_skipped"`
-	NoProfileFiles []string  `json:"no_profile_files,omitempty"`
-	FirstUnmatched []string  `json:"first_unmatched,omitempty"`
-	LagBytes       int64     `json:"lag_bytes"`
-	UDPDropped     int64     `json:"udp_dropped"`
-	Started        time.Time `json:"started"`
+	FilesTotal      int       `json:"files_total"`
+	FilesDone       int       `json:"files_done"`
+	BytesRead       int64     `json:"bytes_read"`
+	Records         int64     `json:"records"`
+	Samples         int64     `json:"samples"`
+	UnmatchedLines  int64     `json:"unmatched_lines"`
+	TSParseErrors   int64     `json:"ts_parse_errors"`
+	ExtractErrors   int64     `json:"extract_errors"`
+	BinarySkipped   int64     `json:"binary_skipped"`
+	ArchivesSkipped []string  `json:"archives_skipped,omitempty"`
+	OversizeRecords int64     `json:"oversize_records"`
+	NoProfileFiles  []string  `json:"no_profile_files,omitempty"`
+	FirstUnmatched  []string  `json:"first_unmatched,omitempty"`
+	LagBytes        int64     `json:"lag_bytes"`
+	UDPDropped      int64     `json:"udp_dropped"`
+	Started         time.Time `json:"started"`
 }
 
 // Progress accumulates the counters behind a lock. It is published three
@@ -51,8 +53,23 @@ func (p *Progress) Unmatched()          { p.mu.Lock(); p.c.UnmatchedLines++; p.m
 func (p *Progress) TSError()            { p.mu.Lock(); p.c.TSParseErrors++; p.mu.Unlock() }
 func (p *Progress) ExtractError()       { p.mu.Lock(); p.c.ExtractErrors++; p.mu.Unlock() }
 func (p *Progress) SkipBinary()         { p.mu.Lock(); p.c.BinarySkipped++; p.mu.Unlock() }
-func (p *Progress) SetLag(n int64)      { p.mu.Lock(); p.c.LagBytes = n; p.mu.Unlock() }
-func (p *Progress) UDPDrop()            { p.mu.Lock(); p.c.UDPDropped++; p.mu.Unlock() }
+
+// SkipArchive records a multi-file container that was not unpacked, so an
+// import that read nothing can say which inputs it declined and why.
+func (p *Progress) SkipArchive(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.c.ArchivesSkipped) < 20 {
+		p.c.ArchivesSkipped = append(p.c.ArchivesSkipped, path)
+	}
+}
+
+// OversizeRecord counts a record longer than the configured cap, whose
+// excess was discarded. Truncation that nothing counts is indistinguishable
+// from data that was never there.
+func (p *Progress) OversizeRecord() { p.mu.Lock(); p.c.OversizeRecords++; p.mu.Unlock() }
+func (p *Progress) SetLag(n int64)  { p.mu.Lock(); p.c.LagBytes = n; p.mu.Unlock() }
+func (p *Progress) UDPDrop()        { p.mu.Lock(); p.c.UDPDropped++; p.mu.Unlock() }
 
 func (p *Progress) NoProfile(path string) {
 	p.mu.Lock()
@@ -82,6 +99,7 @@ func (p *Progress) Snapshot() Snapshot {
 	defer p.mu.Unlock()
 	c := p.c
 	c.NoProfileFiles = append([]string(nil), p.c.NoProfileFiles...)
+	c.ArchivesSkipped = append([]string(nil), p.c.ArchivesSkipped...)
 	c.FirstUnmatched = append([]string(nil), p.c.FirstUnmatched...)
 	return c
 }

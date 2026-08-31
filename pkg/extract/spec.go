@@ -385,6 +385,15 @@ func (p *Profile) compile(s *Spec) error {
 	}
 	for _, m := range p.Framing.Multiline {
 		var err error
+		// An empty start_contains is silently self-defeating:
+		// strings.Contains(line, "") is true for every line, so every
+		// record opens a new multiline buffer, no continuation is ever
+		// joined, and each record is held back until the next one arrives
+		// -- or until the idle flush, on a quiet stream. Nothing reports
+		// it; the profile simply lags and never multilines.
+		if m.StartContains == "" {
+			return fmt.Errorf("multiline needs a non-empty start_contains")
+		}
 		if m.ContinueRegex != "" {
 			if m.continueRe, err = regexp.Compile(m.ContinueRegex); err != nil {
 				return fmt.Errorf("multiline continue_regex: %w", err)
@@ -407,6 +416,20 @@ func (p *Profile) compile(s *Spec) error {
 	for _, bs := range p.BucketSets {
 		if err := bs.compile(); err != nil {
 			return err
+		}
+		// Bucket names become field names on the row, and expand()
+		// derives "<bucket>plus" from them. Checking them here names the
+		// offending bucket; leaving it to the store turns a spec typo
+		// into a per-sample rejection with no pointer back to the spec.
+		for _, b := range bs.Buckets {
+			if err := model.ValidateFieldName(b); err != nil {
+				return fmt.Errorf("bucket set %s: %w", bs.Name, err)
+			}
+			if bs.Cumulative {
+				if err := model.ValidateFieldName(b + "plus"); err != nil {
+					return fmt.Errorf("bucket set %s: cumulative column: %w", bs.Name, err)
+				}
+			}
 		}
 		p.buckets[bs.Name] = bs
 	}

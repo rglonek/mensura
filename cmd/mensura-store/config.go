@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -197,15 +198,22 @@ func durationOr(s string, fallback time.Duration) (time.Duration, error) {
 
 // expandDays lets the config use "30d", which Go's duration parser does
 // not accept, without inventing a second duration syntax elsewhere.
+//
+// Only a bare "<number>d" is rewritten. Sscanf stops at the first byte it
+// cannot use and reports no error for the rest, so "1h30d" used to parse
+// as 1 and expand to "24h" -- a silently wrong retention from a plausible
+// typo. Anything that is not exactly a number followed by "d" is handed to
+// time.ParseDuration unchanged, which rejects it with a real error.
 func expandDays(s string) string {
-	if !strings.HasSuffix(s, "d") {
+	body, ok := strings.CutSuffix(s, "d")
+	if !ok || body == "" {
 		return s
 	}
-	var n float64
-	if _, err := fmt.Sscanf(strings.TrimSuffix(s, "d"), "%g", &n); err != nil {
+	n, err := strconv.ParseFloat(body, 64)
+	if err != nil {
 		return s
 	}
-	return fmt.Sprintf("%gh", n*24)
+	return strconv.FormatFloat(n*24, 'f', -1, 64) + "h"
 }
 
 func (c *fileConfig) toAPIConfig(mode string) store.APIConfig {

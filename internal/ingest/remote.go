@@ -93,17 +93,30 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 
 	// The checkpoint advances only for bytes the store has accepted, the
 	// same rule the local follower uses. runRemoteTail publishes the byte
-	// offset each record ends at; the sink's flush callback promotes it.
-	var progress remoteProgress
-	progress.set(cp.AckedOffset)
-	i.cfg.Sink.OnFlush(func(int) {
-		acked := progress.commit()
-		cp.AckedOffset, cp.Offset = acked, acked
-		cp.UpdatedUnix = time.Now().Unix()
-		if err := cps.Save(cp); err != nil {
-			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
-		}
-	})
+	// offset each record ends at; the delivery observer promotes it.
+	//
+	// This registers one observer per followed path. It used to install a
+	// single callback, which the sink stored in one slot -- so with more
+	// than one --path, every goroutine but the last overwrote the
+	// previous registration and those paths were never checkpointed at
+	// all. They replayed from offset zero on every restart, for the life
+	// of the deployment.
+	obs := &remoteObserver{
+		progress: &remoteProgress{},
+		save: func(acked int64) {
+			cp.AckedOffset, cp.Offset = acked, acked
+			cp.UpdatedUnix = time.Now().Unix()
+			if err := cps.Save(cp); err != nil {
+				i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+			}
+		},
+		onHole: func(at int64) {
+			i.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; restart to re-read from there", target, at)
+		},
+	}
+	obs.progress.set(cp.AckedOffset)
+	progress := obs.progress
+	i.cfg.Sink.Observe(obs)
 
 	for ctx.Err() == nil {
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
@@ -112,7 +125,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		err = i.runRemoteTail(ctx, opts, path, cp, ex, labels, &progress)
+		err = i.runRemoteTail(ctx, opts, path, ex, labels, progress)
 		for _, r := range ex.Flush() {
 			_ = i.cfg.Sink.Add(ctx, r, labels)
 		}
@@ -132,18 +145,24 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 }
 
 // remoteProgress carries a remote tail's byte position between the reader
-// goroutine and the sink's flush callback. pending is how far the reader
-// has handed bytes to the sink; acked is how far the store has confirmed
-// them, and is the only value a checkpoint may hold.
+// goroutine and the delivery observer. pending is how far the reader has
+// handed bytes to the sink, inflight is how far it had got when the sink
+// took the batch it is currently writing, and acked is how far the store
+// has confirmed -- the only value a checkpoint may hold.
 type remoteProgress struct {
-	mu      sync.Mutex
-	pending int64
-	acked   int64
+	mu       sync.Mutex
+	pending  int64
+	inflight int64
+	acked    int64
+	// holed freezes the resume offset after a dropped batch. A checkpoint
+	// is a single offset, so once records are missing from the middle of
+	// the stream it can never move past them without losing them.
+	holed bool
 }
 
 func (p *remoteProgress) set(n int64) {
 	p.mu.Lock()
-	p.pending, p.acked = n, n
+	p.pending, p.inflight, p.acked = n, n, n
 	p.mu.Unlock()
 }
 
@@ -153,17 +172,58 @@ func (p *remoteProgress) advance(n int64) {
 	p.mu.Unlock()
 }
 
-func (p *remoteProgress) commit() int64 {
+func (p *remoteProgress) markInflight() {
+	p.mu.Lock()
+	p.inflight = p.pending
+	p.mu.Unlock()
+}
+
+func (p *remoteProgress) commitInflight() (int64, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.acked = p.pending
-	return p.acked
+	if p.holed || p.inflight <= p.acked {
+		return p.acked, false
+	}
+	p.acked = p.inflight
+	return p.acked, true
+}
+
+func (p *remoteProgress) markHoled() (int64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.holed {
+		return p.acked, false
+	}
+	p.holed = true
+	return p.acked, true
 }
 
 func (p *remoteProgress) ackedOffset() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.acked
+}
+
+// remoteObserver turns one remote tail's delivery outcomes into
+// checkpoints. One is registered per followed path.
+type remoteObserver struct {
+	progress *remoteProgress
+	save     func(acked int64)
+	onHole   func(at int64)
+}
+
+func (o *remoteObserver) BeginFlush() { o.progress.markInflight() }
+
+func (o *remoteObserver) EndFlush(_ int, dropped bool) {
+	if dropped {
+		if at, first := o.progress.markHoled(); first && o.onHole != nil {
+			o.onHole(at)
+		}
+		return
+	}
+	if acked, moved := o.progress.commitInflight(); moved {
+		o.save(acked)
+	}
 }
 
 // runRemoteTail streams one connection's worth of bytes, publishing the
@@ -174,7 +234,7 @@ func (p *remoteProgress) ackedOffset() int64 {
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path string, cp *Checkpoint, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path string, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
 	args := []string{"-o", "BatchMode=yes"}
 	if !opts.InsecureHostKey {
 		args = append(args, "-o", "StrictHostKeyChecking=yes")

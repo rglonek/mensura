@@ -45,6 +45,11 @@ type ReceiveOptions struct {
 	MaxPeers int
 	// PeerIdle is how long a peer's state is kept after its last record.
 	PeerIdle time.Duration
+	// MaxConnections bounds simultaneously served TCP connections. Each
+	// one holds a read buffer and a goroutine for up to connIdleTimeout,
+	// so accepting them without limit is an unbounded footprint that
+	// MaxPeers does not cover: one sender can open thousands.
+	MaxConnections int
 }
 
 // Receive binds the configured listeners and serves until the context is
@@ -65,7 +70,11 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	if opts.PeerIdle <= 0 {
 		opts.PeerIdle = 30 * time.Minute
 	}
+	if opts.MaxConnections <= 0 {
+		opts.MaxConnections = 1024
+	}
 	r := &receiver{ing: i, opts: opts, streams: map[string]*peerStream{}}
+	r.conns = make(chan struct{}, opts.MaxConnections)
 	r.allowed = map[string]struct{}{}
 	for _, a := range opts.AllowedSources {
 		r.allowed[a] = struct{}{}
@@ -113,6 +122,8 @@ type receiver struct {
 	mu      sync.Mutex
 	streams map[string]*peerStream
 	allowed map[string]struct{}
+	// conns is one slot per in-flight TCP connection.
+	conns chan struct{}
 }
 
 // permitted reports whether a sender is allowed on this listener.
@@ -183,7 +194,21 @@ func (r *receiver) serveTCP(ctx context.Context) error {
 			}
 			return err
 		}
-		go r.handleConn(ctx, conn)
+		select {
+		case r.conns <- struct{}{}:
+		default:
+			// Refusing is the honest signal, and it is bounded work: the
+			// alternative is a goroutine and a buffer per connection with
+			// nothing capping either.
+			r.ing.cfg.Log.Printf("WARNING refused tcp connection from %s: %d connections already open",
+				hostOf(conn.RemoteAddr().String()), r.opts.MaxConnections)
+			_ = conn.Close()
+			continue
+		}
+		go func(c net.Conn) {
+			defer func() { <-r.conns }()
+			r.handleConn(ctx, c)
+		}(conn)
 	}
 }
 
@@ -246,8 +271,10 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			// The queue is closed on every exit, not only the clean one,
+			// or the consumer goroutine outlives the listener.
+			close(queue)
 			if ctx.Err() != nil {
-				close(queue)
 				return nil
 			}
 			return err

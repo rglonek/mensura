@@ -114,7 +114,7 @@ func printFieldExpr(fe FieldExpr) string {
 		b.WriteString(" REQUIRED")
 	}
 	if fe.As != "" {
-		b.WriteString(" AS " + strconv.Quote(fe.As))
+		b.WriteString(" AS " + quoteMQL(fe.As))
 	}
 	return b.String()
 }
@@ -172,7 +172,39 @@ func printValue(v string) string {
 	if IsVariable(v) {
 		return v
 	}
-	return strconv.Quote(v)
+	return quoteMQL(v)
+}
+
+// quoteMQL wraps a string in the quoted form the lexer actually reads back.
+//
+// strconv.Quote is the wrong tool: it emits Go escapes such as \x00 and
+// \u00e9, and lexQuoted understands only \n, \t, \r, \\ and the
+// delimiter — it copies anything else through as a literal backslash plus
+// the character. Printing a value with a control byte therefore did not
+// survive Print -> Parse. Escaping only what the lexer decodes, and
+// passing every other byte through verbatim, round-trips exactly.
+func quoteMQL(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // printFloat emits a form the lexer can read back. 'g' would produce
@@ -219,14 +251,14 @@ func quoteIdent(s string) string {
 		return `""`
 	}
 	if keywords[strings.ToUpper(s)] {
-		return strconv.Quote(s)
+		return quoteMQL(s)
 	}
 	for i, r := range s {
 		if i == 0 && !isIdentStart(r) {
-			return strconv.Quote(s)
+			return quoteMQL(s)
 		}
 		if i > 0 && !isIdentRune(r) {
-			return strconv.Quote(s)
+			return quoteMQL(s)
 		}
 	}
 	return s

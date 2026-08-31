@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -168,7 +169,21 @@ func runWithEngine(ctx context.Context, cfg *fileConfig) error {
 
 	if cfg.Mode == "plugin" {
 		sc.Logger.Printf("serving Grafana over the plugin protocol; write API on %s", cfg.Listen.Write.Addr)
-		return plugin.ServeLocal(s)
+		// Served on a goroutine so a signal still unwinds through the
+		// deferred Close. Blocking here meant SIGTERM never reached it,
+		// and Close is what flushes the memtables -- the step that makes
+		// "a graceful stop is durable in every profile" true, and the
+		// only thing standing between durability: batch and losing
+		// whatever had not been compacted yet.
+		served := make(chan error, 1)
+		go func() { served <- plugin.ServeLocal(s) }()
+		select {
+		case err := <-served:
+			return err
+		case <-ctx.Done():
+			sc.Logger.Printf("shutting down")
+			return nil
+		}
 	}
 
 	sc.Logger.Printf("mensura-store %s listening on %s (data dir %s)", store.Version, cfg.Listen.Write.Addr, cfg.DataDir)
@@ -298,12 +313,36 @@ func shutdown(servers []*http.Server) {
 	}
 }
 
+// hashSecret prints the stored form of a bearer secret.
+//
+// With no argument it reads the secret from stdin, because an argv
+// element is visible in ps and lands in shell history -- on the one
+// command whose whole purpose is keeping the secret out of files. The
+// argument form still works, with a warning, so existing runbooks do not
+// break silently.
 func hashSecret(argv []string) {
-	if len(argv) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: mensura-store hash-secret <secret>")
+	var secret string
+	switch len(argv) {
+	case 0:
+		fmt.Fprintln(os.Stderr, "reading the secret from stdin")
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		secret = strings.TrimRight(string(b), "\r\n")
+	case 1:
+		fmt.Fprintln(os.Stderr, "WARNING the secret was passed as an argument, so it is visible in ps and in shell history; pipe it on stdin instead")
+		secret = argv[0]
+	default:
+		fmt.Fprintln(os.Stderr, "usage: mensura-store hash-secret [secret]   (preferred: echo -n <secret> | mensura-store hash-secret)")
 		os.Exit(2)
 	}
-	fmt.Println("sha256:" + store.HashSecret(argv[0]))
+	if secret == "" {
+		fmt.Fprintln(os.Stderr, "the secret is empty")
+		os.Exit(2)
+	}
+	fmt.Println("sha256:" + store.HashSecret(secret))
 }
 
 // runQueryClient is the debugging client: it runs MQL against a store and

@@ -129,6 +129,14 @@ type fieldEntry struct {
 // dictionary is the string-to-index map for one label key. The store owns
 // it because with many independent ingesters a single writer is the only
 // way to keep indices consistent without a coordination protocol.
+//
+// The map is global per label key, not per set: 05-storage.md section 8
+// specifies one dictionary per key for the whole store. So a label key's
+// cardinality budget is shared across sets, and LabelValues reports every
+// value of that key seen anywhere. `LABELS <key> WHERE …` is the
+// set-scoped form, and it scans rather than reading the dictionary.
+// 12-implementation.md section 6.0 records the consequences; changing it
+// would reinterpret every index already on disk.
 type dictionary struct {
 	Entries []string `json:"entries"`
 	index   map[string]int32
@@ -193,9 +201,15 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 	s.warnInexactShardWidths()
-	// A per-set retention with no global default still needs a sweep, so
-	// the trigger is "anything is retained", not "the default is set".
-	if cfg.RetentionSweep > 0 && s.hasAnyRetention() {
+	// The sweep is started whenever it is configured, not only when
+	// something is retained right now. Retention also arrives later, from
+	// a spec's `sets:` block over the write API (applySetMeta), and that
+	// is the documented way to run "--retention 0" globally with per-set
+	// retention declared by the ingester. Deciding once at startup meant
+	// such a set was sharded as if it would be swept and then kept
+	// forever, with no error and no log line. A sweep over nothing costs
+	// one pass across the set names per interval.
+	if cfg.RetentionSweep > 0 {
 		s.wg.Add(1)
 		go s.retentionLoop()
 	}
@@ -229,9 +243,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) DB() *engine.DB          { return s.db }
-func (s *Store) Config() Config          { return s.cfg }
-func (s *Store) Uptime() time.Duration   { return time.Since(s.started) }
+func (s *Store) DB() *engine.DB        { return s.db }
+func (s *Store) Config() Config        { return s.cfg }
+func (s *Store) Uptime() time.Duration { return time.Since(s.started) }
+
+// CatalogueVersion is the version of the catalogue *schema*: which sets
+// exist and what fields, labels and bucket sets they carry.
+//
+// It deliberately does not move when a set's first/last timestamp moves.
+// It used to, which meant it changed on every single write batch, so the
+// ETag on /v1/catalogue never matched and every client watching this
+// number for metadata changes was woken continuously. The first/last
+// timestamps are still reported live in the catalogue body; they are
+// advisory hints for the query builder, not schema.
 func (s *Store) CatalogueVersion() int64 { return s.catVer.Load() }
 
 // ---------- catalogue persistence ----------

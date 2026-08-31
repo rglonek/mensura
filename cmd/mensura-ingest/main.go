@@ -244,9 +244,13 @@ func runFollow(argv []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	// Deferred calls unwind last-first, so the reporter is stopped before
+	// the sink it publishes into is closed. The other order let the
+	// reporting goroutine queue progress samples into a sink that would
+	// never flush again.
+	defer func() { _ = sink.Close(context.Background()) }()
 	stopReporting := startReporting(ctx, ing, sink, common)
 	defer stopReporting()
-	defer sink.Close(context.Background())
 
 	list := splitList(*paths)
 	if *sshHost != "" {
@@ -288,9 +292,9 @@ func runReceive(argv []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	defer func() { _ = sink.Close(context.Background()) }()
 	stopReporting := startReporting(ctx, ing, sink, common)
 	defer stopReporting()
-	defer sink.Close(context.Background())
 
 	var sources []string
 	if *allowed != "" {

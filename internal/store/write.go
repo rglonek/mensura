@@ -207,9 +207,13 @@ func (s *Store) SetKeyScheme(set string, scheme model.KeyScheme) {
 
 // rowFor turns a sample into an engine row: the timestamp, one integer
 // column per label (its dictionary index) and the fields as they came.
+//
+// Every reason to reject the sample is evaluated before the first value is
+// interned. Interning as we went meant a sample rejected by a later check
+// had already burned dictionary entries and written them to disk, so a
+// stream of malformed samples grew the dictionary permanently and could
+// exhaust a label key's cardinality budget without storing a single row.
 func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
-	row := make(engine.Row, len(sm.Labels)+len(sm.Fields)+1)
-	row[model.TimestampField] = model.Int(sm.TSMs)
 	for k, v := range sm.Labels {
 		// A label named "timestamp" would overwrite the indexed column
 		// with a dictionary index, putting the row at a fabricated time
@@ -220,6 +224,16 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 		if err := model.ValidateLabelValue(v); err != nil {
 			return nil, fmt.Errorf("label %q: %w", k, err)
 		}
+	}
+	for k := range sm.Fields {
+		if _, clash := sm.Labels[k]; clash {
+			return nil, fmt.Errorf("%q is both a label and a field", k)
+		}
+	}
+
+	row := make(engine.Row, len(sm.Labels)+len(sm.Fields)+1)
+	row[model.TimestampField] = model.Int(sm.TSMs)
+	for k, v := range sm.Labels {
 		idx, err := s.intern(k, v)
 		if err != nil {
 			return nil, err
@@ -227,9 +241,6 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 		row[k] = model.Int(int64(idx))
 	}
 	for k, v := range sm.Fields {
-		if _, clash := sm.Labels[k]; clash {
-			return nil, fmt.Errorf("%q is both a label and a field", k)
-		}
 		row[k] = v
 	}
 	return row, nil
@@ -244,20 +255,24 @@ func (s *Store) observeSet(set string, samples []model.Sample) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.entryLocked(set)
-	changed := false
+	// Only a schema change bumps the version. Advancing the observed time
+	// range does not: it happens on every batch, and versioning it made
+	// the catalogue ETag useless and woke every client that watches
+	// catalogue_version for metadata changes.
+	schemaChanged := false
 	now := time.Now().UnixMilli()
 	for i := range samples {
 		sm := &samples[i]
 		if e.FirstTSMs == 0 || sm.TSMs < e.FirstTSMs {
-			e.FirstTSMs, changed = sm.TSMs, true
+			e.FirstTSMs = sm.TSMs
 		}
 		if sm.TSMs > e.LastTSMs {
-			e.LastTSMs, changed = sm.TSMs, true
+			e.LastTSMs = sm.TSMs
 		}
 		for k := range sm.Labels {
 			if _, ok := e.Labels[k]; !ok {
 				e.Labels[k] = struct{}{}
-				changed = true
+				schemaChanged = true
 			}
 		}
 		for k := range sm.Fields {
@@ -265,12 +280,12 @@ func (s *Store) observeSet(set string, samples []model.Sample) {
 			if !ok {
 				f = &fieldEntry{Kind: model.KindGauge}
 				e.Fields[k] = f
-				changed = true
+				schemaChanged = true
 			}
 			f.LastSeenMs = now
 		}
 	}
-	if changed {
+	if schemaChanged {
 		s.catVer.Add(1)
 	}
 }

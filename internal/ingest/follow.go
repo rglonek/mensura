@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ type FollowOptions struct {
 	// IdleFlush bounds how long a partial multiline record or a
 	// half-filled aggregation window may wait.
 	IdleFlush time.Duration
+	// MaxRecordBytes bounds one record. A longer one is truncated and
+	// counted rather than buffered without limit.
+	MaxRecordBytes int
 }
 
 // Follow tails files continuously, handling rotation, until the context is
@@ -38,6 +42,9 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 	if opts.IdleFlush <= 0 {
 		opts.IdleFlush = 30 * time.Second
 	}
+	if opts.MaxRecordBytes <= 0 {
+		opts.MaxRecordBytes = defaultMaxRecordBytes
+	}
 	cps, err := NewCheckpointStore(i.cfg.StateDir)
 	if err != nil {
 		return err
@@ -49,7 +56,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 		noProfile: map[string]time.Time{},
 	}
 	// Checkpoints advance only for bytes the store has accepted.
-	i.cfg.Sink.OnFlush(func(int) { f.commit() })
+	i.cfg.Sink.Observe(f)
 
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
@@ -58,6 +65,13 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain the extractors and close the handles, then flush. The
+			// flush is what advances the checkpoints, through the
+			// observer, so nothing is acknowledged before it is
+			// delivered. Committing here and flushing afterwards -- the
+			// old order -- marked the final bytes as accepted even when
+			// that last flush failed against a store that was already
+			// gone, which is the normal ordering in a rolling restart.
 			f.closeAll(ctx)
 			return i.cfg.Sink.Flush(context.Background())
 		case <-idle.C:
@@ -96,17 +110,24 @@ type tailer struct {
 	file        *os.File
 	info        os.FileInfo
 	fingerprint string
-	// fingerprintFull records whether fingerprint covers a full window;
-	// a short-file fingerprint is provisional and may not be compared.
-	fingerprintFull bool
-	offset          int64
-	labels          map[string]string
-	ex              *extract.Stream
-	cp              *Checkpoint
+	// fingerprintAt is how many bytes fingerprint covers. It is the
+	// number of bytes already consumed, capped, so the hash is stable
+	// under append and changes the moment consumed bytes are rewritten.
+	fingerprintAt int
+	offset        int64
+	labels        map[string]string
+	ex            *extract.Stream
+	cp            *Checkpoint
 
-	mu      sync.Mutex
-	pending int64
-	acked   int64
+	mu       sync.Mutex
+	pending  int64
+	inflight int64
+	acked    int64
+	// holed records that a batch was dropped while these bytes were in
+	// flight. Once that has happened the resume offset may never move
+	// again for this tailer: a checkpoint is a single offset, so
+	// advancing it past the gap would bury the lost records for good.
+	holed bool
 }
 
 func (t *tailer) setPending(n int64) {
@@ -115,31 +136,62 @@ func (t *tailer) setPending(n int64) {
 	t.mu.Unlock()
 }
 
-// commitPending promotes pending to acked and returns the checkpoint to
-// write. The record is built and copied under the lock: two flushes can
-// land at once, and mutating the shared Checkpoint while another goroutine
-// marshals it is a race.
-func (t *tailer) commitPending(now int64) Checkpoint {
+// markInflight snapshots how far the reader had got at the moment the sink
+// took the batch. Only these bytes may be acknowledged when that batch
+// commits.
+//
+// The snapshot is what makes the acknowledgement honest. Promoting the
+// live read offset after the write instead acknowledged bytes whose
+// samples were still buffered for the *next* batch, so a crash in that
+// window lost them.
+func (t *tailer) markInflight() {
+	t.mu.Lock()
+	t.inflight = t.pending
+	t.mu.Unlock()
+}
+
+// commitInflight promotes the snapshot to acked and returns the checkpoint
+// to write, or reports false when there is nothing new to persist. The
+// record is built and copied under the lock: two flushes can land at once,
+// and mutating the shared Checkpoint while another goroutine marshals it
+// is a race.
+func (t *tailer) commitInflight(now int64) (Checkpoint, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.acked = t.pending
+	if t.holed || t.inflight <= t.acked {
+		return Checkpoint{}, false
+	}
+	t.acked = t.inflight
 	t.cp.Offset = t.acked
 	t.cp.AckedOffset = t.acked
 	t.cp.UpdatedUnix = now
-	return *t.cp
+	return *t.cp, true
 }
 
-// setFingerprint records a new content fingerprint on the checkpoint.
-func (t *tailer) setFingerprint(fp string, full bool) {
+// markHoled freezes the resume offset after a dropped batch, and reports
+// whether this was the first time.
+func (t *tailer) markHoled() bool {
 	t.mu.Lock()
-	t.fingerprint, t.fingerprintFull = fp, full
-	t.cp.Fingerprint = fp
+	defer t.mu.Unlock()
+	if t.holed {
+		return false
+	}
+	t.holed = true
+	return true
+}
+
+// setFingerprint records a new content fingerprint, and the width it
+// covers, on the checkpoint.
+func (t *tailer) setFingerprint(fp string, width int) {
+	t.mu.Lock()
+	t.fingerprint, t.fingerprintAt = fp, width
+	t.cp.Fingerprint, t.cp.FingerprintBytes = fp, width
 	t.mu.Unlock()
 }
 
 func (t *tailer) reset(to int64) {
 	t.mu.Lock()
-	t.pending, t.acked = to, to
+	t.pending, t.inflight, t.acked = to, to, to
 	t.mu.Unlock()
 	t.offset = to
 }
@@ -218,8 +270,6 @@ func (f *follower) ensure(path string) (*tailer, error) {
 		_ = fh.Close()
 		return nil, err
 	}
-	fingerprint, fpFull := fingerprintFile(fh)
-
 	stream := StreamID(path)
 	cp, had := f.cps.Load(stream)
 	if !had {
@@ -227,7 +277,7 @@ func (f *follower) ensure(path string) (*tailer, error) {
 	}
 	var start int64
 	switch {
-	case had && fpFull && cp.Fingerprint == fingerprint && f.opts.StartAt != "beginning":
+	case had && f.opts.StartAt != "beginning" && fingerprintMatches(fh, cp):
 		// Same file as last time: resume where the store last acknowledged.
 		start = cp.AckedOffset
 	case f.opts.StartAt == "end":
@@ -266,11 +316,17 @@ func (f *follower) ensure(path string) (*tailer, error) {
 
 	t = &tailer{
 		path: path, stream: stream, file: fh, info: info,
-		fingerprint: fingerprint, fingerprintFull: fpFull,
 		labels: f.ing.streamLabels(path, full[:hn]), ex: ex, cp: cp,
 	}
 	t.reset(start)
-	cp.Fingerprint = fingerprint
+	// The fingerprint covers what has been consumed, so it is taken from
+	// the resume point rather than from a fixed prefix.
+	if width := fingerprintWidth(start); width > 0 {
+		fp, n := fingerprintAt(fh, width)
+		if n == width {
+			t.setFingerprint(fp, width)
+		}
+	}
 	f.mu.Lock()
 	f.tailers[path] = t
 	f.mu.Unlock()
@@ -291,29 +347,41 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 	if _, err := t.file.Seek(t.offset, io.SeekStart); err != nil {
 		return err
 	}
+	max := f.opts.MaxRecordBytes
 	r := bufio.NewReaderSize(t.file, 64<<10)
 	for {
-		chunk, err := r.ReadBytes('\n')
-		if len(chunk) > 0 {
-			if chunk[len(chunk)-1] != '\n' {
-				// Incomplete: leave the offset where it was and stop.
-				return f.atEOF(t)
+		rec, err := readRecord(r, max)
+		if !rec.Terminated {
+			if rec.Consumed > max {
+				// No newline within the cap. Consuming it is the only way
+				// out: holding it back for a terminator that is not
+				// coming would re-buffer the same bytes on every poll,
+				// which for a large newline-free file means reading it
+				// into memory again and again.
+				t.offset += int64(rec.Consumed)
+				f.ing.cfg.Progress.OversizeRecord()
+				t.setPending(t.offset)
+				continue
 			}
-			t.offset += int64(len(chunk))
-			line := chunk[:len(chunk)-1]
-			f.ing.cfg.Progress.AddBytes(int64(len(chunk)))
-			results, perr := t.ex.Process(string(line))
-			f.ing.recordOutcome(perr)
-			for _, res := range results {
-				if err := f.ing.cfg.Sink.Add(ctx, res, t.labels); err != nil {
-					return err
-				}
-			}
-			// pending is only advanced once every sample from these bytes
-			// has been handed to the sink, so a commit can never
-			// acknowledge a byte whose samples are still unqueued.
-			t.setPending(t.offset)
+			// Incomplete: leave the offset where it was and stop.
+			return f.atEOF(t)
 		}
+		t.offset += int64(rec.Consumed)
+		if rec.Oversize {
+			f.ing.cfg.Progress.OversizeRecord()
+		}
+		f.ing.cfg.Progress.AddBytes(int64(rec.Consumed))
+		results, perr := t.ex.Process(string(rec.Line))
+		f.ing.recordOutcome(perr)
+		for _, res := range results {
+			if err := f.ing.cfg.Sink.Add(ctx, res, t.labels); err != nil {
+				return err
+			}
+		}
+		// pending is only advanced once every sample from these bytes
+		// has been handed to the sink, so a commit can never
+		// acknowledge a byte whose samples are still unqueued.
+		t.setPending(t.offset)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return f.atEOF(t)
@@ -342,14 +410,16 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 	if err != nil {
 		return err
 	}
-	current, full := fingerprintFile(t.file)
-	// A fingerprint over fewer than fingerprintBytes bytes changes on
-	// every append, so below that threshold only a shrinking file counts
-	// as a rewrite. Treating a growing young file as "rewritten" would
-	// reset the offset and re-read it on every poll.
+	// The bytes behind the read offset are the ones that must not change.
+	// Comparing at the stored width -- not at whatever the file is now --
+	// is what lets this work on a file of any size, including one that
+	// was copytruncated and immediately grew back to its old length.
 	rewritten := openInfo.Size() < t.offset
-	if !rewritten && full && t.fingerprintFull && current != t.fingerprint {
-		rewritten = true
+	if !rewritten && t.fingerprintAt > 0 {
+		current, n := fingerprintAt(t.file, t.fingerprintAt)
+		if n < t.fingerprintAt || current != t.fingerprint {
+			rewritten = true
+		}
 	}
 	if rewritten {
 		// A truncate, a copytruncate, or a rewrite in place: the bytes we
@@ -357,13 +427,14 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 		// truncate followed by fresh appends restores the size.
 		f.ing.cfg.Log.Printf("INFO %s was truncated or rewritten; re-reading from the start", t.path)
 		t.reset(0)
-		t.setFingerprint(current, full)
+		t.setFingerprint("", 0)
 		return nil
 	}
-	// Adopt the fingerprint once the file is finally long enough to have a
-	// stable one, so a later rewrite is still detected.
-	if full && !t.fingerprintFull {
-		t.setFingerprint(current, full)
+	// Widen the window as more of the file is consumed, up to the cap.
+	if width := fingerprintWidth(t.offset); width > t.fingerprintAt {
+		if fp, n := fingerprintAt(t.file, width); n == width {
+			t.setFingerprint(fp, width)
+		}
 	}
 	pathInfo, err := os.Stat(t.path)
 	if os.IsNotExist(err) {
@@ -395,50 +466,88 @@ func (f *follower) retire(ctx context.Context, t *tailer) {
 		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels)
 	}
 	_ = t.file.Close()
+	// Clearing the handle is what makes the retired tailer inert. poll
+	// calls read() again right after checkRotation returns, and a closed
+	// but non-nil handle turned every single rotation into a bogus
+	// "ERROR follow: seek ...: file already closed" -- which also became
+	// the sweep's first error and hid any real failure behind it.
+	t.file = nil
 	f.mu.Lock()
 	delete(f.tailers, t.path)
 	f.mu.Unlock()
-	// The replacement file starts from its beginning.
+	// The replacement file starts from its beginning. The checkpoint is
+	// rewritten by the next successful flush; it is not forced here,
+	// because nothing has been delivered yet.
 	t.reset(0)
-	cp := t.commitPending(time.Now().Unix())
+	cp := *t.cp
+	cp.Offset, cp.AckedOffset, cp.UpdatedUnix = 0, 0, time.Now().Unix()
 	if err := f.cps.Save(&cp); err != nil {
 		f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
 	}
 }
 
-// commit advances every tailer's acknowledged offset. It runs after a
-// successful flush, which is the only event that proves the store has the
-// bytes.
-//
-// It runs on the sink's flush goroutine, so it must not read a tailer's
-// live read offset; only the guarded pending/acked pair is safe here.
-func (f *follower) commit() {
-	f.mu.Lock()
-	tailers := make([]*tailer, 0, len(f.tailers))
-	for _, t := range f.tailers {
-		if t != nil {
-			tailers = append(tailers, t)
-		}
+// BeginFlush snapshots every tailer's read position at the moment the sink
+// takes a batch. It runs on the flushing goroutine with the sink's buffer
+// lock held, so it must not call back into the sink.
+func (f *follower) BeginFlush() {
+	for _, t := range f.snapshotTailers() {
+		t.markInflight()
 	}
-	f.mu.Unlock()
+}
+
+// EndFlush turns a delivery outcome into checkpoints.
+//
+// A committed batch advances each tailer to the offset BeginFlush
+// snapshotted, which is the only offset the store is known to hold. A
+// dropped batch does the opposite: it freezes those tailers, because the
+// records are gone and a resume offset that moved past them would mean
+// they are never re-read, not even after a restart. Which tailer fed the
+// lost batch is not knowable here, so every live one is frozen; the cost
+// is replaying some already-stored records on the next start, which
+// content-addressed row keys collapse back to one row.
+func (f *follower) EndFlush(_ int, dropped bool) {
+	tailers := f.snapshotTailers()
+	if dropped {
+		for _, t := range tailers {
+			if t.markHoled() {
+				f.ing.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; restart to re-read from there",
+					t.path, t.ackedOffset())
+			}
+		}
+		return
+	}
 	now := time.Now().Unix()
 	for _, t := range tailers {
-		cp := t.commitPending(now)
+		cp, ok := t.commitInflight(now)
+		if !ok {
+			continue
+		}
 		if err := f.cps.Save(&cp); err != nil {
 			f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
 		}
 	}
 }
 
-func (f *follower) flushIdle(ctx context.Context) {
+func (t *tailer) ackedOffset() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.acked
+}
+
+func (f *follower) snapshotTailers() []*tailer {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	tailers := make([]*tailer, 0, len(f.tailers))
 	for _, t := range f.tailers {
 		if t != nil {
 			tailers = append(tailers, t)
 		}
 	}
-	f.mu.Unlock()
+	return tailers
+}
+
+func (f *follower) flushIdle(ctx context.Context) {
+	tailers := f.snapshotTailers()
 	now := time.Now()
 	for _, t := range tailers {
 		for _, r := range t.ex.FlushIdle(now) {
@@ -448,40 +557,106 @@ func (f *follower) flushIdle(ctx context.Context) {
 }
 
 func (f *follower) closeAll(ctx context.Context) {
-	f.mu.Lock()
-	tailers := make([]*tailer, 0, len(f.tailers))
-	for _, t := range f.tailers {
-		if t != nil {
-			tailers = append(tailers, t)
-		}
-	}
-	f.mu.Unlock()
-	for _, t := range tailers {
+	for _, t := range f.snapshotTailers() {
 		for _, r := range t.ex.Flush() {
 			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels)
 		}
-		_ = t.file.Close()
+		if t.file != nil {
+			_ = t.file.Close()
+			t.file = nil
+		}
 	}
-	f.commit()
+	// No commit here on purpose: the caller flushes next, and the
+	// observer commits exactly what that flush delivers.
 }
 
-// fingerprintBytes is the width of the rotation fingerprint window. It is
-// fixed rather than "however much the file has": a hash over a growing
-// prefix changes on every append, which reads as a rewrite.
-const fingerprintBytes = 256
+// fingerprintBytes caps the width of the rotation fingerprint. Beyond this
+// the hash costs more than it proves.
+//
+// The width matters. The original fingerprint was 64 bits over a fixed
+// 256-byte window, which is far too narrow to identify a file: rotated
+// logs routinely share their first 256 bytes -- a fixed startup banner, a
+// constant-width header, a templated first line -- and a fingerprint match
+// is what makes a restarting follower resume at the stored offset. Two
+// different files agreeing on that window made it seek into the middle of
+// the new one and silently skip everything before that point.
+const fingerprintBytes = 4096
 
-// fingerprintFile hashes a file's first fingerprintBytes bytes and reports
-// whether the file was long enough to fill the window. A fingerprint taken
-// over a short file is not yet stable and must not be compared.
-func fingerprintFile(f *os.File) (string, bool) {
-	head := make([]byte, fingerprintBytes)
+// fingerprintPrefix versions the fingerprint format. A checkpoint written
+// by an older build carries a bare hex string over the legacy window;
+// recognising it avoids re-reading every followed file on upgrade.
+const fingerprintPrefix = "v2:"
+
+// legacyFingerprintBytes is the original window, kept only to validate a
+// checkpoint written before fingerprintPrefix existed.
+const legacyFingerprintBytes = 256
+
+// fingerprintWidth is how much of a file to fingerprint given how much of
+// it has already been consumed.
+//
+// The window covers bytes that were *already read*, not a fixed prefix.
+// That is what makes it both stable and meaningful: appending cannot
+// change bytes behind the read offset, so the hash does not move on a
+// growing file, while a truncate, a copytruncate or a rewrite in place
+// changes it immediately -- at any file size. A fixed prefix could only
+// ever be compared once the file was longer than the window, which left
+// every short file with no rotation detection but a size comparison, and a
+// copytruncate that restores the size defeats that.
+func fingerprintWidth(consumed int64) int {
+	switch {
+	case consumed <= 0:
+		return 0
+	case consumed > fingerprintBytes:
+		return fingerprintBytes
+	default:
+		return int(consumed)
+	}
+}
+
+// fingerprintAt hashes a file's first width bytes, reporting how many it
+// could actually read. A short read means the file no longer contains the
+// bytes we already consumed from it.
+func fingerprintAt(f *os.File, width int) (string, int) {
+	if width <= 0 {
+		return "", 0
+	}
+	head := make([]byte, width)
 	n, _ := f.ReadAt(head, 0)
-	return fingerprintOf(head[:n]), n >= fingerprintBytes
+	return fingerprintOf(head[:n]), n
 }
 
 // fingerprintOf hashes a file's first bytes. Inode numbers get reused and
 // are invisible over a remote transport; content is neither.
 func fingerprintOf(head []byte) string {
 	sum := sha256.Sum256(head)
+	return fingerprintPrefix + hex.EncodeToString(sum[:16])
+}
+
+// legacyFingerprintOf reproduces the pre-v2 hash so a checkpoint written
+// by an older build is still recognised.
+func legacyFingerprintOf(head []byte) string {
+	sum := sha256.Sum256(head)
 	return hex.EncodeToString(sum[:8])
+}
+
+// fingerprintMatches reports whether a stored checkpoint fingerprint still
+// describes this file, accepting the pre-v2 form.
+func fingerprintMatches(f *os.File, cp *Checkpoint) bool {
+	if cp == nil || cp.Fingerprint == "" {
+		return false
+	}
+	if strings.HasPrefix(cp.Fingerprint, fingerprintPrefix) {
+		width := cp.FingerprintBytes
+		if width <= 0 {
+			return false
+		}
+		got, n := fingerprintAt(f, width)
+		return n == width && got == cp.Fingerprint
+	}
+	head := make([]byte, legacyFingerprintBytes)
+	n, _ := f.ReadAt(head, 0)
+	if n < legacyFingerprintBytes {
+		return false
+	}
+	return cp.Fingerprint == legacyFingerprintOf(head[:n])
 }
