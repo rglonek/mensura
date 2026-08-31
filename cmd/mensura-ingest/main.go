@@ -121,14 +121,6 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	name := c.client
-	if name == "" {
-		if h, err := os.Hostname(); err == nil {
-			name = h
-		} else {
-			name = "mensura-ingest"
-		}
-	}
 	client := wire.NewClient(c.storeURL, os.Getenv("MENSURA_INGEST_TOKEN"))
 	client.Compress = c.compress
 
@@ -146,12 +138,24 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 
 	ing, err := ingest.New(ingest.Config{
 		Spec: spec, Sink: sink, Labels: c.labels, From: from, To: to,
-		StateDir: c.stateDir, ClientName: name, Log: logger,
+		StateDir: c.stateDir, ClientName: c.client, Log: logger,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return ing, sink, nil
+}
+
+// splitList splits a comma-separated flag, dropping empty entries so a
+// trailing comma is not read as a request to ingest "".
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // parseTimeFlag accepts an absolute RFC3339 stamp or a duration before now.
@@ -190,7 +194,7 @@ func runBatch(argv []string) error {
 	stopReporting := startReporting(ctx, ing, sink, common)
 
 	start := time.Now()
-	runErr := ing.Batch(ctx, strings.Split(*sources, ","))
+	runErr := ing.Batch(ctx, splitList(*sources))
 	stopReporting()
 	if err := sink.Close(context.Background()); err != nil {
 		return err
@@ -244,11 +248,11 @@ func runFollow(argv []string) error {
 	defer stopReporting()
 	defer sink.Close(context.Background())
 
-	list := strings.Split(*paths, ",")
+	list := splitList(*paths)
 	if *sshHost != "" {
 		return ing.FollowRemote(ctx, ingest.RemoteOptions{
 			Host: *sshHost, User: *sshUser, Port: *sshPort,
-			CredentialPath: *sshCred, StrictHostKey: *strictHost, Paths: list,
+			CredentialPath: *sshCred, InsecureHostKey: !*strictHost, Paths: list,
 		})
 	}
 	return ing.Follow(ctx, ingest.FollowOptions{
@@ -265,11 +269,18 @@ func runReceive(argv []string) error {
 	httpAddr := fs.String("listen-http", "", "HTTP listen address")
 	mode := fs.String("mode", "logs", "logs | metrics")
 	listener := fs.String("listener-name", "default", "listener name profiles can select on")
+	allowed := fs.String("allow-source", "", "comma-separated sender addresses to accept; empty accepts any")
+	maxDatagram := fs.Int("max-datagram-bytes", 0, "largest accepted UDP record")
+	udpQueue := fs.Int("udp-queue", 0, "UDP backlog before datagrams are dropped and counted")
+	maxPeers := fs.Int("max-peers", 0, "how many distinct senders may hold extraction state")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if *tcpAddr == "" && *udpAddr == "" && *httpAddr == "" {
 		return fmt.Errorf("at least one of --listen-tcp, --listen-udp or --listen-http is required")
+	}
+	if *mode != "logs" && *mode != "metrics" {
+		return fmt.Errorf("--mode %q: expected logs or metrics", *mode)
 	}
 	ing, sink, err := common.setup()
 	if err != nil {
@@ -281,9 +292,17 @@ func runReceive(argv []string) error {
 	defer stopReporting()
 	defer sink.Close(context.Background())
 
+	var sources []string
+	if *allowed != "" {
+		sources = strings.Split(*allowed, ",")
+	}
 	return ing.Receive(ctx, ingest.ReceiveOptions{
 		TCPAddr: *tcpAddr, UDPAddr: *udpAddr, HTTPAddr: *httpAddr,
 		Mode: *mode, Listener: *listener,
+		AllowedSources:   sources,
+		MaxDatagramBytes: *maxDatagram,
+		UDPQueue:         *udpQueue,
+		MaxPeers:         *maxPeers,
 	})
 }
 
@@ -383,7 +402,7 @@ func startReporting(ctx context.Context, ing *ingest.Ingest, sink *ingest.Sink, 
 				if err := ing.Progress().WriteFile(c.progress); err != nil {
 					log.Printf("WARNING writing progress file: %v", err)
 				}
-				if err := ing.Progress().Report(ctx, sink, c.client, c.labels); err != nil {
+				if err := ing.Progress().Report(ctx, sink, ing.ClientName(), c.labels); err != nil {
 					log.Printf("WARNING reporting progress to the store: %v", err)
 				}
 			}

@@ -61,10 +61,24 @@ func New(cfg Config) (*Ingest, error) {
 	if cfg.Progress == nil {
 		cfg.Progress = NewProgress()
 	}
+	if cfg.ClientName == "" {
+		if h, err := os.Hostname(); err == nil {
+			cfg.ClientName = h
+		} else {
+			cfg.ClientName = "mensura-ingest"
+		}
+	}
+	// The spec's `sets:` declarations travel with the first write, the
+	// same way field metadata does.
+	cfg.Sink.DeclareSets(cfg.Spec)
 	return &Ingest{cfg: cfg}, nil
 }
 
 func (i *Ingest) Progress() *Progress { return i.cfg.Progress }
+
+// ClientName is the name this ingest reports to the store, resolved to the
+// hostname when the operator did not choose one.
+func (i *Ingest) ClientName() string { return i.cfg.ClientName }
 
 // Batch imports a set of sources once and returns when they are all
 // processed. Sources may be files, directories, globs or archives.
@@ -79,11 +93,18 @@ func (i *Ingest) Batch(ctx context.Context, sources []string) error {
 	var firstErr error
 	var errMu sync.Mutex
 
+	cancelled := false
 	for _, f := range files {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// Stop starting work, but still wait below: returning here
+			// would leave running goroutines writing into a sink the
+			// caller is about to close.
+			cancelled = true
 		case sem <- struct{}{}:
+		}
+		if cancelled {
+			break
 		}
 		wg.Add(1)
 		go func(path string) {
@@ -101,6 +122,11 @@ func (i *Ingest) Batch(ctx context.Context, sources []string) error {
 		}(f)
 	}
 	wg.Wait()
+	if cancelled {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	if err := i.cfg.Sink.Flush(ctx); err != nil {
 		return err
 	}
@@ -286,14 +312,20 @@ func peek(path string, n int) ([]byte, time.Time, error) {
 	if err != nil {
 		return nil, time.Time{}, err
 	}
+	// Sniffing must see decompressed bytes: compressed data is full of
+	// NULs, so a .bz2 whose head was read raw would always be classified
+	// as binary and skipped, making the bzip2 reader below unreachable.
 	var r io.Reader = f
-	if strings.HasSuffix(path, ".gz") || strings.HasSuffix(path, ".tgz") {
+	switch {
+	case strings.HasSuffix(path, ".gz"), strings.HasSuffix(path, ".tgz"):
 		zr, err := gzip.NewReader(f)
 		if err != nil {
 			return nil, info.ModTime(), nil
 		}
 		defer zr.Close()
 		r = zr
+	case strings.HasSuffix(path, ".bz2"):
+		r = bzip2.NewReader(f)
 	}
 	buf := make([]byte, n)
 	read, err := io.ReadFull(r, buf)

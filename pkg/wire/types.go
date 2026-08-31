@@ -15,7 +15,22 @@ const ProtocolVersion = 1
 // WriteRequest is the body of POST /v1/write.
 type WriteRequest struct {
 	FieldMeta []FieldMeta   `json:"field_meta,omitempty"`
+	SetMeta   []SetMeta     `json:"set_meta,omitempty"`
 	Batches   []model.Batch `json:"batches"`
+}
+
+// SetMeta carries what an extraction spec declares about a destination set
+// as a whole, rather than about one of its fields. Like FieldMeta it is
+// sent once per process start and on spec reload, not per sample.
+type SetMeta struct {
+	Set string `json:"set"`
+	// RetentionMs is how long the set is kept; 0 means "keep everything".
+	// A nil pointer leaves the store's own setting alone.
+	RetentionMs *int64 `json:"retention_ms,omitempty"`
+	// ShardMs is the time-shard width. A nil pointer leaves it alone.
+	ShardMs *int64 `json:"shard_ms,omitempty"`
+	// KeyScheme selects content or offset keying for the set.
+	KeyScheme model.KeyScheme `json:"key_scheme,omitempty"`
 }
 
 // FieldMeta is the metadata that travels from an extraction spec into the
@@ -125,6 +140,10 @@ type Hello struct {
 	DataDir          string `json:"data_dir,omitempty"`
 	CatalogueVersion int64  `json:"catalogue_version"`
 	UptimeSeconds    int64  `json:"uptime_seconds"`
+	// The safety ceilings, so a proxy-mode plugin validates a LIMIT
+	// against the same numbers the store will enforce.
+	MaxSeriesPerGraph     int `json:"max_series_per_graph,omitempty"`
+	MaxDataPointsReceived int `json:"max_datapoints_received,omitempty"`
 }
 
 // Catalogue is the response of GET /v1/catalogue: everything the query

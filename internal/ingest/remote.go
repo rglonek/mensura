@@ -2,11 +2,15 @@ package ingest
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rglonek/mensura/pkg/extract"
@@ -21,9 +25,10 @@ type RemoteOptions struct {
 	Port int
 	// CredentialPath is passed to the ssh client as its identity file.
 	CredentialPath string
-	// StrictHostKey keeps host-key verification on, which is the default.
-	StrictHostKey bool
-	Paths         []string
+	// InsecureHostKey turns off host-key verification. The zero value
+	// keeps it on, so forgetting to set anything is the safe choice.
+	InsecureHostKey bool
+	Paths           []string
 	// ProbeInterval is how often a stalled stream is re-checked, since
 	// remote rotation cannot be observed directly.
 	ProbeInterval time.Duration
@@ -50,16 +55,23 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 	if err != nil {
 		return err
 	}
+	cps.Log = i.cfg.Log
+	// Every path is waited for. Returning on the first error would leave
+	// the other tails running against a sink the caller is about to close.
+	tailCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errCh := make(chan error, len(opts.Paths))
 	for _, path := range opts.Paths {
-		go func(p string) { errCh <- i.followRemotePath(ctx, opts, cps, p) }(path)
+		go func(p string) { errCh <- i.followRemotePath(tailCtx, opts, cps, p) }(path)
 	}
+	var first error
 	for range opts.Paths {
-		if err := <-errCh; err != nil && ctx.Err() == nil {
-			return err
+		if err := <-errCh; err != nil && ctx.Err() == nil && first == nil {
+			first = err
+			cancel()
 		}
 	}
-	return nil
+	return first
 }
 
 func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *CheckpointStore, path string) error {
@@ -79,6 +91,20 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	}
 	i.cfg.Sink.DeclareFields(profile)
 
+	// The checkpoint advances only for bytes the store has accepted, the
+	// same rule the local follower uses. runRemoteTail publishes the byte
+	// offset each record ends at; the sink's flush callback promotes it.
+	var progress remoteProgress
+	progress.set(cp.AckedOffset)
+	i.cfg.Sink.OnFlush(func(int) {
+		acked := progress.commit()
+		cp.AckedOffset, cp.Offset = acked, acked
+		cp.UpdatedUnix = time.Now().Unix()
+		if err := cps.Save(cp); err != nil {
+			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+		}
+	})
+
 	for ctx.Err() == nil {
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
 			RefTime: time.Now(), From: i.cfg.From, To: i.cfg.To,
@@ -86,11 +112,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		n, err := i.runRemoteTail(ctx, opts, path, cp, ex, labels)
-		cp.AckedOffset += n
-		cp.Offset = cp.AckedOffset
-		cp.UpdatedUnix = time.Now().Unix()
-		_ = cps.Save(cp)
+		err = i.runRemoteTail(ctx, opts, path, cp, ex, labels, &progress)
 		for _, r := range ex.Flush() {
 			_ = i.cfg.Sink.Add(ctx, r, labels)
 		}
@@ -109,11 +131,52 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	return nil
 }
 
-// runRemoteTail streams one connection's worth of bytes and returns how
-// many it consumed, so the checkpoint can resume exactly there.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path string, cp *Checkpoint, ex *extract.Stream, labels map[string]string) (int64, error) {
+// remoteProgress carries a remote tail's byte position between the reader
+// goroutine and the sink's flush callback. pending is how far the reader
+// has handed bytes to the sink; acked is how far the store has confirmed
+// them, and is the only value a checkpoint may hold.
+type remoteProgress struct {
+	mu      sync.Mutex
+	pending int64
+	acked   int64
+}
+
+func (p *remoteProgress) set(n int64) {
+	p.mu.Lock()
+	p.pending, p.acked = n, n
+	p.mu.Unlock()
+}
+
+func (p *remoteProgress) advance(n int64) {
+	p.mu.Lock()
+	p.pending = n
+	p.mu.Unlock()
+}
+
+func (p *remoteProgress) commit() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.acked = p.pending
+	return p.acked
+}
+
+func (p *remoteProgress) ackedOffset() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.acked
+}
+
+// runRemoteTail streams one connection's worth of bytes, publishing the
+// byte offset each complete record ends at so the flush callback can turn
+// it into a checkpoint.
+//
+// Bytes are counted from the raw framing rather than from len(line)+1: a
+// CRLF stream or a file whose last line has no newline would otherwise
+// drift the offset permanently, and the drift compounds on every
+// reconnect.
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path string, cp *Checkpoint, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
 	args := []string{"-o", "BatchMode=yes"}
-	if opts.StrictHostKey {
+	if !opts.InsecureHostKey {
 		args = append(args, "-o", "StrictHostKeyChecking=yes")
 	}
 	if opts.Port > 0 {
@@ -126,43 +189,91 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path str
 	if opts.User != "" {
 		dest = opts.User + "@" + opts.Host
 	}
-	// tail -F follows the name across a rotation where the remote tail
-	// supports it; the byte offset is what makes a reconnect lossless.
-	remote := fmt.Sprintf("tail -c +%d -F %s 2>/dev/null || tail -c +%d -f %s",
-		cp.AckedOffset+1, shellQuote(path), cp.AckedOffset+1, shellQuote(path))
+	start := progress.ackedOffset()
+	// One tail invocation, not a shell "|| fallback": a fallback that
+	// fires after the first tail has already streamed bytes would replay
+	// them from the original offset. Support for -F is remembered
+	// per-target instead, so the retry starts from the same place.
+	flag := "-F"
+	if !i.remoteFollowsName(opts.Host, path) {
+		flag = "-f"
+	}
+	remote := fmt.Sprintf("tail -c +%d %s %s", start+1, flag, shellQuote(path))
 	args = append(args, dest, remote)
 
 	cmd := exec.CommandContext(ctx, opts.SSHBinary, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return 0, err
+		return err
 	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return 0, err
+		return err
 	}
-	var consumed int64
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		consumed += int64(len(line) + 1)
-		i.cfg.Progress.AddBytes(int64(len(line) + 1))
-		results, perr := ex.Process(line)
-		i.recordOutcome(perr)
-		for _, r := range results {
-			if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
-				return consumed, err
+	consumed := start
+	r := bufio.NewReaderSize(stdout, 64<<10)
+	var readErr error
+	for {
+		chunk, err := r.ReadBytes('\n')
+		if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
+			consumed += int64(len(chunk))
+			i.cfg.Progress.AddBytes(int64(len(chunk)))
+			line := strings.TrimSuffix(string(chunk[:len(chunk)-1]), "\r")
+			results, perr := ex.Process(line)
+			i.recordOutcome(perr)
+			for _, res := range results {
+				if aerr := i.cfg.Sink.Add(ctx, res, labels); aerr != nil {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					return aerr
+				}
 			}
+			// Only complete records advance the offset, so a connection
+			// that dies mid-line resumes at the start of that line.
+			progress.advance(consumed)
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				readErr = err
+			}
+			break
 		}
 	}
-	scanErr := sc.Err()
 	waitErr := cmd.Wait()
-	if scanErr != nil {
-		return consumed, scanErr
+	if readErr != nil {
+		return readErr
 	}
-	return consumed, waitErr
+	if waitErr != nil {
+		if flag == "-F" && consumed == start {
+			// The remote tail produced nothing and failed; it may not
+			// support -F. Remember that and use -f from now on.
+			i.markRemoteNoFollowName(opts.Host, path)
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("%w: %s", waitErr, msg)
+		}
+	}
+	return waitErr
+}
+
+// remoteFollowName tracks which targets accepted "tail -F".
+var (
+	remoteFollowNameMu sync.Mutex
+	remoteNoFollowName = map[string]struct{}{}
+)
+
+func (i *Ingest) remoteFollowsName(host, path string) bool {
+	remoteFollowNameMu.Lock()
+	defer remoteFollowNameMu.Unlock()
+	_, no := remoteNoFollowName[host+":"+path]
+	return !no
+}
+
+func (i *Ingest) markRemoteNoFollowName(host, path string) {
+	remoteFollowNameMu.Lock()
+	remoteNoFollowName[host+":"+path] = struct{}{}
+	remoteFollowNameMu.Unlock()
 }
 
 // shellQuote wraps a remote path so a space or a glob character cannot be

@@ -67,6 +67,12 @@ func ValidateLabelKey(s string) error {
 	if !validIdent(s, false) {
 		return fmt.Errorf("invalid label key %q: expected [A-Za-z_][A-Za-z0-9_.-]{0,127}", s)
 	}
+	// Labels and fields share one column namespace on a row, so a label
+	// named "timestamp" would overwrite the indexed column with a
+	// dictionary index and put the row at a time nothing can find.
+	if s == TimestampField {
+		return fmt.Errorf("label key %q is reserved for the indexed timestamp column", s)
+	}
 	return nil
 }
 

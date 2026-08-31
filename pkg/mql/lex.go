@@ -63,6 +63,11 @@ func lex(src string) ([]token, error) {
 		}
 		start := l.pos
 		c := l.src[l.pos]
+		// Identifier scanning decodes runes rather than walking bytes: a
+		// byte of a multi-byte rune converted with rune(byte) can look
+		// like a letter to unicode.IsLetter, which would split a UTF-8
+		// identifier in the middle and produce invalid text.
+		r, _ := utf8.DecodeRuneInString(l.src[l.pos:])
 		switch {
 		case c == '"':
 			s, err := l.lexQuoted('"')
@@ -83,9 +88,7 @@ func lex(src string) ([]token, error) {
 				l.pos++
 			}
 			ns := l.pos
-			for l.pos < len(l.src) && (isIdentRune(rune(l.src[l.pos])) || l.src[l.pos] == '.') {
-				l.pos++
-			}
+			l.scanIdent()
 			name := l.src[ns:l.pos]
 			if braced {
 				if l.pos >= len(l.src) || l.src[l.pos] != '}' {
@@ -99,10 +102,8 @@ func lex(src string) ([]token, error) {
 			l.toks = append(l.toks, token{tokVariable, name, start})
 		case c >= '0' && c <= '9', c == '-' && l.peekDigit(1), c == '+' && l.peekDigit(1):
 			l.lexNumber(start)
-		case isIdentStart(rune(c)):
-			for l.pos < len(l.src) && isIdentRune(rune(l.src[l.pos])) {
-				l.pos++
-			}
+		case isIdentStart(r):
+			l.scanIdent()
 			word := l.src[start:l.pos]
 			if keywords[strings.ToUpper(word)] {
 				l.toks = append(l.toks, token{tokKeyword, strings.ToUpper(word), start})
@@ -136,6 +137,20 @@ func lex(src string) ([]token, error) {
 	}
 }
 
+// scanIdent advances past a run of identifier runes.
+func (l *lexer) scanIdent() {
+	for l.pos < len(l.src) {
+		r, size := utf8.DecodeRuneInString(l.src[l.pos:])
+		if r == utf8.RuneError && size <= 1 {
+			return // invalid UTF-8 ends the identifier rather than joining it
+		}
+		if !isIdentRune(r) {
+			return
+		}
+		l.pos += size
+	}
+}
+
 func (l *lexer) peekDigit(off int) bool {
 	return l.pos+off < len(l.src) && l.src[l.pos+off] >= '0' && l.src[l.pos+off] <= '9'
 }
@@ -144,8 +159,22 @@ func (l *lexer) lexNumber(start int) {
 	if l.src[l.pos] == '-' || l.src[l.pos] == '+' {
 		l.pos++
 	}
-	for l.pos < len(l.src) && (l.src[l.pos] >= '0' && l.src[l.pos] <= '9' || l.src[l.pos] == '.') {
-		l.pos++
+	seenDot := false
+	for l.pos < len(l.src) {
+		c := l.src[l.pos]
+		if c >= '0' && c <= '9' {
+			l.pos++
+			continue
+		}
+		// One decimal point only: "1.2.3" is not a number, and letting it
+		// through would surface as a raw strconv error instead of a
+		// positioned parse error.
+		if c == '.' && !seenDot {
+			seenDot = true
+			l.pos++
+			continue
+		}
+		break
 	}
 	// A duration is a number immediately followed by a unit, with no space:
 	// 90s, not 1m30s.

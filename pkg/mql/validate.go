@@ -164,12 +164,32 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 		return nil
 	}
+	// An unsubstituted variable is a configuration error, not a value:
+	// comparing against the literal "$host" matches nothing, so the query
+	// would silently draw an empty panel. Say so instead.
+	unresolved := func(vals ...string) error {
+		for _, v := range vals {
+			if IsVariable(v) {
+				return Diag{"E010", fmt.Sprintf("variable %s was not substituted; the datasource must interpolate it before the query runs", v)}
+			}
+		}
+		return nil
+	}
 	switch {
 	case e.Eq != nil:
+		if err := unresolved(e.Eq.Value); err != nil {
+			return err
+		}
 		return check(e.Eq.Label)
 	case e.Ne != nil:
+		if err := unresolved(e.Ne.Value); err != nil {
+			return err
+		}
 		return check(e.Ne.Label)
 	case e.In != nil:
+		if err := unresolved(e.In.Values...); err != nil {
+			return err
+		}
 		return check(e.In.Label)
 	case e.Match != nil, e.NoMatch != nil:
 		m := e.Match
@@ -184,18 +204,36 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 	return nil
 }
 
+// IsVariable reports whether a predicate value is still an unsubstituted
+// "$name" reference rather than a literal.
+func IsVariable(v string) bool {
+	name, ok := strings.CutPrefix(v, "$")
+	if !ok || name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 && !isIdentStart(r) {
+			return false
+		}
+		if i > 0 && !isIdentRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // Variables lists the Grafana variable names a query references, so the
 // plugin can report dependencies without re-walking the AST.
 func Variables(q *Query) []string {
 	seen := map[string]bool{}
 	var out []string
-	var walk func(e Expr)
 	add := func(v string) {
-		if strings.HasPrefix(v, "$") && !seen[v[1:]] {
+		if IsVariable(v) && !seen[v[1:]] {
 			seen[v[1:]] = true
 			out = append(out, v[1:])
 		}
 	}
+	var walk func(e Expr)
 	walk = func(e Expr) {
 		for _, s := range e.And {
 			walk(s)

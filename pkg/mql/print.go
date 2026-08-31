@@ -2,6 +2,7 @@ package mql
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -164,15 +165,34 @@ func wrap(s string, nested bool) string {
 }
 
 // printValue keeps a variable reference bare and quotes everything else, so
-// a round trip does not turn $host into a literal.
+// a round trip does not turn $host into a literal. A bare "$" followed by
+// anything that is not a variable name is a literal and is quoted, so the
+// two cases stay distinguishable in both directions.
 func printValue(v string) string {
-	if strings.HasPrefix(v, "$") {
+	if IsVariable(v) {
 		return v
 	}
 	return strconv.Quote(v)
 }
 
-func printFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
+// printFloat emits a form the lexer can read back. 'g' would produce
+// "1e+06" for a million, which the number lexer cannot parse, so printing
+// a query with a large or small CLAMP bound would break the round trip
+// that the AST and the text are supposed to have.
+func printFloat(f float64) string {
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		// Neither is expressible in the grammar; the nearest finite bound
+		// is the honest rendering.
+		if math.IsNaN(f) {
+			return "0"
+		}
+		if f > 0 {
+			return strconv.FormatFloat(math.MaxFloat64, 'f', -1, 64)
+		}
+		return strconv.FormatFloat(-math.MaxFloat64, 'f', -1, 64)
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
 
 // printDuration picks the largest unit that divides the value exactly, so
 // 30000 prints as 30s rather than 30000ms.
@@ -212,4 +232,10 @@ func quoteIdent(s string) string {
 	return s
 }
 
-func escapeRegex(re string) string { return strings.ReplaceAll(re, "/", `\/`) }
+// escapeRegex prepares a regex for /.../ delimiters. Backslashes are
+// escaped first: the lexer collapses "\\" to "\", so escaping only the
+// delimiter would let a regex lose a backslash on every round trip.
+func escapeRegex(re string) string {
+	re = strings.ReplaceAll(re, `\`, `\\`)
+	return strings.ReplaceAll(re, "/", `\/`)
+}

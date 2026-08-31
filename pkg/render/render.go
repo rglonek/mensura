@@ -161,7 +161,14 @@ func Series(points []Point, spec Spec, window int64) []Output {
 
 		// 7) Rate normalisation, on the raw inter-sample interval, so the
 		//    reported rate does not depend on where a window boundary fell.
-		if spec.PerSecond && prevPointTime >= 0 {
+		//    The first accepted sample has no interval to divide by, so
+		//    there is no rate to report: it is dropped rather than emitted
+		//    at the un-normalised scale, which would draw as a spike.
+		//    (With DELTA the first sample is already consumed above.)
+		if spec.PerSecond {
+			if prevPointTime < 0 {
+				continue
+			}
 			if tr := float64(lastPointTime-prevPointTime) / 1000; tr > 0 {
 				val /= tr
 			}
@@ -238,6 +245,11 @@ func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
 			after = n
 		case n > lo && n < hi:
 			mid = n
+		default:
+			// The break coincides with an extremum's own timestamp.
+			// Emitting both would put two points at one instant and
+			// break the strictly-increasing-time guarantee (C1), so the
+			// real sample wins and the break is dropped.
 		}
 	}
 
@@ -264,7 +276,7 @@ func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
 	if after > -1 {
 		dps = append(dps, Output{TSMs: after, Null: true})
 	}
-	return padAgainstNulls(dps, wMin, sse)
+	return padAgainstNulls(dps, sse)
 }
 
 // padAgainstNulls splices singular-series padding beside any real point
@@ -277,19 +289,22 @@ func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
 // strictly-increasing-time guarantee (C1) that the same paper asserts.
 // Clamping keeps both properties: the padding is as wide as it can be
 // without reordering anything.
-func padAgainstNulls(dps []Output, ref Point, sse SSE) []Output {
+func padAgainstNulls(dps []Output, sse SSE) []Output {
 	if sse.Mode == SSEOff || len(dps) == 0 {
 		return dps
-	}
-	value := sse.Value
-	if sse.Mode == SSERepeat {
-		value = ref.Value
 	}
 	out := make([]Output, 0, len(dps)+4)
 	for i, p := range dps {
 		if p.Null {
 			out = append(out, p)
 			continue
+		}
+		// SSE REPEAT repeats the value of the point being padded, not one
+		// fixed value for the window: padding the maximum with the
+		// minimum's value would draw a step that never happened.
+		value := sse.Value
+		if sse.Mode == SSERepeat {
+			value = p.Value
 		}
 		leftIsNull := i > 0 && dps[i-1].Null
 		rightIsNull := i+1 < len(dps) && dps[i+1].Null

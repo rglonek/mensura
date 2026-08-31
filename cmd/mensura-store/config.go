@@ -91,7 +91,38 @@ func loadConfig(path string) (*fileConfig, error) {
 	// Refuse it and say which key, rather than silently accepting it.
 	for _, c := range cfg.Auth.Clients {
 		if c.Secret != "" {
-			return nil, fmt.Errorf("config %s: client %q has an inline secret; set `hash` (see `mensura-store hash-secret`) or supply it via the environment", path, c.Name)
+			return nil, fmt.Errorf("config %s: client %q has an inline secret; hash it with `mensura-store hash-secret` and set `hash` instead", path, c.Name)
+		}
+		if c.Hash == "" {
+			return nil, fmt.Errorf("config %s: client %q has no hash", path, c.Name)
+		}
+		if len(c.Scopes) == 0 {
+			return nil, fmt.Errorf("config %s: client %q has no scopes; it could not do anything", path, c.Name)
+		}
+		for _, sc := range c.Scopes {
+			switch store.Scope(sc) {
+			case store.ScopeWrite, store.ScopeQuery, store.ScopeAdmin:
+			default:
+				return nil, fmt.Errorf("config %s: client %q has unknown scope %q (write, query or admin)", path, c.Name, sc)
+			}
+		}
+	}
+	switch cfg.Auth.Mode {
+	case "", "none", "bearer":
+	default:
+		return nil, fmt.Errorf("config %s: auth.mode %q is not supported (none or bearer)", path, cfg.Auth.Mode)
+	}
+	// mTLS is not implemented. Accepting the key and ignoring it would
+	// leave an operator believing client certificates are being verified.
+	for name, l := range map[string]listenSpec{
+		"write": cfg.Listen.Write, "query": cfg.Listen.Query,
+		"debug": cfg.Listen.Debug, "metrics": cfg.Listen.Metrics,
+	} {
+		if l.TLS.ClientCA != "" {
+			return nil, fmt.Errorf("config %s: listen.%s.tls.client_ca is set, but client-certificate verification is not implemented; remove it rather than rely on it", path, name)
+		}
+		if (l.TLS.Cert == "") != (l.TLS.Key == "") {
+			return nil, fmt.Errorf("config %s: listen.%s.tls needs both cert and key", path, name)
 		}
 	}
 	return cfg, nil

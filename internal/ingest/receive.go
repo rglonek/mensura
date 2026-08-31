@@ -36,8 +36,15 @@ type ReceiveOptions struct {
 	// dropped and counted, never blocked: blocking a UDP reader only moves
 	// the loss into the kernel where nobody can see it.
 	UDPQueue int
-	// AllowedSources optionally restricts UDP senders.
+	// AllowedSources optionally restricts senders, on every listener, not
+	// only UDP. Empty means "accept anyone the listener can reach".
 	AllowedSources []string
+	// MaxPeers bounds how many distinct senders keep extraction state.
+	// Each peer holds a stream with its own multiline and aggregation
+	// buffers, so an unbounded peer set is an unbounded memory leak.
+	MaxPeers int
+	// PeerIdle is how long a peer's state is kept after its last record.
+	PeerIdle time.Duration
 }
 
 // Receive binds the configured listeners and serves until the context is
@@ -52,7 +59,17 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	if opts.Mode == "" {
 		opts.Mode = "logs"
 	}
-	r := &receiver{ing: i, opts: opts, streams: map[string]*extract.Stream{}}
+	if opts.MaxPeers <= 0 {
+		opts.MaxPeers = 4096
+	}
+	if opts.PeerIdle <= 0 {
+		opts.PeerIdle = 30 * time.Minute
+	}
+	r := &receiver{ing: i, opts: opts, streams: map[string]*peerStream{}}
+	r.allowed = map[string]struct{}{}
+	for _, a := range opts.AllowedSources {
+		r.allowed[a] = struct{}{}
+	}
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 3)
@@ -80,40 +97,75 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	return first
 }
 
+// peerStream is one sender's extraction state. extract.Stream is not safe
+// for concurrent use, so the mutex is what lets two connections from the
+// same address share one stream rather than corrupt it.
+type peerStream struct {
+	mu   sync.Mutex
+	ex   *extract.Stream
+	seen time.Time
+}
+
 type receiver struct {
 	ing  *Ingest
 	opts ReceiveOptions
 
 	mu      sync.Mutex
-	streams map[string]*extract.Stream
+	streams map[string]*peerStream
+	allowed map[string]struct{}
 }
 
-// stream returns the extraction stream for one peer, creating it on first
+// permitted reports whether a sender is allowed on this listener.
+func (r *receiver) permitted(peer string) bool {
+	if len(r.allowed) == 0 {
+		return true
+	}
+	_, ok := r.allowed[peer]
+	return ok
+}
+
+// stream returns the extraction state for one peer, creating it on first
 // contact. One stream per peer keeps multiline and aggregation state from
 // bleeding between senders.
-func (r *receiver) stream(peer string) (*extract.Stream, map[string]string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *receiver) stream(peer string) (*peerStream, map[string]string, error) {
 	labels := map[string]string{"host": peer, "source": r.opts.Listener}
 	for k, v := range r.ing.cfg.Labels {
 		labels[k] = v
 	}
-	if s, ok := r.streams[peer]; ok {
-		return s, labels, nil
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ps, ok := r.streams[peer]; ok {
+		ps.seen = now
+		return ps, labels, nil
+	}
+	r.evictLocked(now)
+	if len(r.streams) >= r.opts.MaxPeers {
+		return nil, labels, fmt.Errorf("too many active senders (%d); %s is not being tracked", r.opts.MaxPeers, peer)
 	}
 	profile := r.ing.cfg.Spec.SelectProfile("", nil, labels, r.opts.Listener)
 	if profile == nil {
 		return nil, labels, fmt.Errorf("no profile matched listener %q", r.opts.Listener)
 	}
-	s, err := r.ing.cfg.Spec.NewStream(profile, extract.StreamOptions{
-		RefTime: time.Now(), From: r.ing.cfg.From, To: r.ing.cfg.To,
+	ex, err := r.ing.cfg.Spec.NewStream(profile, extract.StreamOptions{
+		RefTime: now, From: r.ing.cfg.From, To: r.ing.cfg.To,
 	})
 	if err != nil {
 		return nil, labels, err
 	}
 	r.ing.cfg.Sink.DeclareFields(profile)
-	r.streams[peer] = s
-	return s, labels, nil
+	ps := &peerStream{ex: ex, seen: now}
+	r.streams[peer] = ps
+	return ps, labels, nil
+}
+
+// evictLocked drops peers that have been silent for longer than PeerIdle.
+func (r *receiver) evictLocked(now time.Time) {
+	for peer, ps := range r.streams {
+		if now.Sub(ps.seen) > r.opts.PeerIdle {
+			delete(r.streams, peer)
+		}
+	}
 }
 
 func (r *receiver) serveTCP(ctx context.Context) error {
@@ -141,6 +193,11 @@ func (r *receiver) serveTCP(ctx context.Context) error {
 func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	peer := hostOf(conn.RemoteAddr().String())
+	_ = conn.SetReadDeadline(time.Now().Add(connIdleTimeout))
+	if !r.permitted(peer) {
+		r.ing.cfg.Log.Printf("WARNING refused tcp connection from %s: not in allowed_sources", peer)
+		return
+	}
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -150,8 +207,15 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 		if err := r.handleRecord(ctx, peer, sc.Text()); err != nil {
 			r.ing.cfg.Log.Printf("WARNING %s: %v", peer, err)
 		}
+		// An idle connection is closed rather than held forever: a
+		// listener that accumulates them runs out of descriptors.
+		_ = conn.SetReadDeadline(time.Now().Add(connIdleTimeout))
 	}
 }
+
+// connIdleTimeout is how long a TCP sender may go silent before its
+// connection is closed. A live log stream is nowhere near this quiet.
+const connIdleTimeout = 15 * time.Minute
 
 func (r *receiver) serveUDP(ctx context.Context) error {
 	addr, err := net.ResolveUDPAddr("udp", r.opts.UDPAddr)
@@ -179,10 +243,6 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 		}
 	}()
 	buf := make([]byte, r.opts.MaxDatagramBytes)
-	allowed := map[string]struct{}{}
-	for _, a := range r.opts.AllowedSources {
-		allowed[a] = struct{}{}
-	}
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -193,10 +253,8 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 			return err
 		}
 		peer := src.IP.String()
-		if len(allowed) > 0 {
-			if _, ok := allowed[peer]; !ok {
-				continue
-			}
+		if !r.permitted(peer) {
+			continue
 		}
 		text := strings.TrimRight(string(buf[:n]), "\r\n")
 		select {
@@ -239,11 +297,19 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body.Set == "" {
-			http.Error(w, "set is required", http.StatusBadRequest)
+		if err := model.ValidateSetName(body.Set); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if model.IsReserved(body.Set) {
+			http.Error(w, fmt.Sprintf("set %q uses the reserved prefix", body.Set), http.StatusBadRequest)
 			return
 		}
 		peer := hostOf(req.RemoteAddr)
+		if !r.permitted(peer) {
+			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
+			return
+		}
 		for i := range body.Samples {
 			s := body.Samples[i]
 			if s.Labels == nil {
@@ -266,8 +332,22 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 		}
 		writeJSONOK(w, map[string]int{"accepted": len(body.Samples)})
 	})
-	srv := &http.Server{Addr: r.opts.HTTPAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() { <-ctx.Done(); _ = srv.Close() }()
+	srv := &http.Server{
+		Addr:              r.opts.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+	go func() {
+		<-ctx.Done()
+		// Shutdown, not Close: an in-flight batch should reach the sink
+		// rather than be cut off mid-request.
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
 	r.ing.cfg.Log.Printf("receiving on http %s", r.opts.HTTPAddr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
@@ -281,6 +361,9 @@ func writeJSONOK(w http.ResponseWriter, v any) {
 }
 
 func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
+	if !r.permitted(peer) {
+		return fmt.Errorf("sender %s is not in allowed_sources", peer)
+	}
 	r.ing.cfg.Progress.AddBytes(int64(len(text) + 1))
 	if r.opts.Mode == "metrics" {
 		set, sample, err := ParseLineProtocol(text, time.Now())
@@ -298,11 +381,15 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 		}
 		return r.ing.cfg.Sink.AddSample(ctx, set, sample)
 	}
-	stream, labels, err := r.stream(peer)
+	ps, labels, err := r.stream(peer)
 	if err != nil {
 		return err
 	}
-	results, perr := stream.Process(text)
+	// extract.Stream is single-threaded state; two connections from one
+	// address must not be inside Process at the same time.
+	ps.mu.Lock()
+	results, perr := ps.ex.Process(text)
+	ps.mu.Unlock()
 	r.ing.recordOutcome(perr)
 	for _, res := range results {
 		if err := r.ing.cfg.Sink.Add(ctx, res, labels); err != nil {

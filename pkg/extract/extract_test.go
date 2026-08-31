@@ -188,7 +188,7 @@ func TestHistogramExpansion(t *testing.T) {
 		}
 	}
 	bs := st.Profile().buckets["h4"]
-	if got := bs.Edges2(); got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 4 {
+	if got := bs.EdgeValues(); got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 4 {
 		t.Fatalf("pow2 edges: %+v", got)
 	}
 }

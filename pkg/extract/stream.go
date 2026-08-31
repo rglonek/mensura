@@ -41,6 +41,9 @@ type Stream struct {
 	assumeYear int
 	tsIdx      int
 	lastTS     time.Time
+	// lastWall is when lastTS was observed, so a quiet stream can tell
+	// how far record time must have advanced since.
+	lastWall time.Time
 
 	from, to time.Time
 
@@ -132,7 +135,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 		st.Stats.TSParseErrors++
 		return nil, err
 	}
-	st.lastTS = ts
+	st.lastTS, st.lastWall = ts, time.Now()
 	if !st.from.IsZero() && ts.Before(st.from) {
 		return nil, nil
 	}
@@ -196,6 +199,10 @@ func (st *Stream) Flush() []Result {
 
 // FlushIdle emits anything that has been waiting longer than the profile's
 // idle timeout, measured against wall clock rather than record time.
+//
+// Aggregation windows are closed here too, not only when a fresh matching
+// record arrives: a stream that goes quiet would otherwise hold its last
+// half-filled window until shutdown.
 func (st *Stream) FlushIdle(now time.Time) []Result {
 	var out []Result
 	for _, m := range st.profile.Framing.Multiline {
@@ -208,8 +215,26 @@ func (st *Stream) FlushIdle(now time.Time) []Result {
 			out = append(out, r...)
 		}
 	}
+	out = append(out, st.closeExpiredAggregators(st.aggregationHorizon(now))...)
 	st.Stats.Samples += int64(len(out))
 	return out
+}
+
+// aggregationHorizon converts wall-clock idleness into the record-time
+// clock the aggregators are keyed on. A window may be closed once real
+// time has moved past the end of the window that the last record opened,
+// which is the only way a quiet stream can make progress.
+func (st *Stream) aggregationHorizon(now time.Time) time.Time {
+	if st.lastTS.IsZero() {
+		return time.Time{}
+	}
+	// lastWall is when the last record was seen; anything older than that
+	// by more than the window width has certainly ended.
+	elapsed := now.Sub(st.lastWall)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return st.lastTS.Add(elapsed)
 }
 
 func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
@@ -276,6 +301,12 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 	}
 
 	if pat.BucketSet != "" {
+		if histRaw == "" {
+			// Writing a full row of zero counts because no "buckets"
+			// group matched would invent data that the source never
+			// carried.
+			return nil, fmt.Errorf("extract: pattern for set %q declares bucket set %q but captured no buckets group", set, pat.BucketSet)
+		}
 		bs := p.buckets[pat.BucketSet]
 		if err := bs.expand(histRaw, fields); err != nil {
 			return nil, err
@@ -336,8 +367,11 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	}
 	a, ok := st.aggs[key]
 	if !ok {
+		// The maps are copied: the caller hands the same ones to the sink,
+		// which labels them further, and the window must not see that.
 		a = &aggregator{
-			start: ts, end: ts.Add(ag.every), labels: labels, fields: fields,
+			start: ts, end: ts.Add(ag.every),
+			labels: copyLabels(labels), fields: copyFields(fields),
 			set: set, line: line, field: ag.Field, mode: ag.Mode,
 		}
 		st.aggs[key] = a
@@ -365,6 +399,9 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 }
 
 func (st *Stream) closeExpiredAggregators(now time.Time) []Result {
+	if now.IsZero() {
+		return nil
+	}
 	var out []Result
 	var expired []string
 	for k, a := range st.aggs {
@@ -391,4 +428,20 @@ func (a *aggregator) emit() Result {
 		fields[a.field] = model.Float(a.value)
 	}
 	return Result{Set: a.set, TSMs: a.start.UnixMilli(), Labels: a.labels, Fields: fields, Line: a.line}
+}
+
+func copyLabels(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyFields(in map[string]model.Value) map[string]model.Value {
+	out := make(map[string]model.Value, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
