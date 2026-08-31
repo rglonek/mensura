@@ -276,6 +276,9 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 	// the cap is a spec or source problem worth reporting, but it is not a
 	// reason to stop importing the rest of the file.
 	br := bufio.NewReaderSize(rc, 64<<10)
+	// The byte offset each record starts at is the second half of its key
+	// hint, so a set keyed by `offset` keeps every occurrence distinct.
+	var consumed int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -283,6 +286,8 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		default:
 		}
 		rec, rerr := readRecord(br, i.cfg.ReadBufferBytes)
+		recStart := consumed
+		consumed += int64(rec.Consumed)
 		if len(rec.Line) > 0 || rec.Terminated {
 			if rec.Oversize {
 				i.cfg.Progress.OversizeRecord()
@@ -290,8 +295,8 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			i.cfg.Progress.AddBytes(int64(rec.Consumed))
 			results, err := stream.Process(string(rec.Line))
 			i.recordOutcome(err)
-			for _, r := range results {
-				if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
+			for n, r := range results {
+				if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(path, offsetPos(recStart), n)); err != nil {
 					return err
 				}
 			}
@@ -303,8 +308,8 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			return rerr
 		}
 	}
-	for _, r := range stream.Flush() {
-		if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
+	for n, r := range stream.Flush() {
+		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(path, flushPos(0), n)); err != nil {
 			return err
 		}
 	}

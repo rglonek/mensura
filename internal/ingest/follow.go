@@ -108,7 +108,6 @@ type tailer struct {
 	path        string
 	stream      string
 	file        *os.File
-	info        os.FileInfo
 	fingerprint string
 	// fingerprintAt is how many bytes fingerprint covers. It is the
 	// number of bytes already consumed, capped, so the hash is stable
@@ -118,6 +117,9 @@ type tailer struct {
 	labels        map[string]string
 	ex            *extract.Stream
 	cp            *Checkpoint
+	// flushSeq numbers the flushes of buffered extractor state, which
+	// have no byte offset of their own to key on.
+	flushSeq int
 
 	mu       sync.Mutex
 	pending  int64
@@ -170,14 +172,28 @@ func (t *tailer) commitInflight(now int64) (Checkpoint, bool) {
 
 // markHoled freezes the resume offset after a dropped batch, and reports
 // whether this was the first time.
+//
+// A tailer that had nothing in flight cannot have contributed to the lost
+// batch, so it is left alone. Freezing every live tailer stopped
+// checkpointing for the whole process -- permanently, since holed is
+// never cleared -- because one file produced one bad record.
 func (t *tailer) markHoled() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.holed {
+	if t.holed || t.inflight <= t.acked {
 		return false
 	}
 	t.holed = true
 	return true
+}
+
+// checkpointSnapshot copies the checkpoint under the lock. The flush
+// goroutine writes these same fields in commitInflight and
+// setFingerprint, so copying the struct without the lock is a race.
+func (t *tailer) checkpointSnapshot() Checkpoint {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return *t.cp
 }
 
 // setFingerprint records a new content fingerprint, and the width it
@@ -315,7 +331,7 @@ func (f *follower) ensure(path string) (*tailer, error) {
 	f.ing.cfg.Sink.DeclareFields(profile)
 
 	t = &tailer{
-		path: path, stream: stream, file: fh, info: info,
+		path: path, stream: stream, file: fh,
 		labels: f.ing.streamLabels(path, full[:hn]), ex: ex, cp: cp,
 	}
 	t.reset(start)
@@ -351,32 +367,38 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 	r := bufio.NewReaderSize(t.file, 64<<10)
 	for {
 		rec, err := readRecord(r, max)
+		oversizeUnterminated := false
 		if !rec.Terminated {
-			if rec.Consumed > max {
-				// No newline within the cap. Consuming it is the only way
-				// out: holding it back for a terminator that is not
-				// coming would re-buffer the same bytes on every poll,
-				// which for a large newline-free file means reading it
-				// into memory again and again.
-				t.offset += int64(rec.Consumed)
-				f.ing.cfg.Progress.OversizeRecord()
-				t.setPending(t.offset)
-				continue
+			if rec.Consumed <= max {
+				// Incomplete: leave the offset where it was and stop.
+				return f.atEOF(t)
 			}
-			// Incomplete: leave the offset where it was and stop.
-			return f.atEOF(t)
+			// No newline within the cap. Consuming it is the only way
+			// out: holding it back for a terminator that is not
+			// coming would re-buffer the same bytes on every poll,
+			// which for a large newline-free file means reading it
+			// into memory again and again. The truncated prefix is
+			// still extracted, which is what batch import does with
+			// the same record; discarding it here meant the same file
+			// produced different data depending on how it was read.
+			oversizeUnterminated = true
 		}
+		recStart := t.offset
 		t.offset += int64(rec.Consumed)
-		if rec.Oversize {
+		if rec.Oversize || oversizeUnterminated {
 			f.ing.cfg.Progress.OversizeRecord()
 		}
 		f.ing.cfg.Progress.AddBytes(int64(rec.Consumed))
 		results, perr := t.ex.Process(string(rec.Line))
 		f.ing.recordOutcome(perr)
-		for _, res := range results {
-			if err := f.ing.cfg.Sink.Add(ctx, res, t.labels); err != nil {
+		for n, res := range results {
+			if err := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); err != nil {
 				return err
 			}
+		}
+		if oversizeUnterminated {
+			t.setPending(t.offset)
+			continue
 		}
 		// pending is only advanced once every sample from these bytes
 		// has been handed to the sink, so a commit can never
@@ -426,6 +448,10 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 		// were reading are gone. Content is what decides, because a
 		// truncate followed by fresh appends restores the size.
 		f.ing.cfg.Log.Printf("INFO %s was truncated or rewritten; re-reading from the start", t.path)
+		// Drain the extractor first. Carrying a half-built multiline
+		// record across the boundary concatenated the old file's tail
+		// onto the new file's first lines.
+		f.drainExtractor(ctx, t)
 		t.reset(0)
 		t.setFingerprint("", 0)
 		return nil
@@ -461,10 +487,22 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 	return nil
 }
 
-func (f *follower) retire(ctx context.Context, t *tailer) {
-	for _, r := range t.ex.Flush() {
-		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels)
+// drainExtractor flushes whatever the extractor still holds -- an open
+// multiline record, a half-filled aggregation window -- into the sink.
+func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
+	results := t.ex.Flush()
+	if len(results) == 0 {
+		return
 	}
+	t.flushSeq++
+	pos := flushPos(t.flushSeq)
+	for n, r := range results {
+		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
+	}
+}
+
+func (f *follower) retire(ctx context.Context, t *tailer) {
+	f.drainExtractor(ctx, t)
 	_ = t.file.Close()
 	// Clearing the handle is what makes the retired tailer inert. poll
 	// calls read() again right after checkRotation returns, and a closed
@@ -479,7 +517,7 @@ func (f *follower) retire(ctx context.Context, t *tailer) {
 	// rewritten by the next successful flush; it is not forced here,
 	// because nothing has been delivered yet.
 	t.reset(0)
-	cp := *t.cp
+	cp := t.checkpointSnapshot()
 	cp.Offset, cp.AckedOffset, cp.UpdatedUnix = 0, 0, time.Now().Unix()
 	if err := f.cps.Save(&cp); err != nil {
 		f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
@@ -550,17 +588,21 @@ func (f *follower) flushIdle(ctx context.Context) {
 	tailers := f.snapshotTailers()
 	now := time.Now()
 	for _, t := range tailers {
-		for _, r := range t.ex.FlushIdle(now) {
-			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels)
+		results := t.ex.FlushIdle(now)
+		if len(results) == 0 {
+			continue
+		}
+		t.flushSeq++
+		pos := flushPos(t.flushSeq)
+		for n, r := range results {
+			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
 		}
 	}
 }
 
 func (f *follower) closeAll(ctx context.Context) {
 	for _, t := range f.snapshotTailers() {
-		for _, r := range t.ex.Flush() {
-			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels)
-		}
+		f.drainExtractor(ctx, t)
 		if t.file != nil {
 			_ = t.file.Close()
 			t.file = nil

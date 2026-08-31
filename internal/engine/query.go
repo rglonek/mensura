@@ -21,7 +21,6 @@ type QueryBuilder struct {
 	hasBet  bool
 	where   Expr
 	project []string
-	limit   int
 	reverse bool
 	err     error
 }
@@ -43,7 +42,6 @@ func (q *QueryBuilder) Project(c ...string) *QueryBuilder {
 	q.project = append(q.project, c...)
 	return q
 }
-func (q *QueryBuilder) Limit(n int) *QueryBuilder { q.limit = n; return q }
 
 // Reverse walks the range newest-first. A logs view wants the most recent
 // records, and reading forward to a limit hands back the oldest ones
@@ -63,8 +61,6 @@ type Iter struct {
 	proj        map[string]struct{}
 	indexed     bool
 	reverse     bool
-	limit       int
-	returned    int
 	key         [16]byte
 	row         Row
 	err         error
@@ -137,8 +133,7 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 	d.stats.OpenIterators.Add(1)
 	return &Iter{
 		db: d, snap: snap, it: it, ctx: ctx,
-		where: q.where, proj: proj, indexed: indexed, limit: q.limit,
-		reverse: q.reverse,
+		where: q.where, proj: proj, indexed: indexed, reverse: q.reverse,
 	}, nil
 }
 
@@ -153,9 +148,6 @@ func (i *Iter) Next() bool {
 		return false
 	}
 	for {
-		if i.limit > 0 && i.returned >= i.limit {
-			return false
-		}
 		if i.ctx != nil {
 			select {
 			case <-i.ctx.Done():
@@ -214,7 +206,6 @@ func (i *Iter) Next() bool {
 			return false
 		}
 		i.row = row
-		i.returned++
 		return true
 	}
 }

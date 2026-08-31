@@ -141,8 +141,14 @@ func loopbackOnly(h http.Handler, logger *log.Logger) http.Handler {
 
 // MetricsHandler serves Prometheus text exposition on its own listener, so
 // a store that is refusing writes is still observable.
+//
+// It carries the same query-scope authorisation as the rest of the API.
+// It used to carry none at all, so a bearer-mode store still published its
+// set names, sizes and write rates to anyone who could reach the metrics
+// port -- and the startup posture check only forces that port onto
+// loopback when authentication is switched off entirely.
 func (a *API) MetricsHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return a.wrap(ScopeQuery, func(w http.ResponseWriter, r *http.Request, _ string) {
 		st := a.store.Stats()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "# HELP mensura_store_writes_total Write requests accepted.\n")
@@ -306,13 +312,16 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleCatalogue(w http.ResponseWriter, r *http.Request, _ string) {
-	cat := a.store.Catalogue()
-	etag := fmt.Sprintf(`"v%d"`, cat.Version)
+	// The version is read before the body is rendered: rendering it walks
+	// every shard, so answering 304 after building it saved the bandwidth
+	// and none of the work.
+	etag := fmt.Sprintf(`"v%d"`, a.store.CatalogueVersion())
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	w.Header().Set("ETag", etag)
+	cat := a.store.Catalogue()
+	w.Header().Set("ETag", fmt.Sprintf(`"v%d"`, cat.Version))
 	writeJSON(w, http.StatusOK, cat)
 }
 

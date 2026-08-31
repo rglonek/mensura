@@ -72,7 +72,6 @@ type QueryRequest struct {
 	ToMs       int64        `json:"to_ms"`
 	MaxPoints  int          `json:"max_points"`
 	IntervalMs int64        `json:"interval_ms"`
-	Format     mql.Format   `json:"format,omitempty"`
 	Options    QueryOptions `json:"options,omitempty"`
 }
 

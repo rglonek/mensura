@@ -162,8 +162,14 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			continue
 		}
 		if ts.Before(buf.ts) {
+			// The buffered record is emitted, not thrown away. Deleting
+			// it lost a whole record every time a continuation line
+			// carried an earlier timestamp -- which interleaved writers
+			// produce routinely -- and reported the loss only as a
+			// counter.
 			delete(st.multiline, m.StartContains)
-			return nil, fmt.Errorf("extract: multiline record timestamps moved backwards")
+			out, _ := st.process(buf.line, buf.ts)
+			return out, fmt.Errorf("extract: multiline record timestamps moved backwards")
 		}
 		for i := range m.Join {
 			j := &m.Join[i]

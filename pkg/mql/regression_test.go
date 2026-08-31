@@ -71,3 +71,41 @@ func TestMalformedNumberIsAPositionedParseError(t *testing.T) {
 		t.Fatalf("want *ParseError, got %T: %v", err, err)
 	}
 }
+
+// The executor switches on Format with a timeseries default and the
+// render layer falls back to the constant SSE mode, so an unrecognised
+// value used to draw a plausible panel of the wrong shape instead of
+// being refused.
+func TestValidateRefusesUnrunnableModifiers(t *testing.T) {
+	sc := testSchema{}
+	neg := int64(-1000)
+	badMode := &SSE{Mode: "nope"}
+	lo, hi := 10.0, 1.0
+	for _, tc := range []struct {
+		name string
+		q    *Query
+	}{
+		{"unknown format", &Query{From: "http", Format: "pie", Select: []FieldExpr{{Field: "inflight"}}}},
+		{"negative every", &Query{From: "http", Select: []FieldExpr{{Field: "inflight"}}, EveryMs: &neg}},
+		{"negative gap", &Query{From: "http", Select: []FieldExpr{{Field: "inflight", Modifiers: Modifiers{GapMs: &neg}}}}},
+		{"unknown sse mode", &Query{From: "http", Select: []FieldExpr{{Field: "inflight", Modifiers: Modifiers{SSE: badMode}}}}},
+		{"inverted clamp", &Query{From: "http", Select: []FieldExpr{{Field: "inflight", Modifiers: Modifiers{Clamp: &Clamp{Min: &lo, Max: &hi}}}}}},
+		{"unknown clamp else", &Query{From: "http", Select: []FieldExpr{{Field: "inflight", Modifiers: Modifiers{Clamp: &Clamp{Min: &hi, Else: "shrug"}}}}}},
+	} {
+		if _, err := Validate(tc.q, sc, 0, 0); err == nil {
+			t.Errorf("%s: accepted, want a diagnostic", tc.name)
+		}
+	}
+}
+
+// Print emits what the lexer reads back. A negative duration out of an
+// unvalidated AST used to print as "-30s" and then fail to parse.
+func TestNegativeDurationRoundTrips(t *testing.T) {
+	ms, err := ParseDuration("-30s")
+	if err != nil {
+		t.Fatalf("ParseDuration: %v", err)
+	}
+	if ms != -30000 {
+		t.Fatalf("got %d ms, want -30000", ms)
+	}
+}

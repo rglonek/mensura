@@ -29,9 +29,16 @@ type RemoteOptions struct {
 	// keeps it on, so forgetting to set anything is the safe choice.
 	InsecureHostKey bool
 	Paths           []string
-	// ProbeInterval is how often a stalled stream is re-checked, since
-	// remote rotation cannot be observed directly.
+	// StartAt is "checkpoint" (default), "beginning" or "end", the same
+	// three choices the local follower offers.
+	StartAt string
+	// ProbeInterval is how often the remote file's size is re-checked.
+	// Rotation cannot be observed directly over a tail, so it is inferred
+	// from the file becoming shorter than the bytes already read.
 	ProbeInterval time.Duration
+	// MaxRecordBytes bounds one record, so a newline-free remote file
+	// cannot be read into memory in one piece.
+	MaxRecordBytes int
 	// ReconnectBackoff bounds the wait between reconnect attempts.
 	ReconnectBackoff time.Duration
 	// SSHBinary overrides the client binary, for tests.
@@ -50,6 +57,9 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 	}
 	if opts.SSHBinary == "" {
 		opts.SSHBinary = "ssh"
+	}
+	if opts.MaxRecordBytes <= 0 {
+		opts.MaxRecordBytes = defaultMaxRecordBytes
 	}
 	cps, err := NewCheckpointStore(i.cfg.StateDir)
 	if err != nil {
@@ -118,16 +128,50 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	progress := obs.progress
 	i.cfg.Sink.Observe(obs)
 
+	resetTo := func(off int64) {
+		progress.set(off)
+		cp.Offset, cp.AckedOffset, cp.UpdatedUnix = off, off, time.Now().Unix()
+		if err := cps.Save(cp); err != nil {
+			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+		}
+	}
+	// StartAt used to be accepted on the command line and then ignored on
+	// this path, so `--start-at end` against a remote host replayed the
+	// whole history instead of starting at the tail.
+	first := true
+	flushSeq := 0
 	for ctx.Err() == nil {
+		// The size is the only rotation signal this path has. A file
+		// shorter than what has already been read was truncated,
+		// copytruncated or replaced, and resuming at the stored byte
+		// offset would seek past the whole of the new one.
+		if size, serr := i.remoteSize(ctx, opts, path); serr != nil {
+			i.cfg.Log.Printf("WARNING cannot size %s: %v", target, serr)
+		} else {
+			switch {
+			case first && opts.StartAt == "beginning":
+				resetTo(0)
+			case first && opts.StartAt == "end":
+				resetTo(size)
+			case size < progress.ackedOffset():
+				i.cfg.Log.Printf("INFO %s was truncated or rotated; re-reading from the start", target)
+				resetTo(0)
+			}
+		}
+		first = false
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
 			RefTime: time.Now(), From: i.cfg.From, To: i.cfg.To,
 		})
 		if err != nil {
 			return err
 		}
-		err = i.runRemoteTail(ctx, opts, path, ex, labels, progress)
-		for _, r := range ex.Flush() {
-			_ = i.cfg.Sink.Add(ctx, r, labels)
+		err = i.runRemoteTail(ctx, opts, path, target, ex, labels, progress)
+		if flushed := ex.Flush(); len(flushed) > 0 {
+			flushSeq++
+			pos := flushPos(flushSeq)
+			for n, r := range flushed {
+				_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
+			}
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -191,11 +235,21 @@ func (p *remoteProgress) commitInflight() (int64, bool) {
 func (p *remoteProgress) markHoled() (int64, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.holed {
+	// A path with nothing in flight cannot have contributed to the lost
+	// batch; freezing it too stopped checkpointing every followed path
+	// for the life of the process because one of them produced one bad
+	// record.
+	if p.holed || p.inflight <= p.acked {
 		return p.acked, false
 	}
 	p.holed = true
 	return p.acked, true
+}
+
+func (p *remoteProgress) pendingOffset() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pending
 }
 
 func (p *remoteProgress) ackedOffset() int64 {
@@ -226,15 +280,8 @@ func (o *remoteObserver) EndFlush(_ int, dropped bool) {
 	}
 }
 
-// runRemoteTail streams one connection's worth of bytes, publishing the
-// byte offset each complete record ends at so the flush callback can turn
-// it into a checkpoint.
-//
-// Bytes are counted from the raw framing rather than from len(line)+1: a
-// CRLF stream or a file whose last line has no newline would otherwise
-// drift the offset permanently, and the drift compounds on every
-// reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path string, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
+// sshArgs builds the client arguments shared by every remote invocation.
+func sshArgs(opts RemoteOptions) []string {
 	args := []string{"-o", "BatchMode=yes"}
 	if !opts.InsecureHostKey {
 		args = append(args, "-o", "StrictHostKeyChecking=yes")
@@ -245,10 +292,53 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path str
 	if opts.CredentialPath != "" {
 		args = append(args, "-i", opts.CredentialPath)
 	}
-	dest := opts.Host
+	return args
+}
+
+func sshDest(opts RemoteOptions) string {
 	if opts.User != "" {
-		dest = opts.User + "@" + opts.Host
+		return opts.User + "@" + opts.Host
 	}
+	return opts.Host
+}
+
+// remoteSize reports the current length of a remote file.
+//
+// It is what stands in for the local follower's fingerprint: a tail cannot
+// report that the file underneath it was replaced, and the byte offsets
+// this path checkpoints are meaningless once it has been. A file shorter
+// than what has already been read is the observable signature of a
+// truncate, a copytruncate or a rotation, and `wc -c` needs no GNU
+// coreutils on the far end.
+func (i *Ingest) remoteSize(ctx context.Context, opts RemoteOptions, path string) (int64, error) {
+	args := append(sshArgs(opts), sshDest(opts), "wc -c < "+shellQuote(path))
+	cmd := exec.CommandContext(ctx, opts.SSHBinary, args...)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return 0, fmt.Errorf("%w: %s", err, msg)
+		}
+		return 0, err
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(out.String()), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unreadable size %q", strings.TrimSpace(out.String()))
+	}
+	return n, nil
+}
+
+// runRemoteTail streams one connection's worth of bytes, publishing the
+// byte offset each complete record ends at so the flush callback can turn
+// it into a checkpoint.
+//
+// Bytes are counted from the raw framing rather than from len(line)+1: a
+// CRLF stream or a file whose last line has no newline would otherwise
+// drift the offset permanently, and the drift compounds on every
+// reconnect.
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
+	args := sshArgs(opts)
+	dest := sshDest(opts)
 	start := progress.ackedOffset()
 	// One tail invocation, not a shell "|| fallback": a fallback that
 	// fires after the first tail has already streamed bytes would replay
@@ -271,19 +361,57 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path str
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	// A rotation cannot be seen from inside the stream: `tail -F` follows
+	// the new file while this counter keeps climbing on the old one, so
+	// the checkpoint ends up pointing far into a file that never held
+	// those bytes, and the next reconnect skips its whole head. Watching
+	// the size and dropping the connection makes the reconnect re-probe
+	// and restart from the beginning.
+	watchStop := make(chan struct{})
+	var watchDone sync.WaitGroup
+	watchDone.Add(1)
+	go func() {
+		defer watchDone.Done()
+		t := time.NewTicker(opts.ProbeInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchStop:
+				return
+			case <-t.C:
+				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				size, serr := i.remoteSize(sctx, opts, path)
+				cancel()
+				if serr != nil || size >= progress.pendingOffset() {
+					continue
+				}
+				i.cfg.Log.Printf("INFO %s is shorter than the bytes already read; reconnecting from the start", target)
+				_ = cmd.Process.Kill()
+				return
+			}
+		}
+	}()
+	defer func() { close(watchStop); watchDone.Wait() }()
+
 	consumed := start
 	r := bufio.NewReaderSize(stdout, 64<<10)
 	var readErr error
 	for {
-		chunk, err := r.ReadBytes('\n')
-		if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
-			consumed += int64(len(chunk))
-			i.cfg.Progress.AddBytes(int64(len(chunk)))
-			line := strings.TrimSuffix(string(chunk[:len(chunk)-1]), "\r")
-			results, perr := ex.Process(line)
+		// readRecord rather than ReadBytes: an unbounded read pulls a
+		// newline-free remote file into memory whole, which is the
+		// failure the local acquisition paths were converted away from.
+		rec, err := readRecord(r, opts.MaxRecordBytes)
+		if rec.Terminated {
+			recStart := consumed
+			consumed += int64(rec.Consumed)
+			if rec.Oversize {
+				i.cfg.Progress.OversizeRecord()
+			}
+			i.cfg.Progress.AddBytes(int64(rec.Consumed))
+			results, perr := ex.Process(string(rec.Line))
 			i.recordOutcome(perr)
-			for _, res := range results {
-				if aerr := i.cfg.Sink.Add(ctx, res, labels); aerr != nil {
+			for n, res := range results {
+				if aerr := i.cfg.Sink.Add(ctx, res, labels, keyHint(target, offsetPos(recStart), n)); aerr != nil {
 					_ = cmd.Process.Kill()
 					_ = cmd.Wait()
 					return aerr

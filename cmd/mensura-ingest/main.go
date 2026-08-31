@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -158,6 +159,18 @@ func splitList(v string) []string {
 	return out
 }
 
+// defaultStateDir is where follow checkpoints live when the operator did
+// not choose a directory, per docs/design/02-ingest.md section 5.
+func defaultStateDir() string {
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "mensura")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".local", "state", "mensura")
+	}
+	return ""
+}
+
 // parseTimeFlag accepts an absolute RFC3339 stamp or a duration before now.
 func parseTimeFlag(s string) (time.Time, error) {
 	if s == "" {
@@ -238,6 +251,17 @@ func runFollow(argv []string) error {
 	if *paths == "" {
 		return fmt.Errorf("--path is required")
 	}
+	// 02-ingest.md section 5 gives --state-dir a default. It had none, so
+	// a follow started without the flag kept no checkpoints at all and
+	// re-read every source from the beginning on every restart, silently.
+	if common.stateDir == "" {
+		common.stateDir = defaultStateDir()
+		if common.stateDir == "" {
+			log.Printf("WARNING no --state-dir and no home directory to derive one from: checkpoints are not persisted, so a restart re-reads every source from the beginning")
+		} else {
+			log.Printf("keeping follow checkpoints in %s (--state-dir)", common.stateDir)
+		}
+	}
 	ing, sink, err := common.setup()
 	if err != nil {
 		return err
@@ -257,6 +281,7 @@ func runFollow(argv []string) error {
 		return ing.FollowRemote(ctx, ingest.RemoteOptions{
 			Host: *sshHost, User: *sshUser, Port: *sshPort,
 			CredentialPath: *sshCred, InsecureHostKey: !*strictHost, Paths: list,
+			StartAt: *startAt,
 		})
 	}
 	return ing.Follow(ctx, ingest.FollowOptions{
@@ -296,10 +321,9 @@ func runReceive(argv []string) error {
 	stopReporting := startReporting(ctx, ing, sink, common)
 	defer stopReporting()
 
-	var sources []string
-	if *allowed != "" {
-		sources = strings.Split(*allowed, ",")
-	}
+	// splitList, not a bare Split: an entry written with a space after
+	// the comma would never have matched a sender address.
+	sources := splitList(*allowed)
 	return ing.Receive(ctx, ingest.ReceiveOptions{
 		TCPAddr: *tcpAddr, UDPAddr: *udpAddr, HTTPAddr: *httpAddr,
 		Mode: *mode, Listener: *listener,

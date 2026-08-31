@@ -402,10 +402,17 @@ func (p *parser) duration() (int64, error) {
 // are rejected on purpose: one number, one unit.
 func ParseDuration(s string) (int64, error) {
 	i := 0
+	// A leading sign is accepted so that Print -> Parse round-trips a
+	// negative duration out of an unvalidated AST rather than failing on
+	// text this package itself produced.
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		i++
+	}
+	start := i
 	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
 		i++
 	}
-	if i == 0 {
+	if i == start {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}
 	n, err := strconv.ParseFloat(s[:i], 64)
