@@ -24,16 +24,6 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 		return nil, fmt.Errorf("query: no AST supplied")
 	}
 	q := req.AST
-	switch q.Kind {
-	case mql.KindSets:
-		return s.querySets(), nil
-	case mql.KindFields:
-		return s.queryFields(q.From)
-	case mql.KindLabelKeys:
-		return s.queryLabelKeys(q.From), nil
-	case mql.KindLabels:
-		return s.queryLabelValues(ctx, q, req)
-	}
 
 	// The datasource ceilings, with a disabled gate expressed as 0. The
 	// validator and the executor must agree on these, or a query that
@@ -47,9 +37,30 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 		pointsCeiling = 0
 	}
 
+	// Validation runs before the auxiliary forms, not after them. The
+	// switch below used to return first, so a LABELS query's WHERE was
+	// never shape-checked: a predicate node carrying two arms of the
+	// tagged union executed as whichever arm the lowering reaches first
+	// and silently dropped the rest, which is how `LABELS host WHERE dc =
+	// "eu-west-1"` could return every datacentre's hosts again.
 	warns, verr := mql.Validate(q, s.Schema(), seriesCeiling, pointsCeiling)
 	if verr != nil {
 		return nil, verr
+	}
+
+	switch q.Kind {
+	case mql.KindSets:
+		return s.querySets(), nil
+	case mql.KindFields:
+		return s.queryFields(q.From)
+	case mql.KindLabelKeys:
+		return s.queryLabelKeys(q.From), nil
+	case mql.KindLabels:
+		resp, err := s.queryLabelValues(ctx, q, req)
+		if err == nil && resp != nil {
+			resp.Warnings = append(warns, resp.Warnings...)
+		}
+		return resp, err
 	}
 
 	// LIMIT may only narrow, never widen — Validate has already refused a
@@ -443,6 +454,13 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 	if q.EveryMs != nil {
 		window = *q.EveryMs
 	}
+	if window < 0 {
+		// Validate refuses a non-positive EVERY, but this value is also
+		// reached by a caller that builds a wire.QueryRequest directly.
+		// A negative window makes every boundary test fire, so each
+		// sample becomes its own window.
+		window = 0
+	}
 	out := make([]*seriesAcc, 0, len(acc))
 	for _, a := range acc {
 		out = append(out, a)
@@ -523,7 +541,7 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		labels := s.rowLabels(row, q.By)
 		g := seriesKey(labels, q.By, "")
 		groups[g] = labels
-		bucketTs := ts - ts%window
+		bucketTs := floorTo(ts, window)
 		for bi, col := range bs.Buckets {
 			if col == "" {
 				continue
@@ -598,6 +616,20 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
 	}
 	return nil
+}
+
+// floorTo rounds a timestamp down onto a window boundary. Go's % keeps the
+// sign of the dividend, so `ts - ts%w` rounds a negative timestamp *up*
+// and puts it in the following window.
+func floorTo(ts, window int64) int64 {
+	if window <= 0 {
+		return ts
+	}
+	m := ts % window
+	if m < 0 {
+		m += window
+	}
+	return ts - m
 }
 
 func heatmapSeriesName(labels map[string]string, by []string, bs wire.BucketSetInfo, bucket int) string {

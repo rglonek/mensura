@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rglonek/mensura/pkg/extract"
@@ -96,23 +98,61 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	}
 	go func() { wg.Wait(); close(errCh) }()
 
+	// Multiline records and aggregation windows need a clock of their own
+	// here: a receiving stream has no end of file to flush at.
+	// stopIdle, not ctx alone: a listener can fail while the context is
+	// still live, and the drain below would then wait for a goroutine
+	// that is waiting for a cancellation that never comes.
+	stopIdle := make(chan struct{})
+	idleDone := make(chan struct{})
+	go func() {
+		defer close(idleDone)
+		t := time.NewTicker(receiveIdleFlush)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopIdle:
+				return
+			case now := <-t.C:
+				r.flushIdle(ctx, now)
+			}
+		}
+	}()
+
 	var first error
 	for err := range errCh {
 		if err != nil && first == nil {
 			first = err
 		}
 	}
+	close(stopIdle)
+	<-idleDone
+	// Everything the peers still hold, on a live context: ctx is already
+	// cancelled by now, and the sink requeues rather than delivers on a
+	// cancelled one.
+	r.flushAll(context.Background())
 	_ = i.cfg.Sink.Flush(context.Background())
 	return first
 }
+
+// receiveIdleFlush is how often buffered peer state is reconsidered. The
+// profile's own idle timeout decides what is actually due; this is just
+// the cadence at which the question is asked.
+const receiveIdleFlush = 5 * time.Second
 
 // peerStream is one sender's extraction state. extract.Stream is not safe
 // for concurrent use, so the mutex is what lets two connections from the
 // same address share one stream rather than corrupt it.
 type peerStream struct {
-	mu   sync.Mutex
-	ex   *extract.Stream
-	seen time.Time
+	mu sync.Mutex
+	ex *extract.Stream
+	// labels are fixed when the peer is first seen, so a flush that runs
+	// without a record in hand can still label what it emits.
+	labels   map[string]string
+	seen     time.Time
+	flushSeq int
 }
 
 type receiver struct {
@@ -124,6 +164,9 @@ type receiver struct {
 	allowed map[string]struct{}
 	// conns is one slot per in-flight TCP connection.
 	conns chan struct{}
+	// seq numbers received records, which have no byte offset of their
+	// own to key on.
+	seq atomic.Int64
 }
 
 // permitted reports whether a sender is allowed on this listener.
@@ -148,8 +191,11 @@ func (r *receiver) stream(peer string) (*peerStream, map[string]string, error) {
 	defer r.mu.Unlock()
 	if ps, ok := r.streams[peer]; ok {
 		ps.seen = now
-		return ps, labels, nil
+		return ps, ps.labels, nil
 	}
+	// Evicted peers are flushed by the idle loop, not dropped here: this
+	// runs under r.mu and delivering into the sink from under it would
+	// invert two locks.
 	r.evictLocked(now)
 	if len(r.streams) >= r.opts.MaxPeers {
 		return nil, labels, fmt.Errorf("too many active senders (%d); %s is not being tracked", r.opts.MaxPeers, peer)
@@ -165,17 +211,90 @@ func (r *receiver) stream(peer string) (*peerStream, map[string]string, error) {
 		return nil, labels, err
 	}
 	r.ing.cfg.Sink.DeclareFields(profile)
-	ps := &peerStream{ex: ex, seen: now}
+	ps := &peerStream{ex: ex, labels: labels, seen: now}
 	r.streams[peer] = ps
 	return ps, labels, nil
 }
 
-// evictLocked drops peers that have been silent for longer than PeerIdle.
-func (r *receiver) evictLocked(now time.Time) {
+// evictLocked drops peers that have been silent for longer than PeerIdle
+// and returns them, so the caller can flush what they still hold once the
+// lock is released. Deleting them outright discarded any open multiline
+// record and any half-filled aggregation window.
+func (r *receiver) evictLocked(now time.Time) []*peerStream {
+	var out []*peerStream
 	for peer, ps := range r.streams {
 		if now.Sub(ps.seen) > r.opts.PeerIdle {
 			delete(r.streams, peer)
+			out = append(out, ps)
 		}
+	}
+	return out
+}
+
+// peers snapshots the live peer streams.
+func (r *receiver) peers() []*peerStream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*peerStream, 0, len(r.streams))
+	for _, ps := range r.streams {
+		out = append(out, ps)
+	}
+	return out
+}
+
+// emit delivers a flushed peer stream's results.
+func (r *receiver) emit(ctx context.Context, ps *peerStream, results []extract.Result) {
+	if len(results) == 0 {
+		return
+	}
+	ps.mu.Lock()
+	ps.flushSeq++
+	pos := flushPos(ps.flushSeq)
+	labels := ps.labels
+	ps.mu.Unlock()
+	host := labels["host"]
+	for n, res := range results {
+		_ = r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(host, pos, n))
+	}
+}
+
+// flushIdle closes multiline records and aggregation windows that have
+// been waiting, and retires silent peers. Nothing used to call either on
+// this path, so a receiving ingest held a peer's last partial record and
+// its open window until the process exited -- and dropped both if the
+// peer was evicted first.
+func (r *receiver) flushIdle(ctx context.Context, now time.Time) {
+	r.mu.Lock()
+	evicted := r.evictLocked(now)
+	r.mu.Unlock()
+	for _, ps := range evicted {
+		ps.mu.Lock()
+		results := ps.ex.Flush()
+		ps.mu.Unlock()
+		r.emit(ctx, ps, results)
+	}
+	for _, ps := range r.peers() {
+		ps.mu.Lock()
+		results := ps.ex.FlushIdle(now)
+		ps.mu.Unlock()
+		r.emit(ctx, ps, results)
+	}
+}
+
+// flushAll drains every peer, which is what a clean shutdown owes them.
+func (r *receiver) flushAll(ctx context.Context) {
+	r.mu.Lock()
+	peers := make([]*peerStream, 0, len(r.streams))
+	for peer, ps := range r.streams {
+		peers = append(peers, ps)
+		delete(r.streams, peer)
+	}
+	r.mu.Unlock()
+	for _, ps := range peers {
+		ps.mu.Lock()
+		results := ps.ex.Flush()
+		ps.mu.Unlock()
+		r.emit(ctx, ps, results)
 	}
 }
 
@@ -223,14 +342,30 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 		r.ing.cfg.Log.Printf("WARNING refused tcp connection from %s: not in allowed_sources", peer)
 		return
 	}
-	sc := bufio.NewScanner(conn)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
+	// Not a bufio.Scanner: one line longer than its buffer makes Scan
+	// return false with ErrTooLong, and this loop then closed the
+	// connection and discarded the rest of the stream without a word.
+	// readRecord truncates the over-long record, counts it, and carries
+	// on -- the same framing the file paths use.
+	br := bufio.NewReaderSize(conn, 64<<10)
+	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := r.handleRecord(ctx, peer, sc.Text()); err != nil {
-			r.ing.cfg.Log.Printf("WARNING %s: %v", peer, err)
+		rec, err := readRecord(br, r.ing.cfg.ReadBufferBytes)
+		if len(rec.Line) > 0 || rec.Terminated {
+			if rec.Oversize {
+				r.ing.cfg.Progress.OversizeRecord()
+			}
+			if rerr := r.handleRecord(ctx, peer, string(rec.Line)); rerr != nil {
+				r.ing.cfg.Log.Printf("WARNING %s: %v", peer, rerr)
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
+				r.ing.cfg.Log.Printf("WARNING %s: connection ended: %v", peer, err)
+			}
+			return
 		}
 		// An idle connection is closed rather than held forever: a
 		// listener that accumulates them runs out of descriptors.
@@ -418,8 +553,11 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 	results, perr := ps.ex.Process(text)
 	ps.mu.Unlock()
 	r.ing.recordOutcome(perr)
-	for _, res := range results {
-		if err := r.ing.cfg.Sink.Add(ctx, res, labels); err != nil {
+	// A received record has no byte offset, so the hint is the listener's
+	// own arrival sequence: still one distinct value per occurrence.
+	pos := "recv:" + strconv.FormatInt(r.seq.Add(1), 10)
+	for n, res := range results {
+		if err := r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(peer, pos, n)); err != nil {
 			return err
 		}
 	}
@@ -453,12 +591,18 @@ func ParseLineProtocol(line string, now time.Time) (string, model.Sample, error)
 		return "", model.Sample{}, fmt.Errorf("set %q uses the reserved prefix", set)
 	}
 	sample := model.Sample{Labels: map[string]string{}, Fields: map[string]model.Value{}}
-	for _, kv := range splitUnescaped(fields[1], ',') {
-		k, v, ok := splitKV(kv)
-		if !ok {
-			return "", model.Sample{}, fmt.Errorf("bad label %q", kv)
+	// "-" is the empty label set. Without it a sample carrying no labels
+	// of its own could not be written at all: the label section is
+	// positional, and an empty one split into a single "" that parsed as
+	// a malformed pair.
+	if fields[1] != "" && fields[1] != "-" {
+		for _, kv := range splitUnescaped(fields[1], ',') {
+			k, v, ok := splitKV(kv)
+			if !ok {
+				return "", model.Sample{}, fmt.Errorf("bad label %q", kv)
+			}
+			sample.Labels[unescape(k)] = unescape(v)
 		}
-		sample.Labels[unescape(k)] = unescape(v)
 	}
 	for _, kv := range splitUnescaped(fields[2], ',') {
 		k, v, ok := splitKV(kv)

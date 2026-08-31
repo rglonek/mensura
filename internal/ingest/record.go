@@ -4,7 +4,34 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"strconv"
 )
+
+// keyHint identifies one occurrence of a record so a set keyed by
+// `offset` can keep every occurrence as its own row.
+//
+// docs/design/04-wire-protocol.md section 6 defines the hint as the stream
+// identity plus the byte offset. Nothing used to supply it, so `offset`
+// keying hashed set, timestamp and labels and *nothing else*: it dropped
+// the field values that content keying hashes, and two records sharing a
+// millisecond and a label set silently overwrote each other -- the exact
+// opposite of what the scheme is for. pos is the byte offset the record
+// started at (or a flush marker), and n separates the samples one record
+// produced.
+func keyHint(stream, pos string, n int) string {
+	h := stream + "\x00" + pos
+	if n != 0 {
+		h += "\x00" + strconv.Itoa(n)
+	}
+	return h
+}
+
+// offsetPos renders a byte offset as a hint position.
+func offsetPos(off int64) string { return strconv.FormatInt(off, 10) }
+
+// flushPos renders the nth flush of a stream's buffered state as a hint
+// position; a flush has no byte offset of its own.
+func flushPos(seq int) string { return "flush:" + strconv.Itoa(seq) }
 
 // defaultMaxRecordBytes bounds one record on every acquisition path.
 const defaultMaxRecordBytes = 1 << 20

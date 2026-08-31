@@ -1,6 +1,8 @@
 package extract
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -327,5 +329,104 @@ func TestOversizeRecordTruncated(t *testing.T) {
 	_, _ = st.Process(`2026-08-28 10:41:02.113 stats: pool=default reqs=91823 inflight=7`)
 	if st.Stats.Oversize != 1 {
 		t.Fatalf("expected the oversize counter to move: %+v", st.Stats)
+	}
+}
+
+// An included spec's defaults used to be parsed and then dropped, so a
+// base file holding the timezone, the year assumption or the shared label
+// list was silently ignored and everything fell back to UTC.
+func TestIncludeCarriesDefaults(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.yaml")
+	if err := os.WriteFile(base, []byte(`
+version: 1
+defaults:
+  timestamp:
+    timezone: Europe/Warsaw
+    assume_year: "2021"
+  labels: [tier]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "main.yaml")
+	if err := os.WriteFile(main, []byte(`
+version: 1
+include: [base.yaml]
+defaults:
+  labels: [pool]
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    patterns:
+      - set: s
+        search: 'n='
+        extract: ['n=(?P<n>\d+)']
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := Load(main)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if spec.Defaults.Timestamp.Timezone != "Europe/Warsaw" {
+		t.Fatalf("timezone %q was not inherited from the include", spec.Defaults.Timestamp.Timezone)
+	}
+	if spec.Defaults.Timestamp.AssumeYear != "2021" {
+		t.Fatalf("assume_year %q was not inherited", spec.Defaults.Timestamp.AssumeYear)
+	}
+	p := spec.Profile("p")
+	for _, want := range []string{"pool", "tier"} {
+		if _, ok := p.labelSet[want]; !ok {
+			t.Fatalf("default label %q is missing; the include's labels were dropped", want)
+		}
+	}
+}
+
+// A continuation line carrying an earlier timestamp used to delete the
+// buffered multiline record, so the whole record vanished and only a
+// counter recorded it.
+func TestBackwardsMultilineEmitsTheBufferedRecord(t *testing.T) {
+	spec, err := Parse([]byte(`
+version: 1
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    framing:
+      multiline:
+        - start_contains: 'ERROR'
+          continue_regex: '^\s+at '
+          join:
+            - {regex: 'at (?P<frame>\S+)', capture: 1}
+    patterns:
+      - set: s
+        search: 'ERROR'
+        extract: ['ERROR (?P<msg>\w+)']
+`))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	st, err := spec.NewStream(spec.Profile("p"), StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if _, err := st.Process("1756382400000 ERROR boom"); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// A continuation stamped earlier than the record it belongs to.
+	out, perr := st.Process("1756382300000     at frame.one")
+	if perr == nil {
+		t.Fatal("expected the backwards timestamp to be reported")
+	}
+	if len(out) != 1 {
+		t.Fatalf("the buffered record was discarded rather than emitted: %d result(s)", len(out))
+	}
+	if out[0].Fields["msg"].S != "boom" {
+		t.Fatalf("wrong record emitted: %+v", out[0].Fields)
 	}
 }

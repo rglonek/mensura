@@ -110,6 +110,15 @@ type setEntry struct {
 	KeyScheme  model.KeyScheme               `json:"key_scheme,omitempty"`
 	FirstTSMs  int64                         `json:"first_ts_ms,omitempty"`
 	LastTSMs   int64                         `json:"last_ts_ms,omitempty"`
+
+	// RetentionMs and ShardMs are what a spec declared for this set over
+	// the write API. They are persisted because the declaration travels
+	// once per ingest process, not per write: an ingester that is already
+	// running never repeats it, so a store that forgot the declaration on
+	// restart kept the set forever and routed it to the unsharded shard
+	// that retention can never drop. A nil pointer means "never declared".
+	RetentionMs *int64 `json:"retention_ms,omitempty"`
+	ShardMs     *int64 `json:"shard_ms,omitempty"`
 }
 
 type fieldEntry struct {
@@ -283,6 +292,15 @@ func (s *Store) loadCatalogue() error {
 			e.Labels = map[string]struct{}{}
 		}
 		s.catalogue[name] = e
+		// Spec-supplied retention and shard width are restored into the
+		// live maps, so a restart keeps enforcing what the ingester
+		// declared rather than silently reverting to the defaults.
+		if e.RetentionMs != nil {
+			s.setRetention[name] = time.Duration(*e.RetentionMs) * time.Millisecond
+		}
+		if e.ShardMs != nil && *e.ShardMs > 0 {
+			s.setShard[name] = time.Duration(*e.ShardMs) * time.Millisecond
+		}
 	}
 	s.conflicts = stored.Conflicts
 	s.catVer.Store(stored.Version)
@@ -320,14 +338,27 @@ func dictEntryKey(label string, idx int32) string {
 	return fmt.Sprintf("%s%s\x00%010d", dictEntryPrefix, label, idx)
 }
 
-// splitDictEntryKey recovers the label key from a per-value record name.
-func splitDictEntryKey(k string) (string, bool) {
+// splitDictEntryKey recovers the label key and the index from a per-value
+// record name.
+//
+// The index is parsed rather than re-derived from load order: the index is
+// what every stored row carries, so a missing or duplicated record must
+// leave a hole, not shift every value after it onto someone else's index
+// and silently mislabel the data.
+func splitDictEntryKey(k string) (string, int32, bool) {
 	rest, ok := strings.CutPrefix(k, dictEntryPrefix)
 	if !ok {
-		return "", false
+		return "", 0, false
 	}
-	label, _, ok := strings.Cut(rest, "\x00")
-	return label, ok
+	label, idxText, ok := strings.Cut(rest, "\x00")
+	if !ok {
+		return "", 0, false
+	}
+	idx, err := strconv.ParseInt(idxText, 10, 32)
+	if err != nil || idx < 0 {
+		return "", 0, false
+	}
+	return label, int32(idx), true
 }
 
 func (s *Store) loadDictionaries() error {
@@ -364,7 +395,7 @@ func (s *Store) loadDictionaries() error {
 		s.dict[strings.TrimPrefix(k, dictPackedPrefix)] = &d
 	}
 	for _, k := range keys {
-		label, ok := splitDictEntryKey(k)
+		label, idx, ok := splitDictEntryKey(k)
 		if !ok {
 			continue
 		}
@@ -374,14 +405,25 @@ func (s *Store) loadDictionaries() error {
 		}
 		d := get(label)
 		v := string(b)
-		if _, dup := d.index[v]; dup {
-			continue
+		if idx > maxDictIndex {
+			return fmt.Errorf("store: label dictionary %s has an implausible index %d", k, idx)
 		}
-		d.index[v] = int32(len(d.Entries))
-		d.Entries = append(d.Entries, v)
+		// Grow to the recorded position, leaving holes empty rather than
+		// closing them up.
+		for int(idx) >= len(d.Entries) {
+			d.Entries = append(d.Entries, "")
+		}
+		d.Entries[idx] = v
+		if _, dup := d.index[v]; !dup {
+			d.index[v] = idx
+		}
 	}
 	return nil
 }
+
+// maxDictIndex bounds an index recovered from a record name, because it is
+// used to size a slice.
+const maxDictIndex = 1 << 24
 
 // intern maps a label value to its dictionary index, adding it if new.
 // Returns an error when the key would exceed the cardinality limit:
@@ -412,13 +454,25 @@ func (s *Store) intern(key, value string) (int32, error) {
 		return 0, fmt.Errorf("label %q exceeds the cardinality limit of %d distinct values", key, s.cfg.MaxLabelCardinality)
 	}
 	idx := int32(len(d.Entries))
+	// A hole left by a lost record is reused rather than skipped, so the
+	// dictionary does not grow past its budget on nothing.
+	for i, e := range d.Entries {
+		if e == "" {
+			idx = int32(i)
+			break
+		}
+	}
 	// One record for the new value only. Rewriting the whole array here
 	// would make interning the n-th value cost O(n) bytes, so filling a
 	// 100k-value dictionary would write ~5 GB under the dictionary lock.
 	if err := s.db.PutDict(dictEntryKey(key, idx), []byte(value)); err != nil {
 		return 0, err
 	}
-	d.Entries = append(d.Entries, value)
+	if int(idx) < len(d.Entries) {
+		d.Entries[idx] = value
+	} else {
+		d.Entries = append(d.Entries, value)
+	}
 	d.index[value] = idx
 	return idx, nil
 }
@@ -455,7 +509,12 @@ func (s *Store) LabelValues(key string) []string {
 	if !ok {
 		return nil
 	}
-	out := append([]string(nil), d.Entries...)
+	out := make([]string, 0, len(d.Entries))
+	for _, e := range d.Entries {
+		if e != "" {
+			out = append(out, e)
+		}
+	}
 	sort.Strings(out)
 	return out
 }
@@ -687,6 +746,14 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	// A set whose every shard has aged out is gone; leaving its catalogue
 	// entry behind would keep advertising fields and a time range that no
 	// longer have any data under them.
+	//
+	// The label dictionary is deliberately not reclaimed with it. There is
+	// one dictionary per label key for the whole store (05-storage.md
+	// section 8, ADR-004), and every stored row holds an index into it, so
+	// a value dropped because one set aged out would silently relabel the
+	// rows of every other set that still carries it. The cost is that a
+	// key's cardinality budget only ever grows; recovering it needs the
+	// per-set dictionaries that ADR-004 rejected, not a sweep here.
 	for logical := range emptied {
 		if len(s.shardsFor(logical, math.MinInt64, math.MaxInt64)) > 0 {
 			continue
@@ -775,8 +842,25 @@ func (s *Store) Sets() []string {
 	return out
 }
 
+// shardsByLogical groups every physical shard under its logical set in one
+// pass. Catalogue used to call shardsFor per set, and shardsFor walks the
+// whole set list, so rendering the catalogue was quadratic in the number
+// of shards -- which retention at an hourly width makes large.
+func (s *Store) shardsByLogical() map[string][]string {
+	out := map[string][]string{}
+	for _, name := range s.db.Sets() {
+		i := strings.LastIndex(name, "@")
+		if i <= 0 {
+			continue
+		}
+		out[name[:i]] = append(out[name[:i]], name)
+	}
+	return out
+}
+
 // Catalogue renders the catalogue for the API and the query builder.
 func (s *Store) Catalogue() wire.Catalogue {
+	shards := s.shardsByLogical()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := wire.Catalogue{Version: s.catVer.Load(), Conflicts: s.conflicts}
@@ -786,7 +870,7 @@ func (s *Store) Catalogue() wire.Catalogue {
 			Fields:    map[string]mql.FieldInfo{},
 			FirstTSMs: e.FirstTSMs,
 			LastTSMs:  e.LastTSMs,
-			Shards:    s.shardsFor(name, math.MinInt64, math.MaxInt64),
+			Shards:    shards[name],
 		}
 		for f, fe := range e.Fields {
 			info.Fields[f] = mql.FieldInfo{

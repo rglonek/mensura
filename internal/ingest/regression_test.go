@@ -1,11 +1,20 @@
 package ingest
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/rglonek/mensura/pkg/wire"
 )
 
 // A line that the follower reads before its newline has arrived must be
@@ -125,5 +134,129 @@ func TestFollowStillDetectsARewriteInPlace(t *testing.T) {
 		if counts[i] == 0 {
 			t.Fatalf("line %d was lost across the rewrite", i)
 		}
+	}
+}
+
+// docs/design/04-wire-protocol.md section 6 defines a set keyed by
+// `offset` as hashing the stream identity and the byte offset. Nothing
+// supplied that hint, so the key hashed set, timestamp and labels and
+// nothing else -- dropping even the field values that content keying
+// hashes, and collapsing two records that share a millisecond into one
+// row. Every acquisition path must attach one, and it must be distinct
+// per occurrence.
+func TestEveryAcquisitionPathSuppliesAKeyHint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	ks := newKeyHintStore()
+	defer ks.srv.Close()
+
+	// Two byte-identical records in the same millisecond: indistinguishable
+	// to everything except the offset they were read at.
+	body := "1756382400000 n=1\n1756382400000 n=1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ing, sink := newFollowIngest(t, ks.recordingStore, "")
+	if err := ing.Batch(context.Background(), []string{path}); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if err := sink.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	hints := ks.hints()
+	if len(hints) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(hints))
+	}
+	for _, h := range hints {
+		if h == "" {
+			t.Fatalf("a sample reached the store with no key hint: %q", hints)
+		}
+	}
+	if hints[0] == hints[1] {
+		t.Fatalf("two occurrences shared the key hint %q, so offset keying would collapse them", hints[0])
+	}
+}
+
+// keyHintStore records the key hint of every sample it is sent.
+type keyHintStore struct {
+	*recordingStore
+	mu    sync.Mutex
+	saw   []string
+	inner *httptest.Server
+}
+
+func newKeyHintStore() *keyHintStore {
+	ks := &keyHintStore{recordingStore: &recordingStore{seen: map[int64]int{}}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/write", func(w http.ResponseWriter, r *http.Request) {
+		var req wire.WriteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		n := 0
+		ks.mu.Lock()
+		for _, b := range req.Batches {
+			for _, s := range b.Samples {
+				ks.saw = append(ks.saw, s.KeyHint)
+				n++
+			}
+		}
+		ks.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(wire.WriteResponse{Accepted: n})
+	})
+	ks.srv = httptest.NewServer(mux)
+	return ks
+}
+
+func (k *keyHintStore) hints() []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return append([]string(nil), k.saw...)
+}
+
+// A TCP sender's over-long line used to make bufio.Scanner return
+// ErrTooLong, which ended the read loop and discarded the rest of the
+// connection without a word. The record is truncated and counted; what
+// follows it still arrives.
+func TestReceiveTCPSurvivesAnOverlongLine(t *testing.T) {
+	ks := newKeyHintStore()
+	defer ks.srv.Close()
+	ing, sink := newFollowIngest(t, ks.recordingStore, "")
+	ing.cfg.ReadBufferBytes = 4096
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	// Bind to pick a free port, then hand the address to the receiver.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ing.Receive(ctx, ReceiveOptions{TCPAddr: addr, Listener: "test"}) }()
+
+	var conn net.Conn
+	if !waitFor(t, 5*time.Second, func() bool {
+		c, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return false
+		}
+		conn = c
+		return true
+	}) {
+		t.Fatal("listener never came up")
+	}
+	defer conn.Close()
+
+	long := strings.Repeat("x", 32<<10)
+	if _, err := fmt.Fprintf(conn, "1756382400000 n=1 %s\n1756382400001 n=2\n", long); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return len(ks.hints()) >= 2 }) {
+		t.Fatalf("the record after an over-long line never arrived (%d sample(s))", len(ks.hints()))
 	}
 }

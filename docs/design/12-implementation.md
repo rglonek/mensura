@@ -331,17 +331,24 @@ decodes write bodies with `DisallowUnknownFields`, so an ingest of this
 version against an older store is refused rather than silently dropping the
 declarations.
 
-### 6.13 The rotation fingerprint uses a fixed window
+### 6.13 The rotation fingerprint covers consumed bytes
 
-Rotation is detected by hashing the head of the file. The hash was taken
-over "however many bytes exist", which for a file shorter than the window
-changes on *every append* — so a young log was diagnosed as rewritten on
-each poll and re-read from the start.
+Rotation is detected by hashing the head of the file. The hash was first
+taken over "however many bytes exist", which for a file shorter than the
+window changes on *every append* — so a young log was diagnosed as
+rewritten on each poll and re-read from the start. A fixed 256-byte window
+fixed that and introduced two problems of its own: rotated logs routinely
+share their first 256 bytes (a startup banner, a templated first line), and
+below the window there was no rotation detection but a size comparison,
+which a copytruncate that restores the size defeats.
 
-The window is now a fixed 256 bytes, and a fingerprint taken over a
-shorter file is marked provisional and not compared. Below the window only
-a shrinking file counts as a rewrite; once the file is long enough the
-fingerprint is adopted and rewrites are detected as before.
+The window now covers the bytes *already consumed*, capped at 4 KiB, and
+the checkpoint records the width it covers. Appending cannot change bytes
+behind the read offset, so the hash is stable on a growing file, while a
+truncate, a copytruncate or a rewrite in place changes it immediately at
+any file size. The hash carries a `v2:` prefix; a checkpoint written by an
+earlier build is still recognised against the legacy 256-byte window, so an
+upgrade does not re-read every followed file.
 
 ### 6.14 An unsubstituted `$variable` is an error
 
@@ -350,6 +357,120 @@ literal, matches nothing, and draws an empty panel with a warning. Since
 the whole point of the project is that a plot may not mislead, validation
 now rejects it with `E010`: an unsubstituted variable is a configuration
 fault, not a value.
+
+### 6.15 `key: offset` carries a key hint
+
+[04](04-wire-protocol.md) §6 defines the `offset` row key as
+`xxh3-128(set ‖ ts_ms ‖ canonical(labels) ‖ key_hint)`, where `key_hint` is
+the stream identity and the byte offset. §6.12 carried the `key: offset`
+declaration to the store; nothing ever supplied the hint itself, so the key
+hashed the set, the timestamp and the labels and *nothing else*. That is
+strictly less than content keying, which at least hashes the field values:
+two records sharing a millisecond and a label set overwrote each other, the
+write API answered `accepted: 3`, and one row was stored. The scheme whose
+purpose is "every occurrence is a distinct row" did the opposite.
+
+Every acquisition path now attaches a hint — stream plus the byte offset
+the record started at, plus an index when one record yields several samples.
+Batch import keys on the file path, follow on the stream id, remote follow
+on `host:path`, and the receive listeners on their own arrival sequence,
+which is the closest thing a datagram has to an offset.
+
+The store refuses an offset-keyed sample that carries no hint, naming the
+omission on the rejection rather than accepting it and storing one row for
+two records. Any writer, not only this ingest, gets told.
+
+### 6.16 Set-level spec options are persisted
+
+The declarations of §6.12 travel *once per ingest process*, which means a
+store that only held them in memory lost them on restart and the ingester,
+whose `metaSent` map still said "sent", never repeated them. The set then
+resolved to no retention, which makes `shardWidth` return zero, which routes
+every subsequent write to the `@all` shard that retention skips by
+construction. A `--retention 0` store with per-set retention declared by the
+spec — the shape the flag exists for — silently stopped enforcing it and
+grew without bound.
+
+`retention_ms` and `shard_ms` are now recorded on the catalogue entry
+alongside `key_scheme` and restored into the live overrides on open.
+
+### 6.17 Auxiliary query forms are validated
+
+`SETS`, `FIELDS`, `LABEL KEYS` and `LABELS` returned from a switch that ran
+*before* `Validate`. For `LABELS … WHERE` that meant its predicate was never
+shape-checked, and the tagged-union check in `arms` exists precisely
+because the lowering in the store takes the first arm of a priority switch:
+a node carrying both `and` and `eq` executed as the `and` and dropped the
+`eq`, so a dashboard variable filtered by datacentre returned every
+datacentre's hosts. Validation now runs first for every kind. A consequence
+worth naming: `FIELDS FROM` and `LABEL KEYS FROM` an unknown set are now an
+`E002` rather than an empty result.
+
+Validation also gained the checks whose absence let an unrunnable query
+render a plausible panel: an unknown `FORMAT` (the executor defaults to
+timeseries), a non-positive `EVERY`, a negative `GAP`, an unknown `SSE`
+mode (the render layer defaults to the constant), and an inverted or
+mis-spelled `CLAMP`.
+
+### 6.18 Remote follow detects rotation by size
+
+An SSH follow counts bytes as they stream past. `tail -F` follows the file
+across a rotation while that counter keeps climbing on the old one, so the
+checkpoint ends up describing a file that never held those bytes and the
+next reconnect seeks past the whole head of the new one. There was no
+truncation detection on this path at all.
+
+`ProbeInterval` — declared, defaulted and until now unused — is what closes
+it: the remote length is read with `wc -c` before each connection and every
+probe interval during one. A file shorter than the bytes already read has
+been truncated, copytruncated or replaced, so the tail is dropped and the
+stream restarts from the beginning. The same probe makes `--start-at end`
+work on this path, which was accepted on the command line and ignored.
+
+### 6.19 One framing for every acquisition path
+
+`readRecord` bounds a record on the batch and local-follow paths. The
+remote tail still used an unbounded `ReadBytes`, so one newline-free file
+was pulled into memory whole, and the TCP listener still used a
+`bufio.Scanner` capped at a megabyte — one longer line returned `ErrTooLong`,
+which ended the read loop, closed the connection and discarded the rest of
+the stream in silence. Both now frame with `readRecord`, and the follower
+extracts the truncated prefix of an over-long record instead of dropping it,
+so the same file yields the same samples however it was acquired.
+
+### 6.20 Buffered extractor state is flushed on every path
+
+`extract.Stream` holds open multiline records and half-filled aggregation
+windows. The receive path never flushed either: a peer's state was dropped
+outright when it was evicted, eviction only ran when a *new* peer arrived,
+and nothing closed a window on a shutdown. The local follower had the same
+hole at a rotation boundary — a truncate reset the reader without draining
+the extractor, so the old file's tail was concatenated onto the new file's
+first lines. Receive now runs an idle flush of its own and drains every peer
+on the way out, and the follower drains before it re-reads.
+
+A backwards timestamp inside a multiline record now *emits* the buffered
+record rather than deleting it. Interleaved writers produce that ordering
+routinely, and the loss was reported only as a counter.
+
+### 6.21 A lost batch freezes only the streams it took bytes from
+
+A dropped batch freezes a checkpoint, because a resume offset that moved
+past a hole would bury the records in it. That freeze applied to every live
+tailer and every followed remote path, and `holed` is never cleared, so one
+bad record from one file stopped checkpoint progress for the whole process
+until it was restarted. A stream whose in-flight mark had not moved past its
+acknowledged offset cannot have contributed to the lost batch, and is now
+left alone.
+
+### 6.22 Metrics carry the same authorisation as the rest of the API
+
+`/metrics` had no authentication in any mode, and the startup posture check
+only forces that listener onto loopback when authentication is switched off
+entirely. A bearer-mode store therefore published its set names, write rates
+and disk usage to anyone who could reach the port. The metrics handler now
+requires the `query` scope like every other read. **Operational note:** a
+scrape against a `bearer`-mode store now needs a token with that scope.
 
 ## 7. Known gaps worth naming
 
@@ -364,5 +485,11 @@ fault, not a value.
   fails, on the same principle as `tls.client_ca`: a declaration that does
   nothing is worse than one that is rejected.
 - **Sub-millisecond timestamps are truncated**, per open question 1.
+- **Retention does not reclaim label dictionary entries.** There is one
+  dictionary per label key for the whole store ([05](05-storage.md) §8,
+  ADR-004) and every stored row holds an index into it, so a value dropped
+  because one set aged out would relabel the rows of every other set that
+  still carries it. A key's cardinality budget therefore only ever grows;
+  recovering it needs the per-set dictionaries ADR-004 rejected.
 - **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
   is the only mitigation for a query with no `BY`.

@@ -162,7 +162,8 @@ evaluation in queries, and writes no files outside `data_dir` and its log.
 
 ## 5. Observability
 
-**Store metrics** (`/metrics`): write requests by status, samples written,
+**Store metrics** (`/metrics`, `query` scope — a scrape against a
+`bearer`-mode store needs a token): write requests by status, samples written,
 rejected samples by reason, batch commit latency, engine stats (puts, scans,
 open iterators), Pebble metrics (cache hit rate, L0 sublevels, compaction debt,
 disk bytes), query count/latency/rows-scanned/series/points, safety-gate trips,

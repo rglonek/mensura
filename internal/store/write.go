@@ -24,10 +24,44 @@ type idempotencyCache struct {
 	max  int
 	ll   *list.List
 	keys map[string]*list.Element
+
+	// inflight serialises requests that carry the same key. Checking
+	// `seen` and recording afterwards is only atomic against a retry that
+	// waits for its answer; two retries in flight at once both missed the
+	// cache and both wrote.
+	inflightMu sync.Mutex
+	inflight   map[string]*sync.WaitGroup
 }
 
 func newIdempotencyCache(max int) *idempotencyCache {
-	return &idempotencyCache{max: max, ll: list.New(), keys: map[string]*list.Element{}}
+	return &idempotencyCache{max: max, ll: list.New(), keys: map[string]*list.Element{}, inflight: map[string]*sync.WaitGroup{}}
+}
+
+// acquire claims a key for the duration of one write, waiting for any
+// request already writing under the same key. The returned function must
+// be called when the write is done.
+func (c *idempotencyCache) acquire(key string) func() {
+	if key == "" {
+		return func() {}
+	}
+	for {
+		c.inflightMu.Lock()
+		wg, busy := c.inflight[key]
+		if !busy {
+			wg = &sync.WaitGroup{}
+			wg.Add(1)
+			c.inflight[key] = wg
+			c.inflightMu.Unlock()
+			return func() {
+				c.inflightMu.Lock()
+				delete(c.inflight, key)
+				c.inflightMu.Unlock()
+				wg.Done()
+			}
+		}
+		c.inflightMu.Unlock()
+		wg.Wait()
+	}
 }
 
 // seen reports whether a key has already been committed, without recording
@@ -68,6 +102,8 @@ func (c *idempotencyCache) record(key string) {
 // are named and the rest is committed, because dropping a whole batch for
 // one malformed row loses far more than it protects.
 func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string) (*wire.WriteResponse, error) {
+	release := s.idem.acquire(idempotencyKey)
+	defer release()
 	if s.idem.seen(idempotencyKey) {
 		return &wire.WriteResponse{Duplicate: true, CatalogueVersion: s.catVer.Load()}, nil
 	}
@@ -99,17 +135,33 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 		}
 
 		byShard := map[string][]engine.Record{}
-		scheme := s.keyScheme(batch.Set)
 		// Only samples that were actually accepted may shape the
 		// catalogue: a rejected row must not widen the label set or move
-		// the set's first/last timestamp.
-		accepted := make([]model.Sample, 0, len(batch.Samples))
+		// the set's first/last timestamp. They are tracked per shard,
+		// because a batch spanning a shard boundary is not one atomic
+		// write: if the second shard fails, the catalogue must still
+		// describe what the first one committed.
+		acceptedByShard := map[string][]model.Sample{}
+		scheme := s.keyScheme(batch.Set)
 		for i := range batch.Samples {
 			sm := &batch.Samples[i]
 			idx := index
 			index++
 			if err := sm.Validate(); err != nil {
 				resp.Rejected = append(resp.Rejected, wire.Rejection{Index: idx, Reason: err.Error()})
+				continue
+			}
+			// A set keyed by `offset` derives its row key from the hint
+			// instead of from the field values, so a sample that carries
+			// no hint is keyed by set, timestamp and labels alone: two
+			// records in the same millisecond would silently overwrite
+			// each other, and the response would still count both as
+			// accepted. Naming the omission is the only honest answer.
+			if scheme == model.KeyOffset && sm.KeyHint == "" {
+				resp.Rejected = append(resp.Rejected, wire.Rejection{
+					Index:  idx,
+					Reason: fmt.Sprintf("set %q is keyed by offset, so every sample needs a key_hint; without one two records sharing a timestamp and labels would collapse into one row", batch.Set),
+				})
 				continue
 			}
 			if batch.Set == model.IngestSet && clientName != "" {
@@ -126,15 +178,15 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			pk := model.PrimaryKey(batch.Set, sm, scheme)
 			shard := s.shardName(batch.Set, sm.TSMs)
 			byShard[shard] = append(byShard[shard], engine.Record{Key: pk, Row: row})
-			accepted = append(accepted, *sm)
+			acceptedByShard[shard] = append(acceptedByShard[shard], *sm)
 			resp.Accepted++
 		}
 		for shard, recs := range byShard {
 			if err := s.db.PutBatch(shard, recs); err != nil {
 				return nil, err
 			}
+			s.observeSet(batch.Set, acceptedByShard[shard])
 		}
-		s.observeSet(batch.Set, accepted)
 	}
 	// The key is recorded only now, once every batch has committed: a
 	// retry of a request that failed part-way must write, not be answered
@@ -387,7 +439,6 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) {
 // would be a concurrent map write.
 func (s *Store) SetRetentionFor(set string, retention, shard time.Duration) {
 	s.retentionMu.Lock()
-	defer s.retentionMu.Unlock()
 	if s.setRetention == nil {
 		s.setRetention = map[string]time.Duration{}
 	}
@@ -400,6 +451,24 @@ func (s *Store) SetRetentionFor(set string, retention, shard time.Duration) {
 	if shard > 0 {
 		s.setShard[set] = shard
 	}
+	s.retentionMu.Unlock()
+
+	// Persisted alongside the catalogue. The declaration travels once per
+	// ingest process, so an ingester that is already running never
+	// repeats it: a store that only held it in memory forgot it on
+	// restart and then kept the set forever, in the unsharded shard that
+	// retention skips.
+	s.mu.Lock()
+	e := s.entryLocked(set)
+	if retention >= 0 {
+		ms := retention.Milliseconds()
+		e.RetentionMs = &ms
+	}
+	if shard > 0 {
+		ms := shard.Milliseconds()
+		e.ShardMs = &ms
+	}
+	s.mu.Unlock()
 }
 
 // retentionFor resolves the effective retention for a logical set: a
@@ -416,27 +485,6 @@ func (s *Store) retentionFor(set string) time.Duration {
 		return d
 	}
 	return s.cfg.Retention
-}
-
-// hasAnyRetention reports whether anything at all is subject to retention,
-// which is what decides whether the sweep loop is worth running.
-func (s *Store) hasAnyRetention() bool {
-	if s.cfg.Retention > 0 {
-		return true
-	}
-	for _, d := range s.cfg.SetRetention {
-		if d > 0 {
-			return true
-		}
-	}
-	s.retentionMu.RLock()
-	defer s.retentionMu.RUnlock()
-	for _, d := range s.setRetention {
-		if d > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // SaveCatalogue persists the catalogue; the HTTP layer calls it on a timer

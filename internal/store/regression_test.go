@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -221,7 +222,7 @@ func TestPerSetRetentionSweepsWithoutAGlobalDefault(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	if !s.hasAnyRetention() {
+	if s.retentionFor("http") <= 0 {
 		t.Fatal("a per-set retention must count as retention worth sweeping")
 	}
 	old := time.Now().Add(-72 * time.Hour)
@@ -329,4 +330,180 @@ func mustParse(t *testing.T, text string) *mql.Query {
 		t.Fatalf("parse %q: %v", text, err)
 	}
 	return q
+}
+
+// A spec's set declarations travel once per ingest process. A store that
+// only held them in memory forgot them on restart, and the set then
+// routed to the unsharded shard that retention skips: declared retention
+// stopped applying, silently and permanently.
+func TestSetMetaSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	cfg.Retention = 0 // the documented shape: global 0, per-set from the spec
+
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	retention := int64((7 * 24 * time.Hour) / time.Millisecond)
+	shard := int64(24 * time.Hour / time.Millisecond)
+	if _, err := s.Write(&wire.WriteRequest{
+		SetMeta: []wire.SetMeta{{Set: "http", RetentionMs: &retention, ShardMs: &shard}},
+		Batches: []model.Batch{{Set: "http", Samples: []model.Sample{
+			{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}},
+		}}},
+	}, "", "test"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	if got := s2.retentionFor("http"); got != 7*24*time.Hour {
+		t.Fatalf("retention after restart is %s, want 168h", got)
+	}
+	if got := s2.shardWidth("http"); got != 24*time.Hour {
+		t.Fatalf("shard width after restart is %s, want 24h", got)
+	}
+	// The ingester does not re-declare, so the next write must still be
+	// routed to a droppable shard rather than to "@all".
+	writeSamples(t, s2, "http", []model.Sample{
+		{TSMs: base() + 1000, Fields: map[string]model.Value{"v": model.Int(2)}},
+	})
+	for _, name := range s2.db.Sets() {
+		if strings.HasSuffix(name, "@"+shardAll) {
+			t.Fatalf("a write landed in the unsharded shard that retention skips: %v", s2.db.Sets())
+		}
+	}
+}
+
+// Auxiliary query forms used to return before Validate ran, so a LABELS
+// predicate was never shape-checked: a node carrying two arms of the
+// tagged union executed as whichever arm the lowering reaches first and
+// silently dropped the rest, widening the result.
+func TestLabelsQueryIsValidated(t *testing.T) {
+	s := openTestStore(t)
+	t0 := base()
+	writeSamples(t, s, "http", []model.Sample{
+		{TSMs: t0, Labels: map[string]string{"host": "web1", "dc": "eu"}, Fields: map[string]model.Value{"v": model.Int(1)}},
+		{TSMs: t0 + 1, Labels: map[string]string{"host": "web2", "dc": "us"}, Fields: map[string]model.Value{"v": model.Int(2)}},
+	})
+	q := &mql.Query{Kind: mql.KindLabels, Label: "host", Where: mql.Expr{
+		And: []mql.Expr{{Has: "v"}},
+		Eq:  &mql.Compare{Label: "dc", Value: "eu"},
+	}}
+	_, err := s.Query(context.Background(), &wire.QueryRequest{
+		AST: q, FromMs: t0 - 1000, ToMs: t0 + 1000,
+	})
+	if err == nil {
+		t.Fatal("a predicate node with two arms must be refused, not executed with the rest dropped")
+	}
+	var d mql.Diag
+	if !errors.As(err, &d) || d.Code != "E001" {
+		t.Fatalf("want E001, got %v", err)
+	}
+}
+
+// Two retries of one request that arrive at once must not both write.
+// seen() and record() are separated by the whole write, so the check has
+// to claim the key rather than merely read it.
+func TestConcurrentDuplicateWritesCommitOnce(t *testing.T) {
+	s := openTestStore(t)
+	t0 := base()
+	req := func() *wire.WriteRequest {
+		return &wire.WriteRequest{Batches: []model.Batch{{Set: "http", Samples: []model.Sample{
+			{TSMs: t0, Labels: map[string]string{"host": "web1"}, Fields: map[string]model.Value{"v": model.Int(1)}, KeyHint: "a:1"},
+		}}}}
+	}
+	var wg sync.WaitGroup
+	dupes := make([]bool, 8)
+	for i := range dupes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := s.Write(req(), "same-key", "test")
+			if err != nil {
+				t.Errorf("write: %v", err)
+				return
+			}
+			dupes[i] = resp.Duplicate
+		}(i)
+	}
+	wg.Wait()
+	committed := 0
+	for _, d := range dupes {
+		if !d {
+			committed++
+		}
+	}
+	if committed != 1 {
+		t.Fatalf("%d of %d concurrent retries committed, want exactly 1", committed, len(dupes))
+	}
+}
+
+// A label dictionary is loaded back by the index in each record's name.
+// Re-deriving it from load order meant one missing record shifted every
+// later value onto someone else's index, silently relabelling stored rows.
+func TestDictionaryIndicesSurviveAHole(t *testing.T) {
+	s := openTestStore(t)
+	for _, v := range []string{"web1", "web2", "web3"} {
+		if _, err := s.intern("host", v); err != nil {
+			t.Fatalf("intern %s: %v", v, err)
+		}
+	}
+	idx, ok := s.lookup("host", "web3")
+	if !ok {
+		t.Fatal("web3 was not interned")
+	}
+	// Drop the middle record, as a lost write would.
+	if err := s.db.PutDict(dictEntryKey("host", 1), nil); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	s.dict = map[string]*dictionary{}
+	if err := s.loadDictionaries(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got, ok := s.lookup("host", "web3"); !ok || got != idx {
+		t.Fatalf("web3 moved from index %d to %d (ok=%v) because of a hole", idx, got, ok)
+	}
+	for _, v := range s.LabelValues("host") {
+		if v == "" {
+			t.Fatal("LabelValues reported the empty placeholder left by the hole")
+		}
+	}
+}
+
+// Offset keying derives the row key from the hint instead of the field
+// values. A sample with no hint is keyed by set, timestamp and labels
+// alone, so two records in one millisecond overwrite each other while the
+// response counts both accepted. It must be named, not silently lost.
+func TestOffsetKeyedSampleNeedsAHint(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.Write(&wire.WriteRequest{
+		SetMeta: []wire.SetMeta{{Set: "http", KeyScheme: model.KeyOffset}},
+	}, "", "test"); err != nil {
+		t.Fatalf("set meta: %v", err)
+	}
+	t0 := base()
+	resp, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{Set: "http", Samples: []model.Sample{
+		{TSMs: t0, Fields: map[string]model.Value{"v": model.Int(1)}},
+		{TSMs: t0, Fields: map[string]model.Value{"v": model.Int(2)}, KeyHint: "a:1"},
+	}}}}, "", "test")
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp.Accepted != 1 || len(resp.Rejected) != 1 {
+		t.Fatalf("accepted %d, rejected %+v; the hintless sample must be refused", resp.Accepted, resp.Rejected)
+	}
+	if !strings.Contains(resp.Rejected[0].Reason, "key_hint") {
+		t.Fatalf("rejection does not say why: %q", resp.Rejected[0].Reason)
+	}
 }

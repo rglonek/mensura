@@ -171,7 +171,13 @@ func (s *Sink) endFlush(obs []DeliveryObserver, accepted int, dropped bool) {
 // Add queues one extracted result. It blocks when the batch is full and
 // the store is not keeping up: back-pressure has to reach the reader, or
 // the loss just moves somewhere less visible.
-func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[string]string) error {
+//
+// keyHint identifies the occurrence: the stream plus the byte offset the
+// record was read at. It is what a set keyed by `offset` hashes instead of
+// the field values, so two records that share a millisecond and a label
+// set stay two rows. Passing "" leaves such a set collapsing them into
+// one, which is why every acquisition path supplies one.
+func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[string]string, keyHint string) error {
 	labels := make(map[string]string, len(streamLabels)+len(r.Labels))
 	for k, v := range streamLabels {
 		labels[k] = v
@@ -179,7 +185,7 @@ func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[strin
 	for k, v := range r.Labels {
 		labels[k] = v
 	}
-	sample := model.Sample{TSMs: r.TSMs, Labels: labels, Fields: r.Fields}
+	sample := model.Sample{TSMs: r.TSMs, Labels: labels, Fields: r.Fields, KeyHint: keyHint}
 
 	s.mu.Lock()
 	s.buffers[r.Set] = append(s.buffers[r.Set], sample)

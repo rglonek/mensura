@@ -73,6 +73,19 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	if len(q.Select) == 0 {
 		return nil, Diag{"E001", "query selects no fields"}
 	}
+	// The executor switches on Format with a timeseries default, so an
+	// unrecognised value used to render as a timeseries rather than being
+	// refused: the panel looked right and was the wrong shape.
+	switch q.Format {
+	case "", FormatTimeseries, FormatTable, FormatHeatmap, FormatLogs:
+	default:
+		return nil, Diag{"E008", fmt.Sprintf("unknown format %q: expected timeseries, table, heatmap or logs", q.Format)}
+	}
+	// EVERY is a window width; a non-positive one is not a narrower
+	// window, it is a window the walk cannot form.
+	if q.EveryMs != nil && *q.EveryMs <= 0 {
+		return nil, Diag{"E007", fmt.Sprintf("EVERY %dms must be positive", *q.EveryMs)}
+	}
 
 	names := map[string]bool{}
 	for _, fe := range q.Select {
@@ -111,6 +124,32 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			}
 			if fe.Modifiers.GapMs == nil && info.MaxInterval == 0 && q.Format == FormatTimeseries {
 				warns = append(warns, Diag{"W103", fmt.Sprintf("field %q has no GAP and no declared cadence; outages will render as continuous lines", fe.Field)})
+			}
+		}
+		if fe.Modifiers.GapMs != nil && *fe.Modifiers.GapMs < 0 {
+			return nil, Diag{"E007", fmt.Sprintf("field %q: GAP must not be negative", fe.Field)}
+		}
+		if m := fe.Modifiers.SSE; m != nil {
+			// The render layer falls back to the constant mode for an
+			// unrecognised name, so a typo silently changed what the
+			// padding means.
+			switch m.Mode {
+			case "", "const", "repeat", "off":
+			default:
+				return nil, Diag{"E008", fmt.Sprintf("field %q: unknown SSE mode %q (const, repeat or off)", fe.Field, m.Mode)}
+			}
+		}
+		if c := fe.Modifiers.Clamp; c != nil {
+			if c.Min == nil && c.Max == nil {
+				return nil, Diag{"E007", fmt.Sprintf("field %q: CLAMP needs at least one of MIN or MAX", fe.Field)}
+			}
+			if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
+				return nil, Diag{"E007", fmt.Sprintf("field %q: CLAMP MIN %g is above MAX %g", fe.Field, *c.Min, *c.Max)}
+			}
+			switch c.Else {
+			case "", "raw", "bound":
+			default:
+				return nil, Diag{"E008", fmt.Sprintf("field %q: unknown CLAMP ELSE %q (raw or bound)", fe.Field, c.Else)}
 			}
 		}
 		if q.Format == FormatTable || q.Format == FormatLogs {

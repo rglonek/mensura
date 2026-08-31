@@ -30,6 +30,28 @@ type Spec struct {
 	path string
 }
 
+// merge fills in what this Defaults block left unset from an included
+// one. Label lists are unioned, because a label declared by a base is
+// still a label.
+func (d *Defaults) merge(other Defaults) {
+	if d.Timestamp.Timezone == "" {
+		d.Timestamp.Timezone = other.Timestamp.Timezone
+	}
+	if d.Timestamp.AssumeYear == "" {
+		d.Timestamp.AssumeYear = other.Timestamp.AssumeYear
+	}
+	have := make(map[string]struct{}, len(d.Labels))
+	for _, l := range d.Labels {
+		have[l] = struct{}{}
+	}
+	for _, l := range other.Labels {
+		if _, ok := have[l]; !ok {
+			have[l] = struct{}{}
+			d.Labels = append(d.Labels, l)
+		}
+	}
+}
+
 type Defaults struct {
 	Timestamp struct {
 		Timezone   string `yaml:"timezone"`
@@ -262,6 +284,13 @@ func load(path string, stack map[string]bool, done map[string]bool) (*Spec, erro
 		}
 		s.Profiles = append(s.Profiles, sub.Profiles...)
 		s.Identity = append(s.Identity, sub.Identity...)
+		// Defaults travel with an include too. They used to be dropped,
+		// so a base spec holding the timezone, the year assumption or the
+		// shared label list was read, compiled and silently ignored: the
+		// including file's own defaults (usually none, meaning UTC) won
+		// by default rather than by choice. The includer still wins where
+		// it declared something itself.
+		s.Defaults.merge(sub.Defaults)
 		if s.Sets == nil {
 			s.Sets = map[string]SetOpt{}
 		}

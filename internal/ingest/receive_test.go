@@ -75,3 +75,21 @@ func TestParseLineProtocolEscaping(t *testing.T) {
 		t.Fatalf("escaping: %+v", s.Labels)
 	}
 }
+
+// The label section is positional, so a sample carrying no labels of its
+// own needs a way to say so: an empty section split into one malformed
+// pair and the whole line was refused.
+func TestParseLineProtocolAcceptsNoLabels(t *testing.T) {
+	for _, line := range []string{"cpu - used=3 1756382400000", "cpu  used=3 1756382400000"} {
+		set, s, err := ParseLineProtocol(line, time.Now())
+		if err != nil {
+			t.Fatalf("%q: %v", line, err)
+		}
+		if set != "cpu" || len(s.Labels) != 0 {
+			t.Fatalf("%q: set %q labels %v", line, set, s.Labels)
+		}
+		if v, ok := s.Fields["used"]; !ok || v.I != 3 {
+			t.Fatalf("%q: fields %v", line, s.Fields)
+		}
+	}
+}
