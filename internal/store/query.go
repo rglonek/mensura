@@ -32,7 +32,7 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	case mql.KindLabelKeys:
 		return s.queryLabelKeys(q.From), nil
 	case mql.KindLabels:
-		return s.queryLabelValues(q.Label), nil
+		return s.queryLabelValues(ctx, q, req)
 	}
 
 	// The datasource ceilings, with a disabled gate expressed as 0. The
@@ -88,7 +88,7 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	case mql.FormatTable, mql.FormatLogs:
 		err = s.runTabular(ctx, q, req, plan, resp)
 	case mql.FormatHeatmap:
-		err = s.runHeatmap(ctx, q, req, plan, resp)
+		err = s.runHeatmap(ctx, q, req, plan, resp, maxSeries, maxPointsIn)
 	default:
 		err = s.runTimeseries(ctx, q, req, plan, resp, maxSeries, maxPointsIn)
 	}
@@ -119,6 +119,10 @@ type queryPlan struct {
 	projection []string
 	fields     []resolvedField
 	impossible bool
+	// reverse walks the range newest-first, which is what a logs view
+	// wants: reading forward to a LIMIT returns the oldest matches in the
+	// range and never the most recent ones.
+	reverse bool
 }
 
 // resolvedField is one selected field with its modifiers resolved against
@@ -135,6 +139,7 @@ func (s *Store) plan(q *mql.Query, req *wire.QueryRequest) (*queryPlan, []mql.Di
 	var warns []mql.Diag
 
 	p.shards = s.shardsFor(q.From, req.FromMs, req.ToMs)
+	p.reverse = q.Format == mql.FormatLogs
 
 	proj := map[string]struct{}{model.TimestampField: {}}
 	for _, l := range q.By {
@@ -395,7 +400,7 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 	var gateErr string
 	points := 0
 
-	err := s.scan(ctx, p, req, func(row engine.Row) bool {
+	err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
 		ts, ok := row[model.TimestampField].AsInt()
 		if !ok {
 			return true
@@ -473,7 +478,7 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 // runHeatmap sums bucket counts per window. Extremes are the right summary
 // for a line; a heatmap wants totals, so this path aggregates rather than
 // running the min/max walk.
-func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryRequest, p *queryPlan, resp *wire.QueryResponse) error {
+func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryRequest, p *queryPlan, resp *wire.QueryResponse, maxSeries, maxPoints int) error {
 	if len(q.Select) == 0 {
 		return fmt.Errorf("query: FORMAT heatmap requires HISTOGRAM(<bucket set>)")
 	}
@@ -502,8 +507,15 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	}
 	sums := map[key]map[int64]float64{}
 	groups := map[string]map[string]string{}
+	// The heatmap path used to accumulate without any bound, so the two
+	// datasource ceilings that stop a busy dashboard from turning into an
+	// out-of-memory kill applied to timeseries queries and not to this
+	// one. A group x bucket pair is a series; a distinct window inside one
+	// is a point.
+	var gateErr string
+	points := 0
 
-	err := s.scan(ctx, p, req, func(row engine.Row) bool {
+	err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
 		ts, ok := row[model.TimestampField].AsInt()
 		if !ok {
 			return true
@@ -525,10 +537,23 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 				continue
 			}
 			k := key{g, bi}
-			if sums[k] == nil {
-				sums[k] = map[int64]float64{}
+			cell, live := sums[k]
+			if !live {
+				if maxSeries > 0 && len(sums) >= maxSeries {
+					gateErr = "too many series for one heatmap; add filters or reduce BY"
+					return false
+				}
+				cell = map[int64]float64{}
+				sums[k] = cell
 			}
-			sums[k][bucketTs] += fv
+			if _, seen := cell[bucketTs]; !seen {
+				points++
+				if maxPoints > 0 && points > maxPoints {
+					gateErr = "too many datapoints received; zoom in or add filters"
+					return false
+				}
+			}
+			cell[bucketTs] += fv
 		}
 		return true
 	})
@@ -567,6 +592,11 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		resp.Series = append(resp.Series, ser)
 	}
 	resp.Stats.SeriesCount = len(resp.Series)
+	if gateErr != "" {
+		resp.Error = gateErr
+		resp.Stats.Truncated = true
+		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
+	}
 	return nil
 }
 
@@ -585,6 +615,15 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	if q.Limits.Points != nil {
 		limit = *q.Limits.Points
 	}
+	// Validate rejects a non-positive LIMIT, but this is the value that
+	// becomes a slice bound below and it is reached by any caller that
+	// builds a wire.QueryRequest directly, so it is clamped here too
+	// rather than trusted. rows[:-1] panics, and in plugin mode that
+	// panic is not recovered: it takes down the process that owns the
+	// data directory.
+	if limit < 0 {
+		limit = 0
+	}
 	resp.Columns = append(resp.Columns, wire.Column{Name: "time", Type: "time"})
 	for _, l := range q.By {
 		resp.Columns = append(resp.Columns, wire.Column{Name: l, Type: "string"})
@@ -602,7 +641,7 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		vals []any
 	}
 	var rows []tsRow
-	err := s.scan(ctx, p, req, func(row engine.Row) bool {
+	err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
 		ts, ok := row[model.TimestampField].AsInt()
 		if !ok {
 			return true
@@ -637,11 +676,14 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	if err != nil {
 		return err
 	}
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
-	if len(rows) > limit {
+	// The scan stops one row past the limit, so an extra row is the signal
+	// that the range held more than was asked for.
+	truncated := len(rows) > limit
+	if truncated {
 		rows = rows[:limit]
-		resp.Stats.Truncated = true
 	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
+	resp.Stats.Truncated = truncated
 	for _, r := range rows {
 		resp.Rows = append(resp.Rows, wire.Row{Values: r.vals})
 	}
@@ -650,11 +692,25 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 
 // scan walks every shard the plan selected, honouring the request context
 // so a client disconnect unwinds iteration rather than finishing it.
-func (s *Store) scan(ctx context.Context, p *queryPlan, req *wire.QueryRequest, visit func(engine.Row) bool) error {
-	for _, shard := range p.shards {
+//
+// stats, when non-nil, accumulates what the scan touched. Those two
+// numbers are part of the query response and used to be left at zero on
+// every query.
+func (s *Store) scan(ctx context.Context, p *queryPlan, req *wire.QueryRequest, stats *wire.QueryStats, visit func(engine.Row) bool) error {
+	shards := p.shards
+	if p.reverse {
+		// Newest shard first, so a bounded newest-first scan can stop
+		// without reading the whole range.
+		shards = make([]string, len(p.shards))
+		for i, name := range p.shards {
+			shards[len(p.shards)-1-i] = name
+		}
+	}
+	for _, shard := range shards {
 		q := s.db.Query(shard).
 			Between(model.TimestampField, req.FromMs, req.ToMs).
-			Project(p.projection...)
+			Project(p.projection...).
+			Reverse(p.reverse)
 		if p.expr != nil {
 			q = q.Where(p.expr)
 		}
@@ -665,9 +721,15 @@ func (s *Store) scan(ctx context.Context, p *queryPlan, req *wire.QueryRequest, 
 		if err != nil {
 			return err
 		}
+		if stats != nil {
+			stats.ShardsScanned++
+		}
 		stop := false
 		for it.Next() {
 			_, row := it.Record()
+			if stats != nil {
+				stats.RowsScanned++
+			}
 			if !visit(row) {
 				stop = true
 				break
@@ -783,12 +845,89 @@ func (s *Store) queryLabelKeys(set string) *wire.QueryResponse {
 	return resp
 }
 
-func (s *Store) queryLabelValues(key string) *wire.QueryResponse {
+// queryLabelValues backs `LABELS <key> [WHERE <predicate>]`.
+//
+// Without a filter this is a plain dictionary read. With one it is the
+// filter scan that 06-query.md section 5 describes: the distinct values
+// of the key among rows that match, across every set carrying that label
+// and inside the request's time range. The predicate used to be parsed,
+// stored in the AST, printed back — and then silently dropped here, so a
+// dashboard variable written as `LABELS host WHERE dc = "eu-west-1"`
+// returned the hosts of every datacentre.
+func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.QueryRequest) (*wire.QueryResponse, error) {
 	resp := &wire.QueryResponse{Columns: []wire.Column{{Name: "value", Type: "string"}}}
-	for _, v := range s.LabelValues(key) {
+	if q.Where.Empty() {
+		for _, v := range s.LabelValues(q.Label) {
+			resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
+		}
+		return resp, nil
+	}
+
+	// A filter scan costs what a query costs, so it takes a job slot.
+	select {
+	case s.jobs <- struct{}{}:
+		defer func() { <-s.jobs }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	seen := map[string]struct{}{}
+	for _, set := range s.setsWithLabel(q.Label) {
+		proj := map[string]struct{}{model.TimestampField: {}, q.Label: {}}
+		expr, warns, impossible := s.buildExpr(set, q.Where, proj)
+		resp.Warnings = append(resp.Warnings, warns...)
+		if impossible {
+			continue
+		}
+		p := &queryPlan{
+			shards: s.shardsFor(set, req.FromMs, req.ToMs),
+			expr:   expr,
+		}
+		for c := range proj {
+			p.projection = append(p.projection, c)
+		}
+		sort.Strings(p.projection)
+		err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
+			v, ok := row[q.Label]
+			if !ok {
+				return true
+			}
+			idx, ok := v.AsInt()
+			if !ok {
+				return true
+			}
+			if str, ok := s.labelValue(q.Label, int32(idx)); ok {
+				seen[str] = struct{}{}
+			}
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	for _, v := range out {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
 	}
-	return resp
+	return resp, nil
+}
+
+// setsWithLabel lists the sets whose catalogue entry carries a label key.
+func (s *Store) setsWithLabel(key string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for name, e := range s.catalogue {
+		if _, ok := e.Labels[key]; ok {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Explain reports the plan a query would run, which is what the builder's

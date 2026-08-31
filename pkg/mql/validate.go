@@ -53,7 +53,13 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		return nil, nil
 	}
 	if q.Kind == KindLabels {
-		return nil, nil
+		if q.Label == "" {
+			return nil, Diag{"E002", "LABELS needs a label key"}
+		}
+		// The optional filter is a real predicate (06-query.md section 5),
+		// so it is shape-checked here even though it carries no FROM set
+		// to resolve label names against.
+		return nil, validateExpr(q, q.Where, nil, &warns)
 	}
 	if q.From == "" {
 		return nil, Diag{"E002", "query has no FROM set"}
@@ -123,6 +129,16 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			warns = append(warns, Diag{"W203", fmt.Sprintf("label %q is not present on set %q; every series will share one group", l, q.From)})
 		}
 	}
+	// A limit is checked at both ends. Only the upper end used to be, and
+	// a negative LIMIT POINTS reached the tabular executor as a slice
+	// bound: rows[:-1] panics, which in plugin mode takes down the process
+	// that owns the data directory.
+	if q.Limits.Series != nil && *q.Limits.Series <= 0 {
+		return warns, Diag{"E007", fmt.Sprintf("LIMIT SERIES %d must be positive", *q.Limits.Series)}
+	}
+	if q.Limits.Points != nil && *q.Limits.Points <= 0 {
+		return warns, Diag{"E007", fmt.Sprintf("LIMIT POINTS %d must be positive", *q.Limits.Points)}
+	}
 	if q.Limits.Series != nil && maxSeries > 0 && *q.Limits.Series > maxSeries {
 		return warns, Diag{"E007", fmt.Sprintf("LIMIT SERIES %d exceeds the datasource maximum of %d", *q.Limits.Series, maxSeries)}
 	}
@@ -135,13 +151,40 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 				return warns, Diag{"E008", "FORMAT heatmap requires HISTOGRAM(<bucket set>)"}
 			}
 		}
+		// The executor renders the first bucket set only. Accepting more
+		// and drawing one is worse than refusing: the panel looks right
+		// and is missing a series family.
+		if len(q.Select) > 1 {
+			return warns, Diag{"E008", "FORMAT heatmap renders one HISTOGRAM; select a single bucket set"}
+		}
 	}
 	return warns, nil
+}
+
+// arms counts how many of the mutually exclusive fields of an Expr node
+// are populated. The JSON form is documented as a tagged union, but
+// nothing used to enforce it: a node carrying both "and" and "eq"
+// validated the "eq" here and then executed without it, because the
+// lowering in the store takes the first arm of a priority switch.
+func arms(e Expr) int {
+	n := 0
+	for _, set := range []bool{
+		len(e.And) > 0, len(e.Or) > 0, e.Not != nil, e.Eq != nil, e.Ne != nil,
+		e.In != nil, e.Match != nil, e.NoMatch != nil, e.Has != "", e.Missing != "",
+	} {
+		if set {
+			n++
+		}
+	}
+	return n
 }
 
 func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 	if e.Empty() {
 		return nil
+	}
+	if n := arms(e); n > 1 {
+		return Diag{"E001", fmt.Sprintf("predicate node sets %d fields; exactly one of and|or|not|eq|ne|in|match|noMatch|has|missing is allowed", n)}
 	}
 	for _, sub := range e.And {
 		if err := validateExpr(q, sub, s, warns); err != nil {
@@ -159,7 +202,7 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 	}
 	check := func(label string) error {
-		if s != nil && !s.HasLabel(q.From, label) {
+		if s != nil && q.From != "" && !s.HasLabel(q.From, label) {
 			return Diag{"E004", fmt.Sprintf("unknown label %q on set %q", label, q.From)}
 		}
 		return nil

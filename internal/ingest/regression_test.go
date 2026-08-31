@@ -101,7 +101,22 @@ func TestFollowStillDetectsARewriteInPlace(t *testing.T) {
 			t.Fatalf("truncate: %v", err)
 		}
 		appendLines(t, path, 100, 130)
-		if !waitFor(t, 5*time.Second, func() bool { return rs.counts()[129] > 0 }) {
+		// Wait for every rewritten line, not just the last one. A poll
+		// that seeks with the pre-truncate offset can read a fragment
+		// from the middle of the new file and deliver the tail first;
+		// the rewrite is detected on the following poll, which re-reads
+		// from the start. Waiting only for the highest line number
+		// sampled that intermediate state and then cancelled before the
+		// corrective pass, which is what this test exists to observe.
+		if !waitFor(t, 5*time.Second, func() bool {
+			counts := rs.counts()
+			for i := int64(100); i < 130; i++ {
+				if counts[i] == 0 {
+					return false
+				}
+			}
+			return true
+		}) {
 			t.Fatalf("post-rewrite lines never arrived")
 		}
 	})

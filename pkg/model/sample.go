@@ -11,6 +11,22 @@ import (
 // row. Specs may not produce a field with this name.
 const TimestampField = "timestamp"
 
+// MaxTSMs is the largest accepted epoch-millisecond timestamp:
+// 9999-12-31T23:59:59.999Z.
+//
+// The bound is not cosmetic. The store routes a row to a time shard whose
+// name carries a "20060102" or "2006010215" stamp, and it recovers a
+// shard's time range by parsing that stamp back. A timestamp past year
+// 9999 formats to a wider stamp that the parser rejects, so the shard
+// becomes invisible to every query, to the catalogue and to retention:
+// the rows are accepted, never readable, and never reclaimed. Refusing
+// the sample is the only outcome that stays honest.
+//
+// The realistic source of such a value is not an attack but a unit
+// mismatch — a spec declaring epoch_ms against a source emitting
+// nanoseconds, or a line-protocol sender doing the same.
+const MaxTSMs int64 = 253402300799999
+
 // KeyScheme selects how a row's primary key is derived. See
 // docs/design/04-wire-protocol.md section 6.
 type KeyScheme string
@@ -48,6 +64,9 @@ var ErrNoFields = errors.New("sample carries no fields")
 func (s *Sample) Validate() error {
 	if s.TSMs <= 0 {
 		return errors.New("sample timestamp must be a positive epoch-millisecond value")
+	}
+	if s.TSMs > MaxTSMs {
+		return fmt.Errorf("sample timestamp %d is beyond %d (9999-12-31T23:59:59.999Z); a value this large is usually epoch nanoseconds or microseconds declared as milliseconds", s.TSMs, MaxTSMs)
 	}
 	if len(s.Fields) == 0 {
 		return ErrNoFields

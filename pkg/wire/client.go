@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -73,8 +74,24 @@ func (c *Client) Write(ctx context.Context, req *WriteRequest) (*WriteResponse, 
 	sum := xxh3.Hash128(body).Bytes()
 	key := hex.EncodeToString(sum[:])
 
+	// Compress once, not once per attempt: the payload is identical on
+	// every retry, and re-gzipping a multi-megabyte batch on each pass
+	// spends CPU precisely when the store is already struggling.
+	payload, encoding := body, ""
+	if c.Compress {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(body); err != nil {
+			return nil, err
+		}
+		if err := zw.Close(); err != nil {
+			return nil, err
+		}
+		payload, encoding = buf.Bytes(), "gzip"
+	}
+
 	for attempt := 0; ; attempt++ {
-		resp, err := c.postWrite(ctx, body, key)
+		resp, err := c.postWrite(ctx, payload, encoding, key)
 		if err == nil {
 			return resp, nil
 		}
@@ -84,7 +101,7 @@ func (c *Client) Write(ctx context.Context, req *WriteRequest) (*WriteResponse, 
 		}
 		delay := retry.After
 		if delay <= 0 {
-			delay = time.Duration(1<<uint(attempt)) * 200 * time.Millisecond
+			delay = backoff(attempt)
 		}
 		delay += time.Duration(c.jitter(int64(delay / 4)))
 		select {
@@ -93,6 +110,22 @@ func (c *Client) Write(ctx context.Context, req *WriteRequest) (*WriteResponse, 
 		case <-time.After(delay):
 		}
 	}
+}
+
+// maxBackoff caps the exponential delay. The shift is also bounded: at
+// attempt 63 the multiplication overflows int64 and the delay flips
+// negative, which turns backoff into a spin.
+const maxBackoff = 30 * time.Second
+
+func backoff(attempt int) time.Duration {
+	if attempt > 16 {
+		attempt = 16
+	}
+	d := time.Duration(1<<uint(attempt)) * 200 * time.Millisecond
+	if d > maxBackoff || d <= 0 {
+		d = maxBackoff
+	}
+	return d
 }
 
 func (c *Client) jitter(n int64) int64 {
@@ -105,20 +138,7 @@ func (c *Client) jitter(n int64) int64 {
 	return rand.Int63n(n)
 }
 
-func (c *Client) postWrite(ctx context.Context, body []byte, idempotencyKey string) (*WriteResponse, error) {
-	payload := body
-	encoding := ""
-	if c.Compress {
-		var buf bytes.Buffer
-		zw := gzip.NewWriter(&buf)
-		if _, err := zw.Write(body); err != nil {
-			return nil, err
-		}
-		if err := zw.Close(); err != nil {
-			return nil, err
-		}
-		payload, encoding = buf.Bytes(), "gzip"
-	}
+func (c *Client) postWrite(ctx context.Context, payload []byte, encoding, idempotencyKey string) (*WriteResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/write", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -136,7 +156,12 @@ func (c *Client) postWrite(ctx context.Context, body []byte, idempotencyKey stri
 		// A connection-level failure is always worth retrying.
 		return nil, &ErrRetryable{Status: 0, Msg: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain before closing, or a body larger than the read limit
+		// leaves the connection unreusable and the pool churns.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+	}()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
@@ -240,13 +265,25 @@ func apiMessage(body []byte) string {
 	return string(body)
 }
 
+// retryAfter reads both forms RFC 9110 allows for the header: a
+// delta-seconds count and an HTTP date. Only the first used to be
+// understood, so a store that answered with a date was retried on the
+// client's own backoff instead of when it asked to be.
 func retryAfter(resp *http.Response) time.Duration {
-	v := resp.Header.Get("Retry-After")
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
 	if v == "" {
 		return 0
 	}
 	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
 		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
 	}
 	return 0
 }

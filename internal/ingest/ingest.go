@@ -5,6 +5,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -133,8 +134,11 @@ func (i *Ingest) Batch(ctx context.Context, sources []string) error {
 	return firstErr
 }
 
-// resolve expands sources into a list of readable files, unpacking
-// archives into a working directory as it goes.
+// resolve expands sources into a list of readable files: globs,
+// directories walked recursively, and plain paths.
+//
+// It does not unpack archives. It never did; the comment that said it did
+// was describing 02-ingest.md section 4.1 rather than this code.
 func (i *Ingest) resolve(sources []string) ([]string, error) {
 	var out []string
 	for _, src := range sources {
@@ -174,22 +178,47 @@ func (i *Ingest) resolve(sources []string) ([]string, error) {
 	return out, nil
 }
 
-// openRecords opens a file, transparently decompressing it, and returns a
-// reader over its records.
+// errArchive names a container format that holds several files. Reading
+// one as a record stream is not a degraded result, it is a wrong one.
+var errArchive = errors.New("ingest: archive members are not unpacked")
+
+// isArchive reports whether a path names a multi-file container.
+//
+// A .tgz is a tar inside a gzip, not a compressed log. Decompressing it
+// and handing the result to the line scanner fed tar headers -- file
+// names, modes, padding -- to the extractor as if they were log records,
+// which produces samples rather than an error and quietly poisons the
+// match rate. Nested archive walking is listed as unimplemented in
+// docs/design/12-implementation.md, so the honest behaviour is to say so.
+func isArchive(path string) bool {
+	lower := strings.ToLower(path)
+	for _, suffix := range []string{".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.zst", ".tar.xz", ".zip"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// openRecords opens a file, transparently decompressing single-file
+// gzip and bzip2 streams, and returns a reader over its records.
 func openRecords(path string) (io.ReadCloser, error) {
+	if isArchive(path) {
+		return nil, fmt.Errorf("%w: unpack %s and point --source at its contents", errArchive, path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case strings.HasSuffix(path, ".gz"), strings.HasSuffix(path, ".tgz"):
+	if strings.HasSuffix(strings.ToLower(path), ".gz") {
 		zr, err := gzip.NewReader(f)
 		if err != nil {
 			_ = f.Close()
 			return nil, err
 		}
 		return readCloser{zr, func() error { zr.Close(); return f.Close() }}, nil
-	case strings.HasSuffix(path, ".bz2"):
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".bz2") {
 		return readCloser{bzip2.NewReader(f), f.Close}, nil
 	}
 	return f, nil
@@ -204,6 +233,15 @@ func (r readCloser) Close() error { return r.closeFn() }
 
 // processFile parses one file start to finish.
 func (i *Ingest) processFile(ctx context.Context, path string) error {
+	// Checked before sniffing. A tar stream is compressed binary, so the
+	// NUL test below would classify it as binary and skip it with no
+	// explanation -- which is safe but leaves the operator staring at an
+	// import that read nothing and said nothing about why.
+	if isArchive(path) {
+		i.cfg.Progress.SkipArchive(path)
+		i.cfg.Log.Printf("WARNING %s is an archive; members are not unpacked. Extract it and point --source at its contents", path)
+		return nil
+	}
 	head, mtime, err := peek(path, 64<<10)
 	if err != nil {
 		return err
@@ -233,26 +271,37 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 	}
 	defer rc.Close()
 
-	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 0, 64<<10), i.cfg.ReadBufferBytes)
-	for sc.Scan() {
+	// bufio.Scanner would fail the whole file with ErrTooLong on one
+	// over-long line and abandon everything after it. A record longer than
+	// the cap is a spec or source problem worth reporting, but it is not a
+	// reason to stop importing the rest of the file.
+	br := bufio.NewReaderSize(rc, 64<<10)
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		line := sc.Text()
-		i.cfg.Progress.AddBytes(int64(len(line) + 1))
-		results, err := stream.Process(line)
-		i.recordOutcome(err)
-		for _, r := range results {
-			if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
-				return err
+		rec, rerr := readRecord(br, i.cfg.ReadBufferBytes)
+		if len(rec.Line) > 0 || rec.Terminated {
+			if rec.Oversize {
+				i.cfg.Progress.OversizeRecord()
+			}
+			i.cfg.Progress.AddBytes(int64(rec.Consumed))
+			results, err := stream.Process(string(rec.Line))
+			i.recordOutcome(err)
+			for _, r := range results {
+				if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return rerr
+		}
 	}
 	for _, r := range stream.Flush() {
 		if err := i.cfg.Sink.Add(ctx, r, labels); err != nil {
@@ -317,14 +366,14 @@ func peek(path string, n int) ([]byte, time.Time, error) {
 	// as binary and skipped, making the bzip2 reader below unreachable.
 	var r io.Reader = f
 	switch {
-	case strings.HasSuffix(path, ".gz"), strings.HasSuffix(path, ".tgz"):
+	case strings.HasSuffix(strings.ToLower(path), ".gz"):
 		zr, err := gzip.NewReader(f)
 		if err != nil {
 			return nil, info.ModTime(), nil
 		}
 		defer zr.Close()
 		r = zr
-	case strings.HasSuffix(path, ".bz2"):
+	case strings.HasSuffix(strings.ToLower(path), ".bz2"):
 		r = bzip2.NewReader(f)
 	}
 	buf := make([]byte, n)

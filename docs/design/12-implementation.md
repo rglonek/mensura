@@ -124,7 +124,7 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Plugin frontend: React builder, Monaco code mode, variable editor, packaging and signing | **not implemented** (M3/M6) |
 | Protobuf wire encoding, zstd | **not implemented**: v1 speaks JSON with gzip (§6.1) |
 | mTLS, per-client rate limits | **not implemented**: bearer auth and server TLS only; back-pressure is by write-slot shedding (§6.2) |
-| S3, SFTP and HTTP batch sources; nested archive unpacking | **not implemented**: local files, directories, globs, and single-file gzip/bzip2 (§6.3) |
+| S3, SFTP and HTTP batch sources; nested archive unpacking | **not implemented**: local files, directories, globs, and single-file gzip/bzip2 (§6.3). A `.tar`/`.tgz`/`.zip` source is refused with an explanation rather than read as one stream |
 | Percentile estimation from bucket sets, `AGGREGATE … BY` | **not implemented** (M5) |
 | Streaming live tail, annotations, dashboard library, dashboard converter | **not implemented** (M6) |
 | Spec reload on SIGHUP | **not implemented** (M4 remainder) |
@@ -132,6 +132,30 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 ## 6. Divergences from documents 01–11
 
 Each entry states what the design says, what the code does, and why.
+
+### 6.0 The label dictionary is global per key, not per set
+
+[05](05-storage.md) §8 describes `_mensura_labels` as "one row per label key:
+the ordered dictionary of its values", and [ADR-004](10-decisions.md) makes
+the store the single writer of that dictionary. The implementation matches
+that: `store.dict` is keyed on the label key alone, across every set.
+
+This is a design property rather than a defect, but it has consequences worth
+stating, because they are visible to operators:
+
+- `MaxLabelCardinality` is one budget per label key for the whole store, so a
+  high-cardinality set can consume the budget another set relies on.
+- `GET /v1/labels?key=host` and the builder's label-value autocomplete return
+  the values of `host` seen anywhere, not only in the set being queried.
+  `LABELS host WHERE …` narrows this by scanning, and is the form to use when
+  the answer must be set-scoped.
+- A `WHERE` clause lowered against the dictionary may resolve values that
+  cannot occur in the queried set. Results stay correct — a row can only carry
+  the index it was written with — but a "matches no value" warning is
+  store-wide rather than set-wide.
+
+Making the dictionary per set would change the meaning of every index already
+written to disk, so it is a storage-version migration and not a local fix.
 
 ### 6.1 The wire encoding is JSON, not protobuf
 
@@ -175,8 +199,16 @@ additionally rejects any non-loopback peer at request time.
 
 [02](02-ingest.md) §4.1 lists S3, SFTP, HTTP and nested-archive sources. The
 implementation resolves local files, directories and globs, and decompresses
-single-file `.gz`, `.tgz` and `.bz2` streams. Nested `tar`/`zip` walking and
-remote object stores are not implemented.
+single-file `.gz` and `.bz2` streams. Nested `tar`/`zip` walking and remote
+object stores are not implemented.
+
+A tar-bearing extension (`.tar`, `.tgz`, `.tar.gz`, `.tar.bz2`, `.tar.zst`,
+`.tar.xz`, `.zip`) is **refused with an explanation**. It used to be
+decompressed and handed to the line scanner, which fed tar headers — member
+names, modes, padding — to the extractor as if they were log records. That
+produces samples rather than an error, so an unpacked-looking import quietly
+carried garbage and a misleading match rate. Refusing is the honest
+behaviour until the walker exists.
 
 *Why*: the acquisition interface takes a list of readable paths, so a source
 is a small adapter in front of it. Getting the pipeline, rotation and delivery
