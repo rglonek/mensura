@@ -129,7 +129,17 @@ type tailer struct {
 	// flight. Once that has happened the resume offset may never move
 	// again for this tailer: a checkpoint is a single offset, so
 	// advancing it past the gap would bury the lost records for good.
+	//
+	// It is cleared by the first flush that succeeds afterwards, which
+	// sets rewind so the poll goroutine re-reads from the frozen offset.
+	// The freeze itself is the right policy; leaving a process restart as
+	// its only exit was not, because a few seconds of store unavailability
+	// then stopped checkpointing every followed file until someone noticed.
 	holed bool
+	// rewind asks the poll goroutine to seek back to acked and re-read.
+	// It is set on the flush goroutine and consumed on the poll one,
+	// which is the goroutine that owns offset and file.
+	rewind bool
 }
 
 func (t *tailer) setPending(n int64) {
@@ -187,6 +197,46 @@ func (t *tailer) markHoled() bool {
 	return true
 }
 
+// clearHole releases a frozen tailer once delivery is demonstrably working
+// again, and reports the offset to re-read from.
+//
+// A successful flush is the signal, rather than a timer: it proves the
+// store is accepting writes, and it cannot fire while the sink is still
+// failing, so this can never spin. Nothing past the hole is acknowledged
+// on the way out -- pending and inflight are pulled back to acked -- so
+// the re-read starts exactly where the lost batch did. This is what a
+// restart does, without the restart.
+func (t *tailer) clearHole() (int64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.holed {
+		return 0, false
+	}
+	t.holed = false
+	t.pending, t.inflight = t.acked, t.acked
+	t.rewind = true
+	return t.acked, true
+}
+
+// rewindOwed reports whether a seek back to the acked offset is pending.
+func (t *tailer) rewindOwed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rewind
+}
+
+// takeRewind reports whether the poll goroutine owes this tailer a seek
+// back to the acked offset, and clears the request.
+func (t *tailer) takeRewind() (int64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.rewind {
+		return 0, false
+	}
+	t.rewind = false
+	return t.acked, true
+}
+
 // checkpointSnapshot copies the checkpoint under the lock. The flush
 // goroutine writes these same fields in commitInflight and
 // setFingerprint, so copying the struct without the lock is a race.
@@ -208,6 +258,9 @@ func (t *tailer) setFingerprint(fp string, width int) {
 func (t *tailer) reset(to int64) {
 	t.mu.Lock()
 	t.pending, t.inflight, t.acked = to, to, to
+	// A rotation replaces the bytes the hole was in, so there is nothing
+	// left to protect by staying frozen, and no rewind left to owe.
+	t.holed, t.rewind = false, false
 	t.mu.Unlock()
 	t.offset = to
 }
@@ -240,6 +293,7 @@ func (f *follower) poll(ctx context.Context) error {
 		if t == nil {
 			continue
 		}
+		f.applyRewind(t)
 		// Rotation is checked before reading: a copytruncate followed
 		// quickly by fresh appends can restore the size, so "smaller than
 		// our offset" is not a reliable test on its own.
@@ -366,6 +420,13 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 	max := f.opts.MaxRecordBytes
 	r := bufio.NewReaderSize(t.file, 64<<10)
 	for {
+		// A hole that cleared while this loop was running invalidates the
+		// position it is reading at. Carrying on would advance pending
+		// past the very bytes the rewind exists to re-read, and the next
+		// commit would acknowledge them. The next poll re-seeks.
+		if t.rewindOwed() {
+			return nil
+		}
 		rec, err := readRecord(r, max)
 		oversizeUnterminated := false
 		if !rec.Terminated {
@@ -418,6 +479,26 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 			return err
 		}
 	}
+}
+
+// applyRewind seeks a thawed tailer back to its frozen offset.
+//
+// The extractor's buffered state -- an open multiline record, a
+// half-filled aggregation window -- is discarded rather than flushed: it
+// was built from the bytes that are about to be read again, so delivering
+// it would emit each of those records twice. This is what a restart does
+// with the same state.
+func (f *follower) applyRewind(t *tailer) {
+	at, ok := t.takeRewind()
+	if !ok {
+		return
+	}
+	_ = t.ex.Flush()
+	// reset, not a bare offset assignment: the read loop may have pushed
+	// pending forward between the hole clearing and this seek, and a
+	// pending that sits past the rewind point is exactly what would let a
+	// later commit acknowledge the re-read bytes without reading them.
+	t.reset(at)
 }
 
 func (f *follower) atEOF(t *tailer) error {
@@ -555,7 +636,7 @@ func (f *follower) EndFlush(_ int, dropped bool) {
 	if dropped {
 		for _, t := range tailers {
 			if t.markHoled() {
-				f.ing.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; restart to re-read from there",
+				f.ing.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; it will be re-read from there once delivery recovers",
 					t.path, t.ackedOffset())
 			}
 		}
@@ -563,6 +644,12 @@ func (f *follower) EndFlush(_ int, dropped bool) {
 	}
 	now := time.Now().Unix()
 	for _, t := range tailers {
+		// Delivery is working again, so a tailer frozen by an earlier
+		// hole is released and asked to re-read from where it froze.
+		if at, thawed := t.clearHole(); thawed {
+			f.ing.cfg.Log.Printf("INFO delivery recovered; re-reading %s from offset %d to fill the hole left by the lost batch", t.path, at)
+			continue
+		}
 		cp, ok := t.commitInflight(now)
 		if !ok {
 			continue

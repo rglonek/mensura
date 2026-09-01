@@ -24,9 +24,14 @@ durability: stream               # batch | stream | paranoid
 
 listen:
   write:  {addr: "0.0.0.0:9631", tls: {cert: …, key: …, client_ca: …}}
-  query:  {addr: "127.0.0.1:9632"}
+  query:  {addr: "127.0.0.1:9632"}   # read surface only: no /v1/write, no /v1/admin/*
   debug:  {addr: "127.0.0.1:9633"}   # /v1/debug/*, loopback only
   metrics:{addr: "127.0.0.1:9634"}
+
+# Every listener honours its own tls: block. A separate `query` address is a
+# separate *surface*, not only a separate port: it mounts the read endpoints
+# and nothing else, so publishing it to Grafana cannot expose writes or admin
+# calls even with auth.mode: none.
 
 auth:
   mode: bearer                   # bearer | mtls | none (loopback only)

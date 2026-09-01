@@ -379,8 +379,16 @@ func (p *parser) integer() (int64, error) {
 	if t.kind != tokNumber {
 		return 0, p.errf("expected an integer, found %s", p.describe(t))
 	}
+	// The lexer emits "1.5" as a number, so ParseInt on it surfaced a bare
+	// strconv error with no position in it. Every other syntax fault in
+	// this parser comes back as a positioned ParseError; this one has to
+	// as well.
+	n, err := strconv.ParseInt(t.text, 10, 64)
+	if err != nil {
+		return 0, p.errf("expected a whole number, found %q", t.text)
+	}
 	p.i++
-	return strconv.ParseInt(t.text, 10, 64)
+	return n, nil
 }
 
 // duration parses <number><unit> with no compound forms, and returns

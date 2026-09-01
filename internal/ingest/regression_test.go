@@ -428,8 +428,12 @@ func TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord(t *testing.T) {
 		t.Fatalf("pending moved to %d, so a commit could acknowledge undelivered bytes", got)
 	}
 
-	// With the store healthy the same bytes are read again, whole.
+	// With the store healthy the same bytes are read again, whole. The
+	// hold the shed write installed is stepped over: it exists to stop
+	// the sink spinning on a store that is refusing writes, not to delay
+	// one that has recovered.
 	refuse.Store(false)
+	sink.now = func() time.Time { return time.Now().Add(2 * retryHold) }
 	if err := f.read(context.Background(), tl); err != nil {
 		t.Fatalf("re-read: %v", err)
 	}
@@ -567,3 +571,168 @@ profiles:
         extract: ['n=(?P<n>\d+)']
         aggregate: {every: 1h, on: [], field: n, mode: last}
 `
+
+// Running out of retries against a store that is shedding load is
+// back-pressure, not a verdict on the batch. The store answers 503 with
+// Retry-After -- its own request to slow down -- and six retries is a few
+// seconds of that, so discarding here threw good data away during exactly
+// the condition the shedding exists to survive.
+func TestRetryExhaustionRequeuesRatherThanDropping(t *testing.T) {
+	var refuse atomic.Bool
+	refuse.Store(true)
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	guard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Load() {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(wire.APIError{Error: "shedding"})
+			return
+		}
+		rs.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer guard.Close()
+
+	client := wire.NewClient(guard.URL, "")
+	client.Compress, client.MaxRetries = false, 1
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	sink := NewSink(client, cfg, testLogger{t})
+	obs := &countingObserver{began: new(int), ended: new(int), drops: new(int), mu: &sync.Mutex{}}
+	sink.Observe(obs)
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if err := sink.AddSample(ctx, "lines", model.Sample{
+			TSMs: int64(1000 + i), Fields: map[string]model.Value{"n": model.Int(int64(i))},
+		}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	if err := sink.Flush(ctx); err == nil {
+		t.Fatal("a shed write was reported as a successful flush")
+	}
+	if got := sink.Snapshot().Dropped; got != 0 {
+		t.Fatalf("Dropped = %d: the batch was discarded rather than held", got)
+	}
+	if *obs.drops != 0 {
+		t.Fatal("the observers were told a batch was lost, which freezes every checkpoint")
+	}
+	// The store recovers; the hold exists to stop the sink spinning on an
+	// overloaded store, not to delay one that is answering again.
+	refuse.Store(false)
+	sink.now = func() time.Time { return time.Now().Add(2 * retryHold) }
+	if err := sink.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for i := int64(1); i <= 3; i++ {
+		if !recorded(rs, i) {
+			t.Errorf("sample %d was lost to the load shedding", i)
+		}
+	}
+}
+
+// Holding is only worth doing while there is somewhere to put the batch.
+// Past the buffer cap the oldest batch is dropped, counted and reported as
+// a hole -- an unbounded buffer turns a store outage into an out-of-memory
+// kill that loses everything rather than the tail.
+func TestAFullBufferStillDropsAndSaysSo(t *testing.T) {
+	guard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(wire.APIError{Error: "shedding"})
+	}))
+	defer guard.Close()
+
+	client := wire.NewClient(guard.URL, "")
+	client.Compress, client.MaxRetries = false, 0
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	cfg.MaxBufferedSamples = 2
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if err := sink.AddSample(ctx, "lines", model.Sample{
+			TSMs: int64(1000 + i), Fields: map[string]model.Value{"n": model.Int(int64(i))},
+		}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	// The hold is stepped over between flushes; each one finds the buffer
+	// fuller than the last.
+	for i := 0; i < 3; i++ {
+		sink.now = func() time.Time { return time.Now().Add(time.Duration(i+1) * 2 * retryHold) }
+		_ = sink.Flush(ctx)
+	}
+	if got := sink.Snapshot().Dropped; got == 0 {
+		t.Fatal("the buffer cap was passed and nothing was counted as dropped")
+	}
+}
+
+// The checkpoint freeze a lost batch installs is the right policy; needing
+// a process restart to leave it was not. A few seconds of store
+// unavailability stopped checkpointing every followed file until someone
+// noticed, and every one of those files then replayed from its last
+// pre-incident offset.
+func TestAFrozenCheckpointThawsWhenDeliveryRecovers(t *testing.T) {
+	tl := &tailer{path: "/tmp/x", cp: &Checkpoint{Stream: "s"}}
+	tl.setPending(600)
+	tl.markInflight()
+	if !tl.markHoled() {
+		t.Fatal("a batch in flight did not freeze the tailer")
+	}
+	// While frozen, nothing may be acknowledged.
+	tl.setPending(1200)
+	tl.markInflight()
+	if _, ok := tl.commitInflight(1); ok {
+		t.Fatal("a frozen tailer acknowledged bytes past the hole")
+	}
+	at, thawed := tl.clearHole()
+	if !thawed || at != 0 {
+		t.Fatalf("clearHole() = (%d, %v), want (0, true)", at, thawed)
+	}
+	if got, ok := tl.takeRewind(); !ok || got != 0 {
+		t.Fatalf("takeRewind() = (%d, %v), want (0, true) so the lost bytes are read again", got, ok)
+	}
+	if got := tl.pendingOffsetForTest(); got != 0 {
+		t.Fatalf("pending = %d after the thaw: a commit could acknowledge bytes nothing re-read", got)
+	}
+	// Once thawed it checkpoints normally again.
+	tl.setPending(64)
+	tl.markInflight()
+	if _, ok := tl.commitInflight(1); !ok {
+		t.Fatal("a thawed tailer still refuses to checkpoint")
+	}
+}
+
+// A rotation replaces the bytes the hole was in, so there is nothing left
+// to protect by staying frozen.
+func TestRotationClearsAFrozenCheckpoint(t *testing.T) {
+	tl := &tailer{path: "/tmp/x", cp: &Checkpoint{Stream: "s"}}
+	tl.setPending(600)
+	tl.markInflight()
+	tl.markHoled()
+	tl.reset(0)
+	tl.setPending(64)
+	tl.markInflight()
+	if _, ok := tl.commitInflight(1); !ok {
+		t.Fatal("a rotated file is still frozen by a hole in the file it replaced")
+	}
+}
+
+// Overlapping sources are ordinary -- "/logs" and "/logs/*.log" name the
+// same files -- and every record in the overlap used to be extracted,
+// delivered and counted twice.
+func TestResolveDeduplicatesOverlappingSources(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 1)
+	i := &Ingest{}
+	got, err := i.resolve([]string{dir, filepath.Join(dir, "*.log"), path})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("resolve returned %d entries for one file: %v", len(got), got)
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rglonek/mensura/pkg/model"
 )
 
 func mustSpec(t *testing.T, body string) *Spec {
@@ -209,4 +211,100 @@ func itoa(n int64) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// ParseDuration accepts a leading sign so that Print -> Parse round-trips
+// an unvalidated AST, so a spec's durations need a range check of their
+// own. Without one, `retention: "-5s"` compiled cleanly, travelled to the
+// store, and was refused there on every single write -- with a 500, which
+// the client retries and then drops.
+func TestNegativeSetDurationsAreASpecError(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"retention", `
+version: 1
+sets: {app: {retention: "-5s"}}
+profiles:
+  - name: p
+    timestamp: {formats: [{layout: epoch_ms, regex: '^[0-9]+'}]}
+    patterns: [{set: app, search: "x", extract: ['(?P<n>\d+)']}]
+`, "retention"},
+		{"shard", `
+version: 1
+sets: {app: {shard: "-1h"}}
+profiles:
+  - name: p
+    timestamp: {formats: [{layout: epoch_ms, regex: '^[0-9]+'}]}
+    patterns: [{set: app, search: "x", extract: ['(?P<n>\d+)']}]
+`, "shard"},
+		{"max_interval", `
+version: 1
+profiles:
+  - name: p
+    timestamp: {formats: [{layout: epoch_ms, regex: '^[0-9]+'}]}
+    fields: {n: {kind: gauge, max_interval: "-30s"}}
+    patterns: [{set: app, search: "x", extract: ['(?P<n>\d+)']}]
+`, "max_interval"},
+	} {
+		if msg := specError(t, tc.body); !strings.Contains(msg, tc.want) {
+			t.Errorf("%s: error %q does not name the offending setting", tc.name, msg)
+		}
+	}
+}
+
+// A sub-second cadence is a legitimate declaration and must survive
+// compilation intact; the wire carries it in milliseconds.
+func TestSubSecondMaxIntervalIsKept(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp: {formats: [{layout: epoch_ms, regex: '^[0-9]+'}]}
+    fields: {n: {kind: gauge, max_interval: "500ms"}}
+    patterns: [{set: app, search: "x", extract: ['(?P<n>\d+)']}]
+`)
+	if got := s.Profiles[0].Fields["n"].MaxIntervalMs(); got != 500 {
+		t.Fatalf("max_interval survived as %d ms, want 500", got)
+	}
+}
+
+// A bucket the payload did not carry is absent, not zero. Writing Int(0)
+// for it draws on a heatmap as a measured zero -- the same invention the
+// "captured no buckets group" guard exists to prevent.
+func TestPartialHistogramDoesNotInventZeroBuckets(t *testing.T) {
+	bs := &BucketSet{Name: "lat", Parse: "key_value", Buckets: []string{"b0", "b1", "b2"}}
+	fields := map[string]model.Value{}
+	if err := bs.expand("b0=3 b2=4", fields); err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if _, invented := fields["b1"]; invented {
+		t.Fatal("a bucket the payload never carried was recorded as a measured zero")
+	}
+	for _, name := range []string{"b0", "b2"} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("bucket %s was captured but not recorded", name)
+		}
+	}
+}
+
+// The derived columns read every bucket, so with some missing they would
+// be wrong -- and a wrong number is worse than an absent one.
+func TestPartialHistogramSkipsDerivedColumns(t *testing.T) {
+	bs := &BucketSet{Name: "lat", Parse: "key_value", Buckets: []string{"b0", "b1"}, Cumulative: true, Tail: true}
+	partial := map[string]model.Value{}
+	if err := bs.expand("b0=3", partial); err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	for _, name := range []string{"tail", "b0plus", "b1plus"} {
+		if _, ok := partial[name]; ok {
+			t.Errorf("%s was derived from a payload that carried only some buckets", name)
+		}
+	}
+	// A complete payload still derives them.
+	full := map[string]model.Value{}
+	if err := bs.expand("b0=3 b1=4", full); err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if _, ok := full["b0plus"]; !ok {
+		t.Fatal("a complete payload no longer derives its cumulative columns")
+	}
 }

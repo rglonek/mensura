@@ -149,6 +149,38 @@ type fieldEntry struct {
 type dictionary struct {
 	Entries []string `json:"entries"`
 	index   map[string]int32
+	// holes lists free positions left by lost records, newest last.
+	//
+	// It is a list rather than a scan because interning used to walk the
+	// whole entry slice looking for a gap on every new value, under the
+	// exclusive dictionary lock and on the write path: quadratic in
+	// cardinality, measured at 4x per doubling, which at the default
+	// 100k-value limit is seconds of lock-held CPU per label key with
+	// every write serialised behind it.
+	holes []int32
+}
+
+// rebuildHoles records the free positions in a freshly loaded dictionary.
+func (d *dictionary) rebuildHoles() {
+	d.holes = nil
+	for i, e := range d.Entries {
+		if e == "" {
+			d.holes = append(d.holes, int32(i))
+		}
+	}
+}
+
+// takeHole pops a free position, skipping any that has been filled since
+// the list was built.
+func (d *dictionary) takeHole() (int32, bool) {
+	for len(d.holes) > 0 {
+		h := d.holes[len(d.holes)-1]
+		d.holes = d.holes[:len(d.holes)-1]
+		if int(h) < len(d.Entries) && d.Entries[h] == "" {
+			return h, true
+		}
+	}
+	return 0, false
 }
 
 // Open starts a store on a data directory. Exactly one process may hold it.
@@ -418,6 +450,9 @@ func (s *Store) loadDictionaries() error {
 			d.index[v] = idx
 		}
 	}
+	for _, d := range s.dict {
+		d.rebuildHoles()
+	}
 	return nil
 }
 
@@ -453,14 +488,14 @@ func (s *Store) intern(key, value string) (int32, error) {
 	if s.cfg.MaxLabelCardinality > 0 && len(d.Entries) >= s.cfg.MaxLabelCardinality {
 		return 0, fmt.Errorf("label %q exceeds the cardinality limit of %d distinct values", key, s.cfg.MaxLabelCardinality)
 	}
-	idx := int32(len(d.Entries))
 	// A hole left by a lost record is reused rather than skipped, so the
-	// dictionary does not grow past its budget on nothing.
-	for i, e := range d.Entries {
-		if e == "" {
-			idx = int32(i)
-			break
-		}
+	// dictionary does not grow past its budget on nothing. The free list
+	// is built once at load and maintained as values are added, so this
+	// costs the same whether the dictionary holds ten values or a hundred
+	// thousand.
+	idx, reused := d.takeHole()
+	if !reused {
+		idx = int32(len(d.Entries))
 	}
 	// One record for the new value only. Rewriting the whole array here
 	// would make interning the n-th value cost O(n) bytes, so filling a

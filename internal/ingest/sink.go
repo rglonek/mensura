@@ -25,10 +25,22 @@ type SinkConfig struct {
 	// before the process gives up, so a supervisor notices a spec that no
 	// longer matches its store.
 	MaxFatalDrops int
+	// MaxBufferedSamples bounds what may be held while the store is
+	// refusing writes. A store that sheds load asks the client to slow
+	// down, so running out of retries is back-pressure, not a licence to
+	// discard: the batch goes back in the buffer and delivery is held.
+	// That trade only holds while there is somewhere to put it, and this
+	// is where "somewhere" ends -- past it the oldest batch is dropped
+	// and counted, because an unbounded buffer turns a store outage into
+	// an out-of-memory kill that loses everything rather than the tail.
+	MaxBufferedSamples int
 }
 
 func DefaultSinkConfig() SinkConfig {
-	return SinkConfig{BatchSize: 1024, BatchBytes: 4 << 20, FlushEvery: 50 * time.Millisecond, MaxFatalDrops: 100}
+	return SinkConfig{
+		BatchSize: 1024, BatchBytes: 4 << 20, FlushEvery: 50 * time.Millisecond,
+		MaxFatalDrops: 100, MaxBufferedSamples: 100_000,
+	}
 }
 
 // Sink batches samples per set and ships them to the store.
@@ -82,6 +94,14 @@ type Sink struct {
 // land, short enough that recovery is automatic.
 const deliveryHold = 30 * time.Second
 
+// retryHold is how long the sink waits after exhausting the client's own
+// retries. The store has just spent several seconds telling this client to
+// back off; flushing again immediately would spend the next batch's
+// retries on the same overload. It is much shorter than deliveryHold
+// because the condition it waits out -- a compaction stall, a rolling
+// restart -- clears on its own.
+const retryHold = 5 * time.Second
+
 func (s *Sink) holding() bool {
 	s.holdMu.Lock()
 	defer s.holdMu.Unlock()
@@ -96,10 +116,13 @@ func (s *Sink) holdDelivery(d time.Duration) {
 
 // SinkStats counts delivery outcomes.
 type SinkStats struct {
-	mu        sync.Mutex
-	Sent      int64
-	Accepted  int64
-	Rejected  int64
+	mu       sync.Mutex
+	Sent     int64
+	Accepted int64
+	Rejected int64
+	// Retried counts batches put back in the buffer after the write
+	// client ran out of its own retries, not the individual HTTP
+	// attempts: one increment is one batch that was held rather than lost.
 	Retried   int64
 	Dropped   int64
 	FatalDrop int64
@@ -139,6 +162,9 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 	}
 	if cfg.MaxFatalDrops == 0 {
 		cfg.MaxFatalDrops = d.MaxFatalDrops
+	}
+	if cfg.MaxBufferedSamples <= 0 {
+		cfg.MaxBufferedSamples = d.MaxBufferedSamples
 	}
 	s := &Sink{
 		client: client, cfg: cfg, log: log,
@@ -316,7 +342,7 @@ func (s *Sink) DeclareFields(p *extract.Profile) {
 			m := wire.FieldMeta{
 				Set: d.Set, Field: name, Kind: model.Kind(fs.Kind),
 				Unit: fs.Unit, UnitHint: fs.UnitHint, Description: fs.Description,
-				MaxIntervalS: int(fs.MaxIntervalMs() / 1000),
+				MaxIntervalMs: fs.MaxIntervalMs(),
 			}
 			if fs.Limits != nil {
 				m.LimitMin, m.LimitMax = fs.Limits.Min, fs.Limits.Max
@@ -452,15 +478,37 @@ func (s *Sink) Flush(ctx context.Context) error {
 			s.log.Printf("ERROR %v; holding %d buffered sample(s) and retrying in %s", authErr, count, deliveryHold)
 			return err
 		}
-		// The batch was taken out of the buffer before the write, so a
-		// retryable failure that ran out of retries loses it. Say so and
-		// count it: an uncounted drop is indistinguishable from success.
+		// Running out of retries is back-pressure, not a verdict on the
+		// batch. A store that sheds load answers 503 with Retry-After --
+		// its own documented signal to slow down -- and six retries is
+		// only a few seconds of that, so discarding here threw good data
+		// away during exactly the condition the shedding exists to
+		// survive. The batch goes back in the buffer and delivery is
+		// held, which is what the auth path already does; the readers
+		// feel it through the buffer filling up.
+		if s.bufferedRoom(count) {
+			hold := s.retryHoldFor(err)
+			s.requeueBatches(batches, count)
+			s.requeueMeta(meta, sets)
+			s.holdDelivery(hold)
+			s.Stats.mu.Lock()
+			s.Stats.Retried++
+			s.Stats.mu.Unlock()
+			s.log.Printf("WARNING %v; holding %d buffered sample(s) and retrying in %s", err, count, hold)
+			return err
+		}
+		// The buffer is full: the store has been refusing writes for long
+		// enough that holding more would cost the whole process. Only now
+		// is anything dropped, and it is said out loud -- an uncounted
+		// drop is indistinguishable from success.
 		s.Stats.mu.Lock()
 		s.Stats.Dropped += int64(count)
 		s.Stats.mu.Unlock()
-		s.log.Printf("ERROR gave up delivering %d samples after retries: %v (first set %q)", count, err, firstSet(batches))
+		s.log.Printf("ERROR gave up delivering %d samples: %v; %d already buffered, which is the %d-sample limit (first set %q)",
+			count, err, s.buffered(), s.cfg.MaxBufferedSamples, firstSet(batches))
 		s.endFlush(obs, 0, true)
 		s.requeueMeta(meta, sets)
+		s.holdDelivery(s.retryHoldFor(err))
 		return err
 	}
 	s.holdMu.Lock()
@@ -488,6 +536,29 @@ func (s *Sink) requeueBatches(batches []model.Batch, count int) {
 		s.buffers[b.Set] = append(b.Samples, s.buffers[b.Set]...)
 	}
 	s.pending += count
+}
+
+// buffered reports how many samples are waiting.
+func (s *Sink) buffered() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending
+}
+
+// bufferedRoom reports whether count samples can go back in the buffer
+// without exceeding the cap.
+func (s *Sink) bufferedRoom(count int) bool {
+	return s.buffered()+count <= s.cfg.MaxBufferedSamples
+}
+
+// retryHoldFor honours a Retry-After the store sent, which is the interval
+// it asked for, and falls back to the fixed hold otherwise.
+func (s *Sink) retryHoldFor(err error) time.Duration {
+	var retry *wire.ErrRetryable
+	if errors.As(err, &retry) && retry.After > 0 {
+		return retry.After
+	}
+	return retryHold
 }
 
 // requeueMeta puts undelivered field metadata back at the head of the
@@ -562,7 +633,18 @@ func (s *Sink) Close(ctx context.Context) error {
 	s.holdMu.Lock()
 	s.holdUntil = time.Time{}
 	s.holdMu.Unlock()
-	return s.Flush(ctx)
+	err := s.Flush(ctx)
+	// Whatever the last flush could not deliver stays in memory and dies
+	// with the process, so it is counted and named here. It is not
+	// reported to the observers as a hole: the checkpoints never advanced
+	// past these bytes, so the next start re-reads them.
+	if n := s.buffered(); n > 0 {
+		s.Stats.mu.Lock()
+		s.Stats.Dropped += int64(n)
+		s.Stats.mu.Unlock()
+		s.log.Printf("ERROR %d sample(s) were still buffered at shutdown and were never delivered; they will be re-read from the last checkpoint", n)
+	}
+	return err
 }
 
 // Snapshot returns delivery counters for the progress report.

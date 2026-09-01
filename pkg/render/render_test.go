@@ -310,3 +310,46 @@ func TestPaddingNeverReordersAgainstAdjacentNull(t *testing.T) {
 		}
 	}
 }
+
+// A trailing gap is a gap. A null was only ever injected when a later
+// sample arrived, so a series that stopped mid-range ended at its last
+// point: a source that went away drew as a line that simply stops, which
+// is the false continuity the whole walk exists to prevent.
+func TestTrailingGapDrawsAConnectBreak(t *testing.T) {
+	t0 := int64(1_700_000_000_000)
+	pts := []Point{{1, t0}, {2, t0 + 1000}, {3, t0 + 2000}}
+	spec := Spec{GapMs: 2000, EndMs: t0 + 60_000, SSE: SSE{Mode: SSEOff}}
+	out := Series(pts, spec, 0)
+	if len(out) == 0 {
+		t.Fatal("no output")
+	}
+	last := out[len(out)-1]
+	if !last.Null {
+		t.Fatalf("the series ends at a real point (%+v); a source that stopped 58s ago draws as a continuous line", last)
+	}
+	if last.TSMs != t0+2000+2000 {
+		t.Fatalf("the break is at %d, want %d -- the moment the declared cadence was first missed", last.TSMs, t0+4000)
+	}
+	for i := 1; i < len(out); i++ {
+		if out[i].TSMs <= out[i-1].TSMs {
+			t.Fatalf("output timestamps are not strictly increasing at %d (C1)", i)
+		}
+	}
+}
+
+// A series that is still arriving on its cadence must not gain a break,
+// and neither must one whose field declares no cadence at all.
+func TestNoTrailingBreakWhenTheCadenceIsHonoured(t *testing.T) {
+	t0 := int64(1_700_000_000_000)
+	pts := []Point{{1, t0}, {2, t0 + 1000}}
+	for _, spec := range []Spec{
+		{GapMs: 5000, EndMs: t0 + 3000, SSE: SSE{Mode: SSEOff}},
+		{GapMs: 0, EndMs: t0 + 600_000, SSE: SSE{Mode: SSEOff}},
+		{GapMs: 5000, EndMs: 0, SSE: SSE{Mode: SSEOff}},
+	} {
+		out := Series(append([]Point(nil), pts...), spec, 0)
+		if len(out) > 0 && out[len(out)-1].Null {
+			t.Errorf("spec %+v invented a trailing break", spec)
+		}
+	}
+}

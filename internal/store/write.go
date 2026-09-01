@@ -12,6 +12,23 @@ import (
 	"github.com/rglonek/mensura/pkg/wire"
 )
 
+// ErrBadRequest marks a write failure caused by what the client sent
+// rather than by the store: a malformed set name, a negative retention, an
+// unknown key scheme. The distinction is not cosmetic. handleWrite turns
+// every other error into a 500, wire.Client treats >= 500 as retryable, and
+// the ingest sink drops a batch that runs out of retries -- so one bad
+// metadata field in a spec used to destroy every batch the ingester
+// produced, at full rate, for the life of the process. A client-input fault
+// has to come back as a 4xx so it is fatal on the first attempt and the
+// spec gets fixed.
+type ErrBadRequest struct{ Msg string }
+
+func (e *ErrBadRequest) Error() string { return e.Msg }
+
+func badRequestf(format string, args ...any) error {
+	return &ErrBadRequest{Msg: fmt.Sprintf(format, args...)}
+}
+
 // idempotencyCache remembers recently committed request keys so a retry
 // that crossed with its own success does not write twice.
 //
@@ -208,21 +225,21 @@ func (s *Store) applySetMeta(metas []wire.SetMeta) error {
 			continue
 		}
 		if err := model.ValidateSetName(m.Set); err != nil {
-			return err
+			return &ErrBadRequest{Msg: err.Error()}
 		}
 		if model.IsReserved(m.Set) {
-			return fmt.Errorf("set %q uses the reserved prefix", m.Set)
+			return badRequestf("set %q uses the reserved prefix", m.Set)
 		}
 		retention, shard := time.Duration(-1), time.Duration(0)
 		if m.RetentionMs != nil {
 			if *m.RetentionMs < 0 {
-				return fmt.Errorf("set %q: retention must not be negative", m.Set)
+				return badRequestf("set %q: retention must not be negative", m.Set)
 			}
 			retention = time.Duration(*m.RetentionMs) * time.Millisecond
 		}
 		if m.ShardMs != nil {
 			if *m.ShardMs < 0 {
-				return fmt.Errorf("set %q: shard width must not be negative", m.Set)
+				return badRequestf("set %q: shard width must not be negative", m.Set)
 			}
 			shard = time.Duration(*m.ShardMs) * time.Millisecond
 		}
@@ -234,7 +251,7 @@ func (s *Store) applySetMeta(metas []wire.SetMeta) error {
 		case model.KeyContent, model.KeyOffset:
 			s.SetKeyScheme(m.Set, m.KeyScheme)
 		default:
-			return fmt.Errorf("set %q: unknown key scheme %q (content or offset)", m.Set, m.KeyScheme)
+			return badRequestf("set %q: unknown key scheme %q (content or offset)", m.Set, m.KeyScheme)
 		}
 	}
 	return nil
@@ -375,13 +392,13 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 			continue
 		}
 		if err := model.ValidateSetName(m.Set); err != nil {
-			return err
+			return &ErrBadRequest{Msg: err.Error()}
 		}
 		if model.IsReserved(m.Set) && m.Set != model.IngestSet {
-			return fmt.Errorf("set %q uses the reserved prefix", m.Set)
+			return badRequestf("set %q uses the reserved prefix", m.Set)
 		}
 		if err := model.ValidateFieldName(m.Field); err != nil {
-			return err
+			return &ErrBadRequest{Msg: err.Error()}
 		}
 	}
 	s.mu.Lock()
@@ -426,7 +443,12 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		if m.Description != "" {
 			f.Description = m.Description
 		}
-		if m.MaxIntervalS > 0 {
+		// Milliseconds win; the whole-second field is only read so an
+		// older ingester's metadata still lands.
+		switch {
+		case m.MaxIntervalMs > 0:
+			f.MaxInterval = m.MaxIntervalMs
+		case m.MaxIntervalS > 0:
 			f.MaxInterval = int64(m.MaxIntervalS) * 1000
 		}
 		if m.LimitMin != nil {

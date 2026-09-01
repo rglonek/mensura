@@ -126,10 +126,13 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		}
 	}
 	obs := &remoteObserver{
-		progress: &remoteProgress{},
+		progress: newRemoteProgress(),
 		save:     save,
 		onHole: func(at int64) {
-			i.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; restart to re-read from there", target, at)
+			i.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; it will be re-read from there once delivery recovers", target, at)
+		},
+		onThaw: func(at int64) {
+			i.cfg.Log.Printf("INFO delivery recovered; reconnecting %s from offset %d to fill the hole left by the lost batch", target, at)
 		},
 	}
 	obs.progress.set(box.ackedOffset())
@@ -229,12 +232,52 @@ type remoteProgress struct {
 	// holed freezes the resume offset after a dropped batch. A checkpoint
 	// is a single offset, so once records are missing from the middle of
 	// the stream it can never move past them without losing them.
+	//
+	// It is cleared by the first flush that succeeds afterwards, which
+	// signals rewind so the tail is reconnected from the frozen offset.
+	// The freeze is the right policy; needing a process restart to leave
+	// it was not.
 	holed bool
+	// rewind is signalled when a hole clears. It is buffered and never
+	// blocks, so the flush goroutine cannot be held up by a tail loop
+	// that is between reconnects.
+	rewind chan struct{}
+}
+
+func newRemoteProgress() *remoteProgress {
+	return &remoteProgress{rewind: make(chan struct{}, 1)}
+}
+
+// clearHole releases a frozen path once delivery is working again and asks
+// the tail loop to reconnect from the frozen offset. Nothing past the hole
+// is acknowledged on the way out, so the reconnect re-reads exactly the
+// bytes the lost batch carried.
+func (p *remoteProgress) clearHole() (int64, bool) {
+	p.mu.Lock()
+	if !p.holed {
+		p.mu.Unlock()
+		return 0, false
+	}
+	p.holed = false
+	p.pending, p.inflight = p.acked, p.acked
+	at := p.acked
+	ch := p.rewind
+	p.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return at, true
 }
 
 func (p *remoteProgress) set(n int64) {
 	p.mu.Lock()
 	p.pending, p.inflight, p.acked = n, n, n
+	// A rotation replaces the bytes the hole was in, so there is nothing
+	// left to protect by staying frozen.
+	p.holed = false
 	p.mu.Unlock()
 }
 
@@ -292,6 +335,7 @@ type remoteObserver struct {
 	progress *remoteProgress
 	save     func(acked int64)
 	onHole   func(at int64)
+	onThaw   func(at int64)
 }
 
 func (o *remoteObserver) BeginFlush() { o.progress.markInflight() }
@@ -300,6 +344,12 @@ func (o *remoteObserver) EndFlush(_ int, dropped bool) {
 	if dropped {
 		if at, first := o.progress.markHoled(); first && o.onHole != nil {
 			o.onHole(at)
+		}
+		return
+	}
+	if at, thawed := o.progress.clearHole(); thawed {
+		if o.onThaw != nil {
+			o.onThaw(at)
 		}
 		return
 	}
@@ -405,6 +455,11 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		for {
 			select {
 			case <-watchStop:
+				return
+			case <-progress.rewind:
+				// A hole cleared: the tail is streaming bytes from past
+				// the frozen offset, so it has to be restarted from it.
+				_ = cmd.Process.Kill()
 				return
 			case <-t.C:
 				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)

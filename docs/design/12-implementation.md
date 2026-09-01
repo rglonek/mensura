@@ -119,6 +119,19 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Unimplemented spec keys are refused | `pkg/extract/regression_test.go:TestUnimplementedFramingOptionsAreRefused`, `…:TestUnknownAggregateModeIsRefused` |
 | Closed windows survive an aggregation error | `…:TestExpiredWindowsSurviveAnAggregationError` |
 | An absent `FORMAT` validates as a timeseries | `pkg/mql/regression_test.go:TestAbsentFormatIsValidatedAsTimeseries` |
+| A client-input fault is a 400, an engine failure is still a 500 | `internal/store/regression_test.go:TestClientInputFaultsAreNotServerErrors`, `…:TestEngineFailuresAreStillServerErrors` |
+| Retry exhaustion requeues; only a full buffer drops | `internal/ingest/regression_test.go:TestRetryExhaustionRequeuesRatherThanDropping`, `…:TestAFullBufferStillDropsAndSaysSo` |
+| A frozen checkpoint thaws when delivery recovers | `…:TestAFrozenCheckpointThawsWhenDeliveryRecovers`, `…:TestRotationClearsAFrozenCheckpoint` |
+| Overlapping `--source` entries are read once | `…:TestResolveDeduplicatesOverlappingSources` |
+| A negative duration is a spec error, sub-second cadence survives | `pkg/extract/regression_test.go:TestNegativeSetDurationsAreASpecError`, `…:TestSubSecondMaxIntervalIsKept` |
+| `field_meta` carries a sub-second cadence | `internal/store/regression_test.go:TestFieldMetaCarriesSubSecondCadence` |
+| The query listener carries no write or admin surface | `…:TestQueryHandlerCarriesNoWriteOrAdminSurface` |
+| `LABELS … WHERE` is gated, and table truncation is visible | `…:TestLabelsFilterScanIsBounded`, `…:TestTabularTruncationIsVisible` |
+| A variable inside a regex is diagnosed | `pkg/mql/regression_test.go:TestUnsubstitutedVariableInARegexIsDiagnosed`, `…:TestVariablesFindsRegexReferences` |
+| `HAS`/`MISSING` check the label name | `…:TestHasAndMissingCheckTheLabelName` |
+| A fractional integer is a positioned parse error | `…:TestFractionalIntegerIsAPositionedParseError` |
+| A partial histogram is not a row of zeros | `pkg/extract/regression_test.go:TestPartialHistogramDoesNotInventZeroBuckets`, `…:TestPartialHistogramSkipsDerivedColumns` |
+| A trailing gap draws a connect-break | `pkg/render/render_test.go:TestTrailingGapDrawsAConnectBreak`, `…:TestNoTrailingBreakWhenTheCadenceIsHonoured` |
 
 ## 5. Implementation status
 
@@ -475,6 +488,18 @@ until it was restarted. A stream whose in-flight mark had not moved past its
 acknowledged offset cannot have contributed to the lost batch, and is now
 left alone.
 
+The freeze also ends without a restart. The first delivery that succeeds
+afterwards clears `holed`, pulls the stream's pending and in-flight marks
+back to its acknowledged offset, and asks the reader to seek there: locally
+the poll goroutine re-seeks the file, remotely the tail is dropped so the
+reconnect re-issues `tail -c` from the frozen offset. A successful flush is
+the signal rather than a timer, because it proves the store is accepting
+writes and cannot fire while the sink is still failing. What this does is
+exactly what a restart did — including discarding the extractor's buffered
+state, which was built from the bytes about to be read again — so the
+duplicates it produces are the ones a content-addressed key already
+collapses.
+
 ### 6.22 Metrics carry the same authorisation as the rest of the API
 
 `/metrics` had no authentication in any mode, and the startup posture check
@@ -619,7 +644,101 @@ elsewhere:
   scheme exists for. Both paths now attach the listener's arrival
   sequence, and a caller-supplied hint still wins.
 
-### 6.31 Smaller corrections
+### 6.31 A client-input fault is a 4xx, and retry exhaustion is back-pressure
+
+Three separate places on the write path turned a recoverable condition into
+permanent loss, and each was survivable alone.
+
+`Store.Write` returned `applySetMeta`/`applyFieldMeta` validation failures as
+bare Go errors and `handleWrite` mapped every non-`Diag` error to `500`.
+`wire.Client` classifies `>= 500` as retryable, so the sink retried six times
+and then dropped the batch — and `requeueMeta` put the offending metadata
+straight back on the queue for the next flush. One bad field in a spec was
+therefore 100 % data loss, at full rate, for the life of the process, with
+every checkpoint frozen alongside it. Those failures now carry
+`store.ErrBadRequest` and come back as `400`, which the client treats as
+fatal on the first attempt.
+
+The same fault was reachable from an ordinary spec typo. `mql.ParseDuration`
+accepts a leading sign so that `Print` → `Parse` round-trips a negative
+duration out of an unvalidated AST, and `Spec.Compile` never range-checked
+the result, so `sets: {app: {retention: "-5s"}}` compiled cleanly. `Compile`
+now refuses a negative retention, a non-positive shard width and a
+non-positive `max_interval`.
+
+Retry exhaustion is no longer a drop. A store that sheds load answers `503`
+with `Retry-After` — its own request to slow down — and the client's six
+retries are a few seconds of that, so discarding at the end of them threw
+good data away during exactly the condition the shedding exists to survive.
+The batch goes back at the head of its buffer and delivery is held for the
+interval the store asked for, which is what the `401` path already did. Only
+a full buffer drops (see §7).
+
+### 6.32 `max_interval` travels in milliseconds
+
+The spec accepts any duration for a field's cadence, and the wire carried
+`max_interval_s` as whole seconds. `500ms` truncated to `0`, which switched
+gap detection off and then had the query emit `W103` saying the field has no
+declared cadence — which was false; `1500ms` rounded to `1000ms`, a *tighter*
+gap than declared, so a series arriving exactly on its declared cadence drew
+a connect-break at every single point. `FieldMeta.MaxIntervalMs` carries it
+now. `max_interval_s` is still read, so an older ingester's metadata still
+lands, and is never written.
+
+### 6.33 The query listener is a read surface
+
+`listen.query` exists so an operator can hand a separate address to Grafana,
+and it mounted the full mux: that address also accepted `/v1/write` and
+`/v1/admin/*`, separated only by bearer scopes, and by nothing at all under
+`auth.mode: none`. `API.QueryHandler` mounts the read endpoints and nothing
+else. Relatedly, `startListeners` passed a zero `listenSpec` for the debug
+and metrics listeners, so their `tls:` blocks were validated at startup and
+then ignored — two of four listeners served plaintext whatever the config
+said. Every listener now uses its own spec.
+
+### 6.34 `LABELS <key> WHERE …` is gated like a graph
+
+`Validate` returns early for `KindLabels`, so neither datasource ceiling was
+computed, and the filter scan walked every set carrying the label across the
+whole time range with no series or points bound, accumulating into an
+unbounded map. That is the path a dashboard hits on every variable refresh.
+It is now bounded by the same two ceilings the timeseries and heatmap paths
+use, and reports a tripped gate the same way: partial results, `Error`, and
+`W401`.
+
+Table and logs truncation is reported the same way too. `runTabular` set
+`Stats.Truncated` and nothing else, and the plugin renders `Warnings` and
+`Error`, so a table silently showed the first 1 000 rows of a range.
+
+### 6.35 A trailing gap is drawn
+
+`render.Series` injected a null only when a *later* sample arrived, so a
+series that stopped mid-range ended at its last point: a source that went
+away drew as a line that simply stops, which is the false continuity the
+whole walk exists to prevent. `Spec.EndMs` carries the end of the requested
+range, and a null is emitted at `last + gapMs` when the range ends more than
+`gapMs` after the last sample. It is left at zero for alert evaluation,
+where no synthetic point may contribute.
+
+### 6.36 A partially parsed histogram is not a row of zeros
+
+`expand` refuses to invent a row when the whole `buckets` group is missing,
+but wrote `Int(0)` for every declared bucket the payload did not contain —
+which draws on a heatmap as a measured zero, the same invention one bucket
+at a time. Absent buckets are now absent. The derived `tail` and
+`<bucket>plus` columns read every bucket, so they are skipped rather than
+computed wrong when the payload carried only some.
+
+### 6.37 Interning is linear
+
+`intern` scanned the whole entry slice for a reusable hole on every new
+value, under the exclusive dictionary lock and on the write path: 10 k
+values in 25 ms, 20 k in 92 ms, 40 k in 362 ms — a clean 4× per doubling,
+which at the default 100 k cardinality limit is seconds of lock-held CPU per
+label key with every write serialised behind it. The free positions are held
+in a list built once at load, so the cost no longer depends on cardinality.
+
+### 6.38 Smaller corrections
 
 - The remote follower shared one `Checkpoint` between its tail loop, which
   rewinds it on a rotation, and the sink's flush goroutine, which advances
@@ -665,6 +784,41 @@ elsewhere:
 - `startReporting`'s stop function waits for its goroutine, so a progress
   sample can no longer be queued into a sink whose final flush has already
   happened.
+- A variable inside a regex is diagnosed. `host = "$env"` was a clear
+  `E010` while `host =~ /$env/` compiled as a literal regex, matched
+  nothing, and produced only a `W201` — the same mistake with two very
+  different answers. `Variables()` walks `match`/`noMatch` too, so the
+  plugin reports the dependency. `$` is the end-of-line anchor far more
+  often than it is a variable, so only a `$` immediately followed by an
+  identifier counts, and an escaped `\$` is left alone.
+- `validateExpr` applies the unknown-label check (`E004`) to `has` and
+  `missing`, not only to the comparisons. `MISSING nosuchlabel` used to
+  validate and match every row.
+- `Checkpoint.SpecHash` and `LastTSMs` were serialised into every
+  checkpoint file and read by nothing. The feature they were for —
+  spec-change invalidation — is not implemented, so the fields are gone
+  rather than left looking like one that works.
+- Batch import keys its hint on `StreamID(path)`, as follow does. Keying
+  on the raw path gave one record two different keys depending on how the
+  file was read, so under `key: offset` a file that was imported and later
+  followed produced two rows per record.
+- `Ingest.resolve` de-duplicates. Overlapping sources are ordinary —
+  `/logs` and `/logs/*.log` name the same files — and every record in the
+  overlap was extracted, delivered and counted twice.
+- `lexNumber` decodes the unit rather than byte-casting it, which is the
+  conversion the identifier scanner was explicitly moved away from; only
+  the rewind kept it harmless.
+- `p.integer()` reports a fractional token as a positioned `ParseError`.
+  The lexer emits `1.5` as a number, so `ParseInt` surfaced a bare
+  `strconv` error with no position in it.
+- `remoteService.Parse` returns an error when the catalogue fetch fails.
+  Returning `q, nil, nil` reported a query as valid when the
+  catalogue-dependent half of validation never ran.
+- `CheckHealth` no longer prints `data from 1970-01-01` for sets that carry
+  a last timestamp but no first one.
+- `receiver` collapses a repeated per-record warning onto the powers of
+  ten. A listener that matches no profile fails every record, and a line
+  each was a log flood at line rate.
 
 ## 7. Known gaps worth naming
 
@@ -693,8 +847,11 @@ elsewhere:
   refuses both. Separating them needs a tagged value on `Compare` and
   `InList`, which changes the JSON shape of every stored panel; the
   round-trip is otherwise lossless.
-- **The sink's buffer is not bounded.** A cancelled context (§ shutdown)
-  and a rejected credential (§6.26) both requeue rather than shed, so a
-  long outage of either kind grows memory until the store comes back.
-  Shedding instead would lose data that is still good, so the bound
-  belongs with a spill-to-disk queue rather than with a drop.
+- **The sink's buffer is bounded by a count, not by a spill.** A cancelled
+  context (§ shutdown), a rejected credential (§6.26) and now retry
+  exhaustion (§6.31) all requeue rather than shed, so a long outage grows
+  memory until the store comes back. `SinkConfig.MaxBufferedSamples`
+  (100 000) is where that ends: past it the oldest batch is dropped,
+  counted and logged with the reason, because an unbounded buffer turns a
+  store outage into an out-of-memory kill that loses everything rather
+  than the tail. Losing nothing at all still needs a spill-to-disk queue.

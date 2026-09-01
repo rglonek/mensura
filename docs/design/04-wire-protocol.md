@@ -104,7 +104,12 @@ Notes:
   nothing was written. Keys are remembered for `idempotency_window` (default
   10 min) in a bounded LRU. (The shipped bound is on entry count rather than on age —
 [12-implementation.md §6.9](12-implementation.md).)
-- `400` — malformed body, unknown field, bad timestamp.
+- `400` — malformed body, unknown field, bad timestamp, or metadata the client
+  sent that the store will not accept (a reserved or malformed set name, a
+  negative retention or shard width, an unknown key scheme). Client-input faults
+  must not come back as `500`: the client classifies `>= 500` as retryable and
+  its sink eventually discards the batch, so one bad field in a spec turned into
+  full-rate data loss for the life of the process.
 - `401`/`403` — auth.
 - `413` — too large.
 - `422` — unknown set while `strict_sets` is on.
@@ -155,7 +160,8 @@ message FieldMeta {
   string set = 1; string field = 2;
   Kind   kind = 3;                    // COUNTER | GAUGE | DELTA | STRING
   string unit = 4; string unit_hint = 5; string description = 6;
-  int32  max_interval_s = 7;
+  int64  max_interval_ms = 12;        // declared cadence; int32 max_interval_s = 7 is the
+                                      // superseded whole-second form, still read, never written
   Limits limits = 8;                  // {min, max, replace_with_raw}
   string bucket_set = 9;              // membership, for heatmaps
   int32  bucket_index = 10;
