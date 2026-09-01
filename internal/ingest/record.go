@@ -84,12 +84,27 @@ func readRecord(r *bufio.Reader, max int) (record, error) {
 	for {
 		chunk, err := r.ReadSlice('\n')
 		rec.Consumed += len(chunk)
+		// The terminator is framing, not payload, so it is dropped before
+		// the cap is applied -- otherwise a record of exactly max bytes
+		// looked like one that had been truncated.
+		body := chunk
+		if err == nil {
+			body = trimEOL(body)
+		}
 		if n := max - len(rec.Line); n > 0 {
-			if n > len(chunk) {
-				n = len(chunk)
+			// Oversize is set whenever bytes are discarded, including
+			// when the truncation point falls inside the chunk that also
+			// carries the terminator. It used to be set only on a
+			// *later* chunk, so the common case -- one long line -- was
+			// truncated and counted as if it had arrived whole, and
+			// truncation nothing counts is indistinguishable from data
+			// that was never there.
+			if n < len(body) {
+				rec.Oversize = true
+				body = body[:n]
 			}
-			rec.Line = append(rec.Line, chunk[:n]...)
-		} else if len(chunk) > 0 {
+			rec.Line = append(rec.Line, body...)
+		} else if len(body) > 0 {
 			rec.Oversize = true
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -103,8 +118,12 @@ func readRecord(r *bufio.Reader, max int) (record, error) {
 			return rec, err
 		}
 		rec.Terminated = true
-		// Drop the terminator, and a CRLF's carriage return with it.
-		rec.Line = trimEOL(rec.Line)
+		// A CRLF can be split by the reader's buffer, leaving the CR at
+		// the end of the previous chunk and this one holding only the
+		// LF. It is a terminator either way.
+		if n := len(rec.Line); len(chunk) == 1 && n > 0 && rec.Line[n-1] == '\r' {
+			rec.Line = rec.Line[:n-1]
+		}
 		return rec, nil
 	}
 }

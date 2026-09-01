@@ -26,6 +26,7 @@ import (
 
 	"github.com/rglonek/mensura/internal/ingest"
 	"github.com/rglonek/mensura/pkg/extract"
+	"github.com/rglonek/mensura/pkg/model"
 	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
 )
@@ -118,6 +119,17 @@ func (l *labelFlag) Set(v string) error {
 func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	if c.spec == "" {
 		return nil, nil, fmt.Errorf("--spec is required")
+	}
+	// Checked here rather than dropped later: an operator label that
+	// fails validation is discarded on its way to the store, so a typo
+	// used to cost every sample its dc or env with nothing said.
+	for k, v := range c.labels {
+		if err := model.ValidateLabelKey(k); err != nil {
+			return nil, nil, fmt.Errorf("--label: %w", err)
+		}
+		if err := model.ValidateLabelValue(v); err != nil {
+			return nil, nil, fmt.Errorf("--label %q: %w", k, err)
+		}
 	}
 	spec, err := extract.Load(c.spec)
 	if err != nil {

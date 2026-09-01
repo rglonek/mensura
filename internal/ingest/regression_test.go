@@ -1,9 +1,11 @@
 package ingest
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -734,5 +736,309 @@ func TestResolveDeduplicatesOverlappingSources(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("resolve returned %d entries for one file: %v", len(got), got)
+	}
+}
+
+// A declaration the store refuses outright must not be requeued. The store
+// applies metadata before any batch and answers a bad one with 400, which
+// the client classifies as fatal, so putting it back at the head of the
+// queue made the *next* batch fail for the same reason, and the one after
+// that: one unusable line in a spec dropped every sample the ingester
+// produced until MaxFatalDrops gave up on the process.
+func TestFatallyRejectedMetadataIsNotResent(t *testing.T) {
+	var mu sync.Mutex
+	var withMeta, accepted int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wire.WriteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(req.SetMeta) > 0 {
+			withMeta++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(wire.APIError{Error: `set "_mensura_x" uses the reserved prefix`})
+			return
+		}
+		for _, b := range req.Batches {
+			accepted += len(b.Samples)
+		}
+		_ = json.NewEncoder(w).Encode(wire.WriteResponse{Accepted: accepted})
+	}))
+	defer srv.Close()
+
+	client := wire.NewClient(srv.URL, "")
+	client.Compress, client.MaxRetries = false, 0
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	ms := int64(3600000)
+	sink.metaMu.Lock()
+	sink.setQ = append(sink.setQ, wire.SetMeta{Set: "_mensura_x", RetentionMs: &ms})
+	sink.metaMu.Unlock()
+
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if err := sink.AddSample(ctx, "lines", sampleN(int64(i))); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		_ = sink.Flush(ctx)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if withMeta != 1 {
+		t.Errorf("the refused declaration was sent %d times; it must be discarded after the first rejection", withMeta)
+	}
+	if accepted != 3 {
+		t.Errorf("%d of 3 later samples were accepted: the poison declaration kept failing their batches", accepted)
+	}
+	if got := sink.Snapshot().FatalDrop; got != 1 {
+		t.Errorf("FatalDrop = %d, want exactly the one batch that carried the bad declaration", got)
+	}
+}
+
+// Holding is only worth doing while there is somewhere to put the batch.
+// The cap used to be consulted only where a batch was put back, so while
+// delivery was held -- 30 seconds after a rejected credential, or as long
+// as a Retry-After the store chose -- Add kept appending with nothing
+// bounding it at all.
+func TestAHeldDeliveryStillHonoursTheBufferCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(wire.APIError{Error: "shedding"})
+	}))
+	defer srv.Close()
+
+	client := wire.NewClient(srv.URL, "")
+	client.Compress, client.MaxRetries = false, 0
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	cfg.BatchSize = 4
+	cfg.MaxBufferedSamples = 16
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	obs := &countingObserver{began: new(int), ended: new(int), drops: new(int), mu: &sync.Mutex{}}
+	sink.Observe(obs)
+
+	ctx := context.Background()
+	for i := 0; i < 400; i++ {
+		if err := sink.AddSample(ctx, "lines", sampleN(int64(i))); err != nil && i == 0 {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	if got := sink.buffered(); got > cfg.MaxBufferedSamples {
+		t.Errorf("buffered %d samples against a cap of %d: the hold ignores the limit", got, cfg.MaxBufferedSamples)
+	}
+	if got := sink.Snapshot().Dropped; got == 0 {
+		t.Error("samples were discarded past the cap without being counted")
+	}
+	obs.mu.Lock()
+	drops := *obs.drops
+	obs.mu.Unlock()
+	if drops == 0 {
+		t.Error("the observers were not told the samples were lost, so a checkpoint could advance over them")
+	}
+}
+
+// BatchBytes was documented, defaulted and never read, so one request was
+// bounded only by a sample count. A buffer that filled during an outage
+// then went out as a single body, and a body past the store's
+// max_request_bytes comes back 413 -- a status the client classifies as
+// fatal, so the whole buffer was dropped rather than delivered in pieces.
+func TestABigBufferIsDeliveredInBoundedRequests(t *testing.T) {
+	var mu sync.Mutex
+	var sizes []int
+	var got []int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req wire.WriteRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		n := 0
+		mu.Lock()
+		sizes = append(sizes, len(body))
+		for _, b := range req.Batches {
+			for _, s := range b.Samples {
+				v, _ := s.Fields["n"].AsInt()
+				got = append(got, v)
+				n++
+			}
+		}
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(wire.WriteResponse{Accepted: n})
+	}))
+	defer srv.Close()
+
+	client := wire.NewClient(srv.URL, "")
+	client.Compress, client.MaxRetries = false, 0
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	cfg.BatchSize = 1 << 20 // never triggers; the size bound is what is under test
+	cfg.BatchBytes = 4096
+	sink := NewSink(client, cfg, testLogger{t})
+	ctx := context.Background()
+	const n = 200
+	for i := 0; i < n; i++ {
+		if err := sink.AddSample(ctx, "lines", sampleN(int64(i))); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	for i := 0; i < 20 && sink.buffered() > 0; i++ {
+		if err := sink.Flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	}
+	if err := sink.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sizes) < 2 {
+		t.Fatalf("%d request(s) for %d samples: the byte budget was not applied", len(sizes), n)
+	}
+	for _, sz := range sizes {
+		if sz > 4*cfg.BatchBytes {
+			t.Errorf("a request of %d bytes went out against a %d-byte budget", sz, cfg.BatchBytes)
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("delivered %d of %d samples", len(got), n)
+	}
+	seen := map[int64]bool{}
+	for _, v := range got {
+		if seen[v] {
+			t.Fatalf("sample %d was delivered twice by the split", v)
+		}
+		seen[v] = true
+	}
+}
+
+// A partial take must not let a checkpoint advance: the observers' own
+// high-water mark covers every byte handed to the sink, including the
+// samples still waiting in the buffer.
+func TestAPartialTakeDoesNotAcknowledgeWhatItLeftBehind(t *testing.T) {
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	cfg := DefaultSinkConfig()
+	cfg.FlushEvery = time.Hour
+	cfg.BatchSize = 1 << 20
+	cfg.BatchBytes = 256
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	obs := &countingObserver{began: new(int), ended: new(int), drops: new(int), mu: &sync.Mutex{}}
+	sink.Observe(obs)
+	ctx := context.Background()
+	for i := 0; i < 50; i++ {
+		if err := sink.AddSample(ctx, "lines", sampleN(int64(i))); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	if err := sink.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if sink.buffered() == 0 {
+		t.Fatal("the whole buffer went out in one request; the test is not exercising a partial take")
+	}
+	obs.mu.Lock()
+	began := *obs.began
+	obs.mu.Unlock()
+	if began != 0 {
+		t.Errorf("BeginFlush ran %d time(s) for a batch that left samples behind: the checkpoint would cover bytes the store does not hold", began)
+	}
+}
+
+// A record truncated at the cap is counted as oversize even when the
+// truncation point falls inside the chunk that also carries the newline --
+// the common case of one long line. Truncation nothing counts is
+// indistinguishable from data that was never there.
+func TestTruncationIsAlwaysCounted(t *testing.T) {
+	cases := []struct {
+		name     string
+		line     string
+		max      int
+		oversize bool
+		want     string
+	}{
+		{"fits", "hello\n", 10, false, "hello"},
+		{"exactly at the cap", "hello\n", 5, false, "hello"},
+		{"exactly at the cap with crlf", "hello\r\n", 5, false, "hello"},
+		{"truncated in the terminating chunk", "hello world\n", 5, true, "hello"},
+		{"truncated with no terminator", "hello world", 5, true, "hello"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec, _ := readRecord(bufio.NewReaderSize(strings.NewReader(c.line), 64), c.max)
+			if rec.Oversize != c.oversize {
+				t.Errorf("Oversize = %v, want %v (kept %q of %q)", rec.Oversize, c.oversize, rec.Line, c.line)
+			}
+			if string(rec.Line) != c.want {
+				t.Errorf("Line = %q, want %q", rec.Line, c.want)
+			}
+			if rec.Consumed != len(c.line) {
+				t.Errorf("Consumed = %d, want %d: byte offsets are checkpoints", rec.Consumed, len(c.line))
+			}
+		})
+	}
+}
+
+// The progress document is what an operator reads after the crash it
+// describes, so it is synced before the rename and the directory after it,
+// the way the checkpoints are. A document that survived only in the page
+// cache describes nothing.
+func TestProgressFileIsWrittenAtomically(t *testing.T) {
+	p := NewProgress()
+	p.AddBytes(120)
+	p.Unmatched()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested", "progress.json")
+	if err := p.WriteFile(path); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		t.Fatalf("the progress document is not readable: %v", err)
+	}
+	if snap.BytesRead != 120 || snap.UnmatchedLines != 1 {
+		t.Errorf("progress document does not carry the counters: %+v", snap)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Error("the temporary file was left behind")
+	}
+	// Overwriting an existing document must work too.
+	p.AddBytes(80)
+	if err := p.WriteFile(path); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+}
+
+// A CRLF can be split by the reader's own buffer. The terminator is
+// stripped either way, so a label built from the record does not carry a
+// stray carriage return.
+func TestSplitCRLFIsStillATerminator(t *testing.T) {
+	// A 16-byte reader buffer makes ReadSlice hand back "0123456789abcde\r"
+	// and then "\n".
+	r := bufio.NewReaderSize(strings.NewReader("0123456789abcde\r\nnext\n"), 16)
+	rec, err := readRecord(r, 1<<20)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(rec.Line); got != "0123456789abcde" {
+		t.Errorf("Line = %q, want the record without its terminator", got)
+	}
+	if !rec.Terminated || rec.Consumed != 17 {
+		t.Errorf("Terminated = %v, Consumed = %d, want true and 17", rec.Terminated, rec.Consumed)
 	}
 }

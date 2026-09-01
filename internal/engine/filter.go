@@ -21,6 +21,13 @@ type eqExpr struct {
 type inExpr struct {
 	col  string
 	vals []model.Value
+	// nums and strs index vals for the large lists the query planner
+	// produces: a regex on a label expands to one entry per matching
+	// dictionary value, up to the whole cardinality budget, and a linear
+	// walk of that per row is O(rows x values). A bool anywhere in the
+	// list leaves both nil and falls back to the walk, which is exact.
+	nums map[float64]struct{}
+	strs map[string]struct{}
 }
 type betweenExpr struct {
 	col    string
@@ -32,7 +39,7 @@ func And(sub ...Expr) Expr                            { return &andExpr{sub} }
 func Or(sub ...Expr) Expr                             { return &orExpr{sub} }
 func Not(e Expr) Expr                                 { return &notExpr{e} }
 func Eq(col string, v model.Value) Expr               { return &eqExpr{col, v} }
-func In(col string, vals ...model.Value) Expr         { return &inExpr{col, vals} }
+func In(col string, vals ...model.Value) Expr         { return newInExpr(col, vals) }
 func BetweenExpr(col string, lo, hi model.Value) Expr { return &betweenExpr{col, lo, hi} }
 func Exists(col string) Expr                          { return &existsExpr{col} }
 
@@ -76,10 +83,60 @@ func (e *eqExpr) eval(r *lazyRow) bool {
 }
 func (e *eqExpr) columns(into map[string]struct{}) { into[e.col] = struct{}{} }
 
+// inSetThreshold is where indexing the list starts paying for itself.
+const inSetThreshold = 8
+
+func newInExpr(col string, vals []model.Value) *inExpr {
+	e := &inExpr{col: col, vals: vals}
+	if len(vals) < inSetThreshold {
+		return e
+	}
+	nums := make(map[float64]struct{}, len(vals))
+	strs := make(map[string]struct{}, len(vals))
+	for _, v := range vals {
+		switch v.T {
+		case model.TypeString:
+			strs[v.S] = struct{}{}
+		case model.TypeInt, model.TypeFloat:
+			f, ok := v.AsFloat()
+			if !ok {
+				return e
+			}
+			nums[f] = struct{}{}
+		default:
+			// A bool or an invalid value: valueEqual treats those
+			// exactly, so keep the linear walk rather than approximate
+			// it.
+			return e
+		}
+	}
+	e.nums, e.strs = nums, strs
+	return e
+}
+
 func (e *inExpr) eval(r *lazyRow) bool {
 	v, ok := r.get(e.col)
 	if !ok {
 		return false
+	}
+	if e.nums != nil || e.strs != nil {
+		// Mirrors valueEqual: a string matches only string members, a
+		// number matches any numeric member of the same magnitude, and a
+		// bool matches nothing here because none was indexed.
+		switch v.T {
+		case model.TypeString:
+			_, hit := e.strs[v.S]
+			return hit
+		case model.TypeInt, model.TypeFloat:
+			f, ok := v.AsFloat()
+			if !ok {
+				return false
+			}
+			_, hit := e.nums[f]
+			return hit
+		default:
+			return false
+		}
 	}
 	for _, c := range e.vals {
 		if valueEqual(v, c) {

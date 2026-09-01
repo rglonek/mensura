@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -306,5 +307,72 @@ func TestPartialHistogramSkipsDerivedColumns(t *testing.T) {
 	}
 	if _, ok := full["b0plus"]; !ok {
 		t.Fatal("a complete payload no longer derives its cumulative columns")
+	}
+}
+
+// A pattern may not write a reserved set, and neither may the `sets:`
+// block. Without the check a spec declaring retention for one compiled,
+// and the declaration then travelled with every write as metadata the
+// store refuses outright -- one spec typo turning into a 400 on every
+// batch the ingester produced.
+func TestReservedSetNameIsRefusedInTheSetsBlock(t *testing.T) {
+	body := `
+version: 1
+sets:
+  %s: {retention: 1h}
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: app
+        search: "x"
+        extract: ['x (?P<n>\d+)']
+`
+	mustSpec(t, strings.Replace(body, "%s", "app", 1))
+	for _, name := range []string{"_mensura_ingest", "_mensura_catalogue", "_mensura_x"} {
+		msg := specError(t, strings.Replace(body, "%s", name, 1))
+		if !strings.Contains(msg, "reserved") || !strings.Contains(msg, name) {
+			t.Errorf("refusal for %q does not name the problem: %s", name, msg)
+		}
+	}
+}
+
+// `mode: increment` counts occurrences. Seeding the window with the
+// captured value plus one meant a pattern that also extracted the field it
+// counts started every window at that value, so the first window of each
+// key reported a number nothing had counted.
+func TestIncrementCountsOccurrencesNotTheCapturedValue(t *testing.T) {
+	spec := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+      strip: true
+    labels: [class]
+    patterns:
+      - set: errors
+        search: "ERR"
+        extract: [' ERR (?P<class>\w+) (?P<n>\d+)']
+        aggregate: {every: 10s, on: [class], field: n, mode: increment}
+`)
+	st, err := spec.NewStream(spec.Profiles[0], StreamOptions{RefTime: time.Now()})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	for i := 0; i < 3; i++ {
+		if _, err := st.Process(fmt.Sprintf("%d ERR disk 500", base+int64(i)*1000)); err != nil {
+			t.Fatalf("process: %v", err)
+		}
+	}
+	out := st.Flush()
+	if len(out) != 1 {
+		t.Fatalf("flush produced %d results, want 1", len(out))
+	}
+	got, _ := out[0].Fields["n"].AsInt()
+	if got != 3 {
+		t.Errorf("increment counted %d occurrences, want 3: the captured value seeded the window", got)
 	}
 }

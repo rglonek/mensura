@@ -370,6 +370,46 @@ func (s *Store) entryLocked(set string) *setEntry {
 	return e
 }
 
+// equal compares two catalogue field records by value.
+//
+// Struct comparison was wrong here: LimitMin and LimitMax are pointers,
+// and a decoded request allocates fresh ones on every call, so
+// re-declaring identical limits always read as a change and bumped
+// CatalogueVersion -- the ETag churn that version's own contract rules
+// out.
+func (a fieldEntry) equal(b fieldEntry) bool {
+	return a.Kind == b.Kind && a.Unit == b.Unit && a.UnitHint == b.UnitHint &&
+		a.Description == b.Description && a.MaxInterval == b.MaxInterval &&
+		sameLimit(a.LimitMin, b.LimitMin) && sameLimit(a.LimitMax, b.LimitMax) &&
+		a.BucketSet == b.BucketSet && a.BucketIndex == b.BucketIndex &&
+		a.BucketEdge == b.BucketEdge && a.LastSeenMs == b.LastSeenMs
+}
+
+// bucketSetEqual compares two bucket-set records by value.
+func bucketSetEqual(a, b wire.BucketSetInfo) bool {
+	if a.Unit != b.Unit || len(a.Buckets) != len(b.Buckets) || len(a.Edges) != len(b.Edges) {
+		return false
+	}
+	for i := range a.Buckets {
+		if a.Buckets[i] != b.Buckets[i] {
+			return false
+		}
+	}
+	for i := range a.Edges {
+		if a.Edges[i] != b.Edges[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameLimit(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 // maxBucketIndex bounds a declared histogram bucket position. A bucket set
 // wider than this is a mistake or an attack, not a histogram; the index is
 // used as an allocation size, so it may not be taken on trust.
@@ -451,11 +491,15 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		case m.MaxIntervalS > 0:
 			f.MaxInterval = int64(m.MaxIntervalS) * 1000
 		}
+		// The value is copied, not the pointer: the request's own
+		// pointers must not stay reachable from the catalogue.
 		if m.LimitMin != nil {
-			f.LimitMin = m.LimitMin
+			v := *m.LimitMin
+			f.LimitMin = &v
 		}
 		if m.LimitMax != nil {
-			f.LimitMax = m.LimitMax
+			v := *m.LimitMax
+			f.LimitMax = &v
 		}
 		if m.BucketSet != "" {
 			// BucketIndex is unauthenticated client input and is used
@@ -470,7 +514,17 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 			if e.BucketSets == nil {
 				e.BucketSets = map[string]wire.BucketSetInfo{}
 			}
-			bs := e.BucketSets[m.BucketSet]
+			// Built on a copy, not in place: the stored slices are what a
+			// rendered catalogue and a running heatmap query were built
+			// from, and writing through them changes what those already
+			// hold. The copy is also what lets the comparison below see
+			// whether anything actually moved.
+			stored := e.BucketSets[m.BucketSet]
+			bs := wire.BucketSetInfo{
+				Buckets: append([]string(nil), stored.Buckets...),
+				Edges:   append([]float64(nil), stored.Edges...),
+				Unit:    stored.Unit,
+			}
 			for len(bs.Buckets) <= m.BucketIndex {
 				bs.Buckets = append(bs.Buckets, "")
 				bs.Edges = append(bs.Edges, 0)
@@ -480,10 +534,17 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 			if m.Unit != "" {
 				bs.Unit = m.Unit
 			}
-			e.BucketSets[m.BucketSet] = bs
-			changed = true
+			// Only a real change bumps the version. Marking every
+			// declaration as one meant each ingest process that declared
+			// a bucket set moved CatalogueVersion on startup and woke
+			// every client watching it -- the same churn the limits
+			// comparison above exists to prevent.
+			if !bucketSetEqual(stored, bs) {
+				e.BucketSets[m.BucketSet] = bs
+				changed = true
+			}
 		}
-		if before != *f {
+		if !before.equal(*f) {
 			changed = true
 		}
 	}

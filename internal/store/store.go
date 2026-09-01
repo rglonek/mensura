@@ -36,6 +36,17 @@ type Config struct {
 	// memory and larger files for far fewer metadata round trips.
 	StorageProfile string
 
+	// Engine tuning, the `db:` block of the config file
+	// (docs/design/09-operations.md section 1.1). Zero means "leave the
+	// engine default"; CacheBytes accepts engine.NoBlockCache to disable
+	// the block cache outright. These used to be parsed and dropped, so
+	// an operator who sized the store for a small host got the 1 GiB
+	// default anyway, with nothing saying so.
+	CacheBytes               int64
+	MemTableSizeBytes        uint64
+	MaxConcurrentCompactions int
+	Compression              string
+
 	// Retention defaults, overridable per set.
 	Retention      time.Duration
 	Shard          time.Duration
@@ -207,6 +218,11 @@ func Open(cfg Config) (*Store, error) {
 	default:
 		return nil, fmt.Errorf("store: unknown durability %q (batch, stream or paranoid)", cfg.Durability)
 	}
+	switch cfg.StorageProfile {
+	case "", "local", "network-fs":
+	default:
+		return nil, fmt.Errorf("store: unknown storage profile %q (local or network-fs)", cfg.StorageProfile)
+	}
 	if cfg.StorageProfile == "network-fs" {
 		// Every one of these exists because a network filesystem charges a
 		// metadata round trip where a local disk charges nothing.
@@ -216,6 +232,28 @@ func Open(cfg Config) (*Store, error) {
 		opts.L0StopWritesThreshold = 40
 		opts.EnableBloomFilter = true
 		opts.MaxConcurrentCompactions = 2
+	}
+	// Explicit tuning is applied last, so it wins over the profile's
+	// choices rather than being quietly overridden by them.
+	if cfg.CacheBytes != 0 {
+		opts.CacheBytes = cfg.CacheBytes
+	}
+	if cfg.MemTableSizeBytes != 0 {
+		opts.MemTableSizeBytes = cfg.MemTableSizeBytes
+	}
+	if cfg.MaxConcurrentCompactions != 0 {
+		opts.MaxConcurrentCompactions = cfg.MaxConcurrentCompactions
+	}
+	if cfg.Compression != "" {
+		// Validated rather than passed through: the engine falls back to
+		// snappy for a name it does not know, so a typo would select a
+		// codec the operator did not ask for and say nothing.
+		switch strings.ToLower(cfg.Compression) {
+		case "none", "snappy", "zstd", "balanced", "default":
+			opts.Compression = cfg.Compression
+		default:
+			return nil, fmt.Errorf("store: unknown compression %q (none, snappy, zstd or balanced)", cfg.Compression)
+		}
 	}
 	db, err := engine.Open(opts)
 	if err != nil {
@@ -617,7 +655,7 @@ func (s *Store) shardName(set string, tsMs int64) string {
 	t := time.UnixMilli(tsMs).UTC()
 	if hours%24 == 0 {
 		days := hours / 24
-		day := t.Unix() / 86400
+		day := floorDiv(t.Unix(), 86400)
 		start := time.Unix((day-mod(day, int64(days)))*86400, 0).UTC()
 		if days == 1 {
 			return set + "@" + start.Format("20060102")
@@ -629,6 +667,18 @@ func (s *Store) shardName(set string, tsMs int64) string {
 		return set + "@" + start.Format("2006010215")
 	}
 	return set + "@" + start.Format("2006010215") + "-" + strconv.Itoa(hours) + "h"
+}
+
+// floorDiv divides towards negative infinity. Go's / truncates towards
+// zero, which put a pre-epoch timestamp in the day *after* the one it
+// belongs to, while the mod below was carefully written not to. Half a
+// calculation handling negatives is worse than neither half doing so.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
 }
 
 // mod is a non-negative modulo, so a pre-epoch timestamp still floors onto
@@ -801,6 +851,25 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	return dropped, nil
 }
 
+// ForgetSet removes every trace of a logical set from the catalogue: its
+// entry and the spec-supplied retention and shard overrides that were
+// recorded alongside it.
+//
+// The overrides used to be left behind by an admin drop, so a set of the
+// same name created afterwards silently inherited the policy of the one
+// that was deleted -- until a restart, which loaded neither, and then it
+// silently did not.
+func (s *Store) ForgetSet(name string) {
+	s.mu.Lock()
+	delete(s.catalogue, name)
+	s.mu.Unlock()
+	s.retentionMu.Lock()
+	delete(s.setRetention, name)
+	delete(s.setShard, name)
+	s.retentionMu.Unlock()
+	s.catVer.Add(1)
+}
+
 // Compact runs a full-keyspace compaction; batch ingest calls this once at
 // the end of an import.
 func (s *Store) Compact() error { return s.db.Compact() }
@@ -862,7 +931,10 @@ func (sc Schema) BucketSet(set, name string) ([]string, bool) {
 		return nil, false
 	}
 	bs, ok := e.BucketSets[name]
-	return bs.Buckets, ok
+	// Copied under the lock for the same reason Catalogue copies: the
+	// validator reads this after the lock is released, while a write
+	// carrying bucket metadata may be rewriting the very same slice.
+	return append([]string(nil), bs.Buckets...), ok
 }
 
 // Sets lists the logical sets in the catalogue.
@@ -898,7 +970,16 @@ func (s *Store) Catalogue() wire.Catalogue {
 	shards := s.shardsByLogical()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := wire.Catalogue{Version: s.catVer.Load(), Conflicts: s.conflicts}
+	// Copied, never aliased: the caller marshals this after the lock is
+	// released, and the write path mutates the very same slice and maps
+	// under the write lock. A map read racing a map write is not a data
+	// race the runtime tolerates -- it is a fatal error that takes the
+	// process down, and in plugin mode that process owns the data
+	// directory.
+	out := wire.Catalogue{
+		Version:   s.catVer.Load(),
+		Conflicts: append([]wire.CatalogueConflict(nil), s.conflicts...),
+	}
 	for name, e := range s.catalogue {
 		info := wire.SetInfo{
 			Name:      name,
@@ -919,11 +1000,25 @@ func (s *Store) Catalogue() wire.Catalogue {
 		}
 		sort.Strings(info.Labels)
 		if len(e.BucketSets) > 0 {
-			info.BucketSets = e.BucketSets
+			info.BucketSets = copyBucketSets(e.BucketSets)
 		}
 		out.Sets = append(out.Sets, info)
 	}
 	sort.Slice(out.Sets, func(i, j int) bool { return out.Sets[i].Name < out.Sets[j].Name })
+	return out
+}
+
+// copyBucketSets deep-copies a set's bucket-set map, including the slices
+// inside it: applyFieldMeta writes into both.
+func copyBucketSets(in map[string]wire.BucketSetInfo) map[string]wire.BucketSetInfo {
+	out := make(map[string]wire.BucketSetInfo, len(in))
+	for name, bs := range in {
+		out[name] = wire.BucketSetInfo{
+			Buckets: append([]string(nil), bs.Buckets...),
+			Edges:   append([]float64(nil), bs.Edges...),
+			Unit:    bs.Unit,
+		}
+	}
 	return out
 }
 

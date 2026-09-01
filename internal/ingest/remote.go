@@ -87,8 +87,8 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *CheckpointStore, path string) error {
 	target := opts.Host + ":" + path
 	stream := StreamID(target)
-	cp, ok := cps.Load(stream)
-	if !ok {
+	cp, hadCheckpoint := cps.Load(stream)
+	if !hadCheckpoint {
 		cp = &Checkpoint{Stream: stream, Path: target}
 	}
 	labels := map[string]string{"host": opts.Host, "source": path}
@@ -159,7 +159,12 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 			switch {
 			case first && opts.StartAt == "beginning":
 				resetTo(0)
-			case first && opts.StartAt == "end":
+			case first && opts.StartAt == "end" && !hadCheckpoint:
+				// Only when there is no checkpoint, which is what the
+				// local follower does with the same flag. Honouring it
+				// unconditionally meant a restart of a remote follow
+				// skipped everything written while it was down, while
+				// the identical local command resumed.
 				resetTo(size)
 			case size < progress.ackedOffset():
 				i.cfg.Log.Printf("INFO %s was truncated or rotated; re-reading from the start", target)
@@ -484,10 +489,15 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		// newline-free remote file into memory whole, which is the
 		// failure the local acquisition paths were converted away from.
 		rec, err := readRecord(r, opts.MaxRecordBytes)
-		if rec.Terminated {
+		// A record longer than the cap with no terminator in it is
+		// consumed rather than held back, exactly as the local follower
+		// does: waiting for a newline that is not coming would re-read
+		// the same bytes on every reconnect and never advance.
+		oversizeUnterminated := !rec.Terminated && rec.Consumed > opts.MaxRecordBytes
+		if rec.Terminated || oversizeUnterminated {
 			recStart := consumed
 			consumed += int64(rec.Consumed)
-			if rec.Oversize {
+			if rec.Oversize || oversizeUnterminated {
 				i.cfg.Progress.OversizeRecord()
 			}
 			i.cfg.Progress.AddBytes(int64(rec.Consumed))

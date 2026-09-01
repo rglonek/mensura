@@ -371,7 +371,16 @@ func (i *Ingest) streamLabels(path string, head []byte) map[string]string {
 		labels["source"] = filepath.Base(path)
 	}
 	for k, v := range labels {
-		if model.ValidateLabelKey(k) != nil || model.ValidateLabelValue(v) != nil {
+		// Said out loud rather than dropped in silence: a label that
+		// vanishes between the spec and the store is exactly the kind of
+		// thing an operator spends an afternoon on.
+		if err := model.ValidateLabelKey(k); err != nil {
+			i.cfg.Log.Printf("WARNING %s: discarding label %q: %v", path, k, err)
+			delete(labels, k)
+			continue
+		}
+		if err := model.ValidateLabelValue(v); err != nil {
+			i.cfg.Log.Printf("WARNING %s: discarding label %q: %v", path, k, err)
 			delete(labels, k)
 		}
 	}

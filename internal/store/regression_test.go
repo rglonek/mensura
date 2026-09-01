@@ -785,3 +785,249 @@ func TestFieldMetaCarriesSubSecondCadence(t *testing.T) {
 		}
 	}
 }
+
+// Catalogue() used to hand back the live BucketSets map. The caller
+// marshals it after the lock is released, and a concurrent write carrying
+// bucket metadata rewrites that same map under the write lock -- which is
+// not a race the runtime tolerates but a fatal error that takes the
+// process down, and in plugin mode that process owns the data directory.
+func TestCatalogueDoesNotAliasLiveBucketSets(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.applyFieldMeta([]wire.FieldMeta{
+		{Set: "http", Field: "b0", Kind: model.KindGauge, BucketSet: "lat", BucketIndex: 0, BucketEdge: 0},
+	}); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	cat := s.Catalogue()
+	if len(cat.Sets) != 1 || len(cat.Sets[0].BucketSets) != 1 {
+		t.Fatalf("catalogue does not describe the bucket set: %+v", cat.Sets)
+	}
+	// Mutating the rendered catalogue must not reach the store, and a
+	// later write must not reach the rendered catalogue.
+	cat.Sets[0].BucketSets["scribbled"] = wire.BucketSetInfo{}
+	cat.Sets[0].BucketSets["lat"].Buckets[0] = "scribbled"
+	if err := s.applyFieldMeta([]wire.FieldMeta{
+		{Set: "http", Field: "b1", Kind: model.KindGauge, BucketSet: "lat", BucketIndex: 1, BucketEdge: 1},
+	}); err != nil {
+		t.Fatalf("second field meta: %v", err)
+	}
+	if got := len(cat.Sets[0].BucketSets["lat"].Buckets); got != 1 {
+		t.Errorf("the rendered catalogue grew to %d bucket(s) under a concurrent write: it aliases store state", got)
+	}
+	fresh := s.Catalogue()
+	bs := fresh.Sets[0].BucketSets["lat"]
+	if len(bs.Buckets) != 2 || bs.Buckets[0] != "b0" || bs.Buckets[1] != "b1" {
+		t.Errorf("store state was scribbled on through the rendered catalogue: %+v", bs)
+	}
+	if _, leaked := fresh.Sets[0].BucketSets["scribbled"]; leaked {
+		t.Error("a key added to the rendered catalogue reached the store")
+	}
+}
+
+// The same aliasing, caught the way it actually bites: rendering the
+// catalogue while writes carry bucket metadata. Run under -race.
+func TestCatalogueIsSafeUnderConcurrentFieldMeta(t *testing.T) {
+	s := openTestStore(t)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = s.applyFieldMeta([]wire.FieldMeta{{
+				Set: "http", Field: fmt.Sprintf("b%d", i%16), Kind: model.KindGauge,
+				BucketSet: fmt.Sprintf("lat%d", i%4), BucketIndex: i % 16,
+			}})
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		// Marshalled outside the store lock, exactly as the HTTP handler
+		// and the plugin's resource handler do it.
+		if _, err := json.Marshal(s.Catalogue()); err != nil {
+			t.Fatalf("marshal catalogue: %v", err)
+		}
+		if _, ok := s.Schema().BucketSet("http", "lat0"); ok {
+			_ = ok
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// CatalogueVersion is the version of the catalogue *schema*, and its whole
+// point is that it does not move when nothing changed. LimitMin and
+// LimitMax are pointers, and a decoded request allocates fresh ones every
+// time, so comparing the struct made every re-declaration of identical
+// limits look like a change -- and woke every client watching the ETag.
+func TestRedeclaringIdenticalLimitsDoesNotBumpTheVersion(t *testing.T) {
+	s := openTestStore(t)
+	lo, hi := 0.0, 100.0
+	meta := func() []wire.FieldMeta {
+		min, max := lo, hi
+		return []wire.FieldMeta{{
+			Set: "http", Field: "latency", Kind: model.KindGauge,
+			LimitMin: &min, LimitMax: &max,
+		}}
+	}
+	if err := s.applyFieldMeta(meta()); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	v := s.CatalogueVersion()
+	for i := 0; i < 3; i++ {
+		if err := s.applyFieldMeta(meta()); err != nil {
+			t.Fatalf("field meta: %v", err)
+		}
+	}
+	if got := s.CatalogueVersion(); got != v {
+		t.Errorf("CatalogueVersion moved from %d to %d on metadata that did not change", v, got)
+	}
+	// A real change still moves it.
+	changed := 5.0
+	if err := s.applyFieldMeta([]wire.FieldMeta{{Set: "http", Field: "latency", LimitMin: &changed}}); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	if s.CatalogueVersion() == v {
+		t.Error("a changed limit did not move CatalogueVersion")
+	}
+}
+
+// The same churn from the neighbouring branch: a bucket-set declaration
+// marked the catalogue changed whether or not it was, so every ingest
+// process that declared one moved the version on startup.
+func TestRedeclaringABucketSetDoesNotBumpTheVersion(t *testing.T) {
+	s := openTestStore(t)
+	meta := []wire.FieldMeta{
+		{Set: "lat", Field: "b0", Kind: model.KindGauge, BucketSet: "hdr", BucketIndex: 0, BucketEdge: 0, Unit: "ms"},
+		{Set: "lat", Field: "b1", Kind: model.KindGauge, BucketSet: "hdr", BucketIndex: 1, BucketEdge: 1, Unit: "ms"},
+	}
+	if err := s.applyFieldMeta(meta); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	v := s.CatalogueVersion()
+	for i := 0; i < 3; i++ {
+		if err := s.applyFieldMeta(meta); err != nil {
+			t.Fatalf("field meta: %v", err)
+		}
+	}
+	if got := s.CatalogueVersion(); got != v {
+		t.Errorf("CatalogueVersion moved from %d to %d on a bucket set that did not change", v, got)
+	}
+	// A new bucket is a real change.
+	if err := s.applyFieldMeta([]wire.FieldMeta{
+		{Set: "lat", Field: "b2", Kind: model.KindGauge, BucketSet: "hdr", BucketIndex: 2, BucketEdge: 2, Unit: "ms"},
+	}); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	if s.CatalogueVersion() == v {
+		t.Error("a new bucket did not move CatalogueVersion")
+	}
+	bs, ok := s.Catalogue().Sets[0].BucketSets["hdr"]
+	if !ok || len(bs.Buckets) != 3 || bs.Buckets[2] != "b2" {
+		t.Errorf("the bucket set does not describe the new bucket: %+v", bs)
+	}
+}
+
+// Dropping a set has to take its spec-supplied retention and shard width
+// with it. They used to be left behind, so a set of the same name created
+// afterwards silently inherited the policy of the one that was deleted --
+// until a restart, which loaded neither, and then it silently did not.
+func TestDroppingASetForgetsItsRetentionOverride(t *testing.T) {
+	s := openTestStore(t)
+	s.SetRetentionFor("http", 7*24*time.Hour, time.Hour)
+	if got := s.retentionFor("http"); got != 7*24*time.Hour {
+		t.Fatalf("retention override was not applied: %v", got)
+	}
+	writeSamples(t, s, "http", []model.Sample{{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}}})
+
+	// Through the admin endpoint, which is where the set is dropped.
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20})
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("DELETE", "/v1/admin/sets/http", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE /v1/admin/sets/http = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := s.retentionFor("http"); got != s.cfg.Retention {
+		t.Errorf("retention for a dropped set is %v, want the default %v", got, s.cfg.Retention)
+	}
+	if got := s.shardWidth("http"); got != s.cfg.Shard {
+		t.Errorf("shard width for a dropped set is %v, want the default %v", got, s.cfg.Shard)
+	}
+	if _, ok := s.catalogue["http"]; ok {
+		t.Error("the catalogue entry survived the drop")
+	}
+}
+
+// seriesKey frames its parts with lengths, for the reason PrimaryKey does:
+// a label value is any valid UTF-8, so it may contain the '=' and the NUL
+// that separated it. Two distinct groupings that build one key are two
+// series drawn as one.
+func TestSeriesKeySeparatesAmbiguousLabelSets(t *testing.T) {
+	by := []string{"a", "ab"}
+	one := map[string]string{"a": "x\x00ab=y", "ab": "z"}
+	two := map[string]string{"a": "x", "ab": "y\x00ab=z"}
+	if seriesKey(one, by, "f") == seriesKey(two, by, "f") {
+		t.Fatal("two distinct label sets share a series key: the series would be merged")
+	}
+	// The field name must not be able to run into the last label either.
+	three := map[string]string{"a": "x", "ab": "y"}
+	if seriesKey(three, by, "f") == seriesKey(map[string]string{"a": "x", "ab": "y\x00f"}, by, "") {
+		t.Fatal("a label value that swallows the field name shares its series key")
+	}
+}
+
+// The store's own day arithmetic used a truncating division while the
+// modulo next to it was written for negatives: a pre-epoch timestamp
+// floored into the following day.
+func TestShardNameFloorsPreEpochTimestamps(t *testing.T) {
+	s := openTestStore(t)
+	s.SetRetentionFor("old", 24*365*100*time.Hour, 24*time.Hour)
+	ts := time.Date(1969, 12, 30, 6, 0, 0, 0, time.UTC).UnixMilli()
+	if got, want := s.shardName("old", ts), "old@19691230"; got != want {
+		t.Errorf("shardName = %q, want %q", got, want)
+	}
+}
+
+// An unknown storage profile used to be ignored, so a typo quietly served
+// the local tuning on a network filesystem.
+func TestUnknownStorageProfileIsRefused(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.StorageProfile = "netwrok-fs"
+	s, err := Open(cfg)
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("an unknown storage profile was accepted")
+	}
+}
+
+// The `db:` block reaches the engine. It used to be parsed and dropped, so
+// an operator sizing the store for a small host kept the 1 GiB default.
+func TestEngineTuningReachesTheEngine(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	cfg.CacheBytes = 8 << 20
+	cfg.MemTableSizeBytes = 4 << 20
+	cfg.MaxConcurrentCompactions = 1
+	cfg.Compression = "zstd"
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	writeSamples(t, s, "http", []model.Sample{{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}}})
+
+	cfg.DataDir = t.TempDir()
+	cfg.Compression = "zstdd"
+	bad, err := Open(cfg)
+	if err == nil {
+		_ = bad.Close()
+		t.Fatal("an unknown compression profile was accepted; the engine falls back to snappy for one it does not know")
+	}
+}
