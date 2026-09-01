@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -89,6 +90,27 @@ func (s *Sample) Validate() error {
 		if !v.Valid() {
 			return errors.New("field " + k + " has no value")
 		}
+		if err := ValidateFieldValue(v); err != nil {
+			return fmt.Errorf("field %q: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// ValidateFieldValue rejects a value that cannot travel on the wire.
+//
+// A non-finite float is the whole of it, and it is not a theoretical
+// case: strconv.ParseFloat accepts "NaN", "Inf" and "+Infinity", so
+// Coerce turns any of those tokens in a log into a float64 that
+// encoding/json refuses to marshal. That failure lands on the *request*,
+// not the sample, so one such line used to make a whole batch
+// undeliverable -- and, because an undeliverable batch is reported to the
+// delivery observers as a lost one, it froze every followed file's
+// checkpoint for the life of the process. Naming the sample is the only
+// outcome that keeps the rest of the batch moving.
+func ValidateFieldValue(v Value) error {
+	if v.T == TypeFloat && (math.IsNaN(v.F) || math.IsInf(v.F, 0)) {
+		return fmt.Errorf("value %s is not a finite number; NaN and infinity have no meaning on a plot and cannot be encoded", v.String())
 	}
 	return nil
 }
@@ -121,6 +143,14 @@ func (v Value) MarshalJSON() ([]byte, error) {
 	case TypeInt:
 		return json.Marshal(map[string]any{"i": v.I})
 	case TypeFloat:
+		// Named here rather than left to encoding/json, whose
+		// "unsupported value: NaN" says nothing about which value it
+		// came from. Validate rejects such a value before it can reach
+		// a buffer; this is the backstop for a caller that builds a
+		// Sample directly.
+		if err := ValidateFieldValue(v); err != nil {
+			return nil, err
+		}
 		return json.Marshal(map[string]any{"f": v.F})
 	case TypeString:
 		return json.Marshal(map[string]any{"s": v.S})

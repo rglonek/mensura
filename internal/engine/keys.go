@@ -82,6 +82,40 @@ func indexKeyPK(key []byte) ([16]byte, bool) {
 	return pk, true
 }
 
+// dataPointerTag marks a D/ value as a forward pointer to an index key
+// rather than a row payload.
+//
+// The pointer used to be a bare 8 bytes and was recognised by its length,
+// but PutBatch also stores a whole row under D/ when that row carries no
+// indexed column -- and a small row encodes to exactly 8 bytes (a one
+// column, three-character name, one byte value). Length alone therefore
+// could not tell a pointer from a row. The tag can: encodeRow writes a
+// uvarint column count first, and a 9-byte payload whose count is zero is
+// not something it can produce.
+const dataPointerTag byte = 0x00
+
+// dataPointer encodes the forward pointer stored under a D/ key for an
+// indexed row.
+func dataPointer(val int64) []byte {
+	b := make([]byte, 9)
+	b[0] = dataPointerTag
+	binary.BigEndian.PutUint64(b[1:], biasInt(val))
+	return b
+}
+
+// readDataPointer recovers the indexed value from a D/ payload, reporting
+// whether it was one. The bare 8-byte form written by an earlier build is
+// still recognised, so a data directory does not have to be rewritten.
+func readDataPointer(payload []byte) (int64, bool) {
+	if len(payload) == 9 && payload[0] == dataPointerTag {
+		return unbiasInt(binary.BigEndian.Uint64(payload[1:])), true
+	}
+	if len(payload) == 8 {
+		return unbiasInt(binary.BigEndian.Uint64(payload)), true
+	}
+	return 0, false
+}
+
 // prefixEnd returns the exclusive upper bound covering every key that
 // starts with prefix.
 func prefixEnd(prefix []byte) []byte {

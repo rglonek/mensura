@@ -36,6 +36,15 @@ func flushPos(seq int) string { return "flush:" + strconv.Itoa(seq) }
 // defaultMaxRecordBytes bounds one record on every acquisition path.
 const defaultMaxRecordBytes = 1 << 20
 
+// Record is one framed record, exported so tools outside this package --
+// `mensura-ingest check` in particular -- frame a file exactly the way
+// the acquisition paths do rather than reimplementing it.
+type Record = record
+
+// ReadRecord frames one record. It is the exported form of readRecord;
+// see that function for why every path shares one framing.
+func ReadRecord(r *bufio.Reader, max int) (Record, error) { return readRecord(r, max) }
+
 // record is one framed line plus what it cost to read.
 type record struct {
 	// Line is the record without its terminator, truncated to the cap.

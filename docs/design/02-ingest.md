@@ -232,7 +232,8 @@ stalling plus a periodic `stat` probe over the same session. Because remote
 rotation detection is weaker than local, remote follow:
 
 - always uses the content fingerprint (not inode) as `file_id`;
-- runs a `stat`/`ls -i` probe every `--remote-probe-interval` (default 15 s);
+- runs a length probe every `--ssh-probe-interval` (default 15 s), which is
+  what detects a file shorter than the bytes already read;
 - prefers `--rotated-glob` catch-up over trying to be clever about the race.
 
 Multiple remote files multiplex over one SSH connection where the server

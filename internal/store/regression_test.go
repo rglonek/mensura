@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rglonek/mensura/internal/engine"
 	"github.com/rglonek/mensura/pkg/model"
 	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
@@ -505,5 +507,118 @@ func TestOffsetKeyedSampleNeedsAHint(t *testing.T) {
 	}
 	if !strings.Contains(resp.Rejected[0].Reason, "key_hint") {
 		t.Fatalf("rejection does not say why: %q", resp.Rejected[0].Reason)
+	}
+}
+
+// field_meta used to reach entryLocked with no validation at all, so any
+// client holding the write scope could put a reserved name -- or one
+// carrying the '@' that separates a set from its shard suffix -- into the
+// catalogue. Such an entry was persisted, served from /v1/catalogue,
+// accepted by the MQL validator as a real set, and could not be removed
+// through DELETE /v1/admin/sets/, which does validate.
+func TestFieldMetaCannotForgeASetName(t *testing.T) {
+	for _, bad := range []string{"_mensura_catalogue", "not a valid@name", "has spaces", "@"} {
+		s := openTestStore(t)
+		_, err := s.Write(&wire.WriteRequest{
+			FieldMeta: []wire.FieldMeta{{Set: bad, Field: "x"}},
+		}, "", "c")
+		if err == nil {
+			t.Errorf("field_meta for set %q was accepted", bad)
+		}
+		if got := s.Sets(); len(got) != 0 {
+			t.Errorf("field_meta for set %q left %v in the catalogue", bad, got)
+		}
+	}
+	// The one reserved set a client may write is still allowed.
+	s := openTestStore(t)
+	if _, err := s.Write(&wire.WriteRequest{
+		FieldMeta: []wire.FieldMeta{{Set: model.IngestSet, Field: "records"}},
+	}, "", "c"); err != nil {
+		t.Fatalf("field_meta for the ingest set was refused: %v", err)
+	}
+	// A field name is checked too: it shares the row's column namespace
+	// with the labels.
+	if _, err := s.Write(&wire.WriteRequest{
+		FieldMeta: []wire.FieldMeta{{Set: "app", Field: "timestamp"}},
+	}, "", "c"); err == nil {
+		t.Fatal("field_meta naming the reserved timestamp column was accepted")
+	}
+}
+
+// CatalogueVersion is the version of the schema, and the /v1/catalogue
+// ETag is built from it. Re-declaring the same field metadata -- which
+// every ingest process does on start -- must not move it, or the ETag
+// misses and every client watching the number is woken for nothing.
+func TestRedeclaringFieldMetaDoesNotChurnTheCatalogueVersion(t *testing.T) {
+	s := openTestStore(t)
+	meta := []wire.FieldMeta{{Set: "app", Field: "latency", Kind: model.KindGauge, Unit: "ms"}}
+	if _, err := s.Write(&wire.WriteRequest{FieldMeta: meta}, "", "c"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	settled := s.CatalogueVersion()
+	for i := 0; i < 5; i++ {
+		if _, err := s.Write(&wire.WriteRequest{FieldMeta: meta}, "", "c"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if got := s.CatalogueVersion(); got != settled {
+		t.Fatalf("catalogue version moved from %d to %d on unchanged metadata", settled, got)
+	}
+	// A real change still moves it.
+	changed := []wire.FieldMeta{{Set: "app", Field: "latency", Kind: model.KindCounter, Unit: "ms"}}
+	if _, err := s.Write(&wire.WriteRequest{FieldMeta: changed}, "", "c"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if s.CatalogueVersion() == settled {
+		t.Fatal("catalogue version did not move on a changed kind")
+	}
+}
+
+// A field carrying NaN cannot be encoded, so it must be refused by name
+// rather than accepted and left to break the request it travels in.
+func TestNonFiniteFieldValueIsRejectedNotStored(t *testing.T) {
+	s := openTestStore(t)
+	resp, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{Set: "app", Samples: []model.Sample{
+		{TSMs: 1000, Fields: map[string]model.Value{"latency": model.Float(math.NaN())}},
+		{TSMs: 1001, Fields: map[string]model.Value{"latency": model.Float(1.5)}},
+	}}}}, "", "c")
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp.Accepted != 1 {
+		t.Fatalf("accepted %d, expected the finite sample only", resp.Accepted)
+	}
+	if len(resp.Rejected) != 1 || !strings.Contains(resp.Rejected[0].Reason, "latency") {
+		t.Fatalf("rejection does not name the field: %+v", resp.Rejected)
+	}
+}
+
+// Two samples whose label sets differ only in where the framing bytes
+// fall must stay two rows. The content key used to hash "k=v\x00" with no
+// length prefix, so they collapsed into one and the write API still
+// reported both as accepted.
+func TestAmbiguousLabelSetsStayDistinctRows(t *testing.T) {
+	s := openTestStore(t)
+	ts := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	resp, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{Set: "app", Samples: []model.Sample{
+		{TSMs: ts, Labels: map[string]string{"a": "b", "c": "d"}, Fields: map[string]model.Value{"n": model.Int(1)}},
+		{TSMs: ts, Labels: map[string]string{"a": "b\x00c=d"}, Fields: map[string]model.Value{"n": model.Int(1)}},
+	}}}}, "", "c")
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp.Accepted != 2 {
+		t.Fatalf("accepted %d, expected 2", resp.Accepted)
+	}
+	rows := 0
+	p := &queryPlan{shards: s.shardsFor("app", ts-1000, ts+1000), projection: []string{model.TimestampField}}
+	if err := s.scan(context.Background(), p, &wire.QueryRequest{FromMs: ts - 1000, ToMs: ts + 1000}, nil, func(engine.Row) bool {
+		rows++
+		return true
+	}); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("stored %d row(s) for two distinct samples", rows)
 	}
 }

@@ -384,7 +384,6 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 			oversizeUnterminated = true
 		}
 		recStart := t.offset
-		t.offset += int64(rec.Consumed)
 		if rec.Oversize || oversizeUnterminated {
 			f.ing.cfg.Progress.OversizeRecord()
 		}
@@ -392,18 +391,26 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		results, perr := t.ex.Process(string(rec.Line))
 		f.ing.recordOutcome(perr)
 		for n, res := range results {
-			if err := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); err != nil {
-				return err
+			if aerr := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); aerr != nil {
+				// The read offset stays *before* this record. It used to
+				// be advanced above, so a delivery failure part-way
+				// through a record left the remaining samples unqueued
+				// and the next poll seeking past the bytes that would
+				// have produced them -- a silent loss. Re-reading the
+				// record instead redelivers the samples that did get
+				// through, which is the at-least-once contract and what
+				// content-addressed row keys collapse back to one row.
+				return aerr
 			}
 		}
-		if oversizeUnterminated {
-			t.setPending(t.offset)
-			continue
-		}
+		t.offset = recStart + int64(rec.Consumed)
 		// pending is only advanced once every sample from these bytes
 		// has been handed to the sink, so a commit can never
 		// acknowledge a byte whose samples are still unqueued.
 		t.setPending(t.offset)
+		if oversizeUnterminated {
+			continue
+		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return f.atEOF(t)
@@ -564,6 +571,14 @@ func (f *follower) EndFlush(_ int, dropped bool) {
 			f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
 		}
 	}
+}
+
+// pendingOffsetForTest exposes the in-flight high-water mark, which is
+// the value a commit is allowed to acknowledge.
+func (t *tailer) pendingOffsetForTest() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.pending
 }
 
 func (t *tailer) ackedOffset() int64 {

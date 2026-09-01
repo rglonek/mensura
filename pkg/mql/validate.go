@@ -81,6 +81,16 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	default:
 		return nil, Diag{"E008", fmt.Sprintf("unknown format %q: expected timeseries, table, heatmap or logs", q.Format)}
 	}
+	// Every later test reads this rather than q.Format. An absent
+	// "format" key decodes to "" and executes as a timeseries, but the
+	// checks below compared against the constant, so the shape most
+	// panels are stored in -- a hand-authored AST with no format --
+	// skipped the very warning that says outages will be drawn as
+	// continuous lines.
+	format := q.Format
+	if format == "" {
+		format = FormatTimeseries
+	}
 	// EVERY is a window width; a non-positive one is not a narrower
 	// window, it is a window the walk cannot form.
 	if q.EveryMs != nil && *q.EveryMs <= 0 {
@@ -122,7 +132,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			if info.Kind == model.KindCounter && !fe.Modifiers.Delta {
 				warns = append(warns, Diag{"W102", fmt.Sprintf("field %q is a counter and is plotted raw; consider RATE", fe.Field)})
 			}
-			if fe.Modifiers.GapMs == nil && info.MaxInterval == 0 && q.Format == FormatTimeseries {
+			if fe.Modifiers.GapMs == nil && info.MaxInterval == 0 && format == FormatTimeseries {
 				warns = append(warns, Diag{"W103", fmt.Sprintf("field %q has no GAP and no declared cadence; outages will render as continuous lines", fe.Field)})
 			}
 		}
@@ -152,10 +162,10 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 				return nil, Diag{"E008", fmt.Sprintf("field %q: unknown CLAMP ELSE %q (raw or bound)", fe.Field, c.Else)}
 			}
 		}
-		if q.Format == FormatTable || q.Format == FormatLogs {
+		if format == FormatTable || format == FormatLogs {
 			m := fe.Modifiers
 			if m.Delta || m.PerSecond || m.Negate || m.GapMs != nil || m.SSE != nil || m.Clamp != nil {
-				return nil, Diag{"E008", fmt.Sprintf("field %q uses timeseries-only modifiers with FORMAT %s", fe.Field, q.Format)}
+				return nil, Diag{"E008", fmt.Sprintf("field %q uses timeseries-only modifiers with FORMAT %s", fe.Field, format)}
 			}
 		}
 	}
@@ -184,7 +194,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	if q.Limits.Points != nil && maxPoints > 0 && *q.Limits.Points > maxPoints {
 		return warns, Diag{"E007", fmt.Sprintf("LIMIT POINTS %d exceeds the datasource maximum of %d", *q.Limits.Points, maxPoints)}
 	}
-	if q.Format == FormatHeatmap {
+	if format == FormatHeatmap {
 		for _, fe := range q.Select {
 			if fe.Histogram == "" {
 				return warns, Diag{"E008", "FORMAT heatmap requires HISTOGRAM(<bucket set>)"}
@@ -288,6 +298,13 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 
 // IsVariable reports whether a predicate value is still an unsubstituted
 // "$name" reference rather than a literal.
+//
+// The AST stores a variable reference as the plain string "$name", so a
+// label value that is *literally* "$name" is indistinguishable from one
+// and is refused by E010. That is a known limitation rather than an
+// oversight: separating the two needs a tagged value on Compare and
+// InList, which would change the JSON shape of every stored panel. It is
+// recorded in docs/design/12-implementation.md section 7.
 func IsVariable(v string) bool {
 	name, ok := strings.CutPrefix(v, "$")
 	if !ok || name == "" {

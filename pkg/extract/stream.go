@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rglonek/mensura/pkg/model"
 )
@@ -22,11 +23,15 @@ type Result struct {
 
 // Stats counts what a stream did, which is what makes a spec debuggable.
 type Stats struct {
-	Records        int64
-	Samples        int64
-	Unmatched      int64
-	TSParseErrors  int64
-	Oversize       int64
+	Records       int64
+	Samples       int64
+	Unmatched     int64
+	TSParseErrors int64
+	Oversize      int64
+	// Unjoined counts continuation lines that matched a multiline
+	// continue_regex but no join rule, so they were absorbed into
+	// nothing.
+	Unjoined       int64
 	FirstUnmatched []string
 }
 
@@ -127,7 +132,7 @@ func (st *Stream) Profile() *Profile { return st.profile }
 func (st *Stream) Process(line string) ([]Result, error) {
 	st.Stats.Records++
 	if n := st.profile.Framing.MaxRecordBytes; n > 0 && len(line) > n {
-		line = line[:n]
+		line = trimToRune(line[:n])
 		st.Stats.Oversize++
 	}
 	ts, off, err := st.scanTimestamp(line)
@@ -179,7 +184,13 @@ func (st *Stream) Process(line string) ([]Result, error) {
 				return nil, nil
 			}
 		}
-		return nil, nil
+		// The line is a continuation -- continue_regex claimed it -- but
+		// no join rule captured anything from it, so it contributed
+		// nothing to the buffered record and nothing of its own. It used
+		// to vanish from both the samples and the unmatched tally, which
+		// is the one outcome a spec author cannot debug.
+		st.Stats.Unjoined++
+		return nil, ErrNoJoin
 	}
 	return st.process(line, ts)
 }
@@ -191,15 +202,19 @@ func (st *Stream) Flush() []Result {
 	var out []Result
 	for k, buf := range st.multiline {
 		delete(st.multiline, k)
-		if r, err := st.process(buf.line, buf.ts); err == nil {
-			out = append(out, r...)
-		}
+		// Partial results are kept even when process reports an error:
+		// it returns the windows it closed alongside the failure.
+		r, _ := st.process(buf.line, buf.ts)
+		out = append(out, r...)
 	}
+	// Only these are counted here. process() already counted everything
+	// it returned, so adding len(out) on top double-counted every
+	// flushed multiline record.
 	for k, a := range st.aggs {
 		delete(st.aggs, k)
 		out = append(out, a.emit())
+		st.Stats.Samples++
 	}
-	st.Stats.Samples += int64(len(out))
 	return out
 }
 
@@ -217,12 +232,14 @@ func (st *Stream) FlushIdle(now time.Time) []Result {
 			continue
 		}
 		delete(st.multiline, m.StartContains)
-		if r, err := st.process(buf.line, buf.ts); err == nil {
-			out = append(out, r...)
-		}
+		r, _ := st.process(buf.line, buf.ts)
+		out = append(out, r...)
 	}
-	out = append(out, st.closeExpiredAggregators(st.aggregationHorizon(now))...)
-	st.Stats.Samples += int64(len(out))
+	// closeExpiredAggregators is called directly here, so its results are
+	// the only ones this function counts; process() counts its own.
+	closed := st.closeExpiredAggregators(st.aggregationHorizon(now))
+	out = append(out, closed...)
+	st.Stats.Samples += int64(len(closed))
 	return out
 }
 
@@ -334,8 +351,13 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 	var out []Result
 	out = append(out, st.closeExpiredAggregators(ts)...)
 	if pat.Aggregate != nil {
+		// The error is returned *with* out, never instead of it: the
+		// windows in out have already been removed from st.aggs, so a
+		// caller that dropped them on the error lost every window that
+		// happened to expire on the same record as a spec fault.
 		if err := st.aggregate(pat, set, ts, labels, fields, line); err != nil {
-			return nil, err
+			st.Stats.Samples += int64(len(out))
+			return out, err
 		}
 		st.Stats.Samples += int64(len(out))
 		return out, nil
@@ -434,6 +456,21 @@ func (a *aggregator) emit() Result {
 		fields[a.field] = model.Float(a.value)
 	}
 	return Result{Set: a.set, TSMs: a.start.UnixMilli(), Labels: a.labels, Fields: fields, Line: a.line}
+}
+
+// trimToRune drops a trailing partial UTF-8 sequence left by cutting a
+// record at a byte boundary. Without it a truncated capture becomes an
+// invalid-UTF-8 label value, which the store rejects by name -- so an
+// over-long record lost its whole sample rather than its tail.
+func trimToRune(s string) string {
+	for len(s) > 0 {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r != utf8.RuneError || size > 1 {
+			return s
+		}
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 func copyLabels(in map[string]string) map[string]string {

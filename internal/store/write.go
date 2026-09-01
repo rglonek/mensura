@@ -108,7 +108,9 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 		return &wire.WriteResponse{Duplicate: true, CatalogueVersion: s.catVer.Load()}, nil
 	}
 	if len(req.FieldMeta) > 0 {
-		s.applyFieldMeta(req.FieldMeta)
+		if err := s.applyFieldMeta(req.FieldMeta); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.applySetMeta(req.SetMeta); err != nil {
 		return nil, err
@@ -359,19 +361,51 @@ const maxBucketIndex = 4096
 // applyFieldMeta merges declared metadata. Last writer wins, but a
 // disagreement between two ingesters is recorded and surfaced rather than
 // resolved silently.
-func (s *Store) applyFieldMeta(metas []wire.FieldMeta) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+//
+// Names are validated exactly as a batch's are. They used to be taken on
+// trust, and entryLocked creates whatever it is given, so any client with
+// the write scope could put a reserved name -- or one carrying the '@'
+// that separates a set from its shard suffix -- into the catalogue. Such
+// an entry was persisted, served from /v1/catalogue, accepted by the MQL
+// validator as a real set, and could not be removed through
+// DELETE /v1/admin/sets/, which does validate.
+func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 	for _, m := range metas {
 		if m.Set == "" || m.Field == "" {
 			continue
 		}
+		if err := model.ValidateSetName(m.Set); err != nil {
+			return err
+		}
+		if model.IsReserved(m.Set) && m.Set != model.IngestSet {
+			return fmt.Errorf("set %q uses the reserved prefix", m.Set)
+		}
+		if err := model.ValidateFieldName(m.Field); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Only a real change bumps the version. Bumping unconditionally made
+	// the /v1/catalogue ETag miss on every write that carried metadata,
+	// which is the churn CatalogueVersion's own contract rules out.
+	changed := false
+	for _, m := range metas {
+		if m.Set == "" || m.Field == "" {
+			continue
+		}
+		_, hadSet := s.catalogue[m.Set]
 		e := s.entryLocked(m.Set)
+		if !hadSet {
+			changed = true
+		}
 		f, ok := e.Fields[m.Field]
 		if !ok {
 			f = &fieldEntry{}
 			e.Fields[m.Field] = f
+			changed = true
 		}
+		before := *f
 		if ok && f.Kind != "" && m.Kind != "" && f.Kind != m.Kind {
 			s.conflicts = append(s.conflicts, wire.CatalogueConflict{
 				Set: m.Set, Field: m.Field, Was: string(f.Kind), Now: string(m.Kind),
@@ -425,9 +459,16 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) {
 				bs.Unit = m.Unit
 			}
 			e.BucketSets[m.BucketSet] = bs
+			changed = true
+		}
+		if before != *f {
+			changed = true
 		}
 	}
-	s.catVer.Add(1)
+	if changed {
+		s.catVer.Add(1)
+	}
+	return nil
 }
 
 // SetRetentionFor records a per-set retention and shard width supplied by
