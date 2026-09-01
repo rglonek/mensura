@@ -167,6 +167,38 @@ type receiver struct {
 	// seq numbers received records, which have no byte offset of their
 	// own to key on.
 	seq atomic.Int64
+
+	// recordWarns collapses a repeated per-record failure. A listener
+	// that matches no profile fails every record, and a line each was a
+	// log flood at line rate that buried everything else.
+	warnMu     sync.Mutex
+	recordWarn map[string]int64
+}
+
+// warnRecord logs a per-record failure, then repeats it only on the powers
+// of ten with a running count.
+func (r *receiver) warnRecord(where string, err error) {
+	msg := err.Error()
+	r.warnMu.Lock()
+	if r.recordWarn == nil {
+		r.recordWarn = map[string]int64{}
+	}
+	// The message can carry a peer address, so the map is bounded rather
+	// than left to grow with the number of senders that ever misbehaved.
+	if len(r.recordWarn) > 256 {
+		r.recordWarn = map[string]int64{}
+	}
+	r.recordWarn[msg]++
+	n := r.recordWarn[msg]
+	r.warnMu.Unlock()
+	if !isLogMilestone(n) {
+		return
+	}
+	if n == 1 {
+		r.ing.cfg.Log.Printf("WARNING %s: %v", where, err)
+		return
+	}
+	r.ing.cfg.Log.Printf("WARNING %s: %v (%d times so far)", where, err, n)
 }
 
 // permitted reports whether a sender is allowed on this listener.
@@ -368,7 +400,7 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 				r.ing.cfg.Progress.OversizeRecord()
 			}
 			if rerr := r.handleRecord(ctx, peer, string(rec.Line)); rerr != nil {
-				r.ing.cfg.Log.Printf("WARNING %s: %v", peer, rerr)
+				r.warnRecord(peer, rerr)
 			}
 		}
 		if err != nil {
@@ -408,7 +440,7 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 	go func() {
 		for d := range queue {
 			if err := r.handleRecord(ctx, d.peer, d.text); err != nil {
-				r.ing.cfg.Log.Printf("WARNING udp %s: %v", d.peer, err)
+				r.warnRecord("udp "+d.peer, err)
 			}
 		}
 	}()

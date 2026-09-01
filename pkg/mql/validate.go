@@ -288,12 +288,62 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		if m == nil {
 			m = e.NoMatch
 		}
+		// A variable is a configuration error wherever it survives, and a
+		// regex is no exception: `host = "$env"` was a clear E010 while
+		// `host =~ /$env/` compiled as a literal regex, matched nothing,
+		// and produced only a "matches no value" warning -- the same
+		// mistake with two very different diagnoses.
+		if vs := regexVariables(m.Regex); len(vs) > 0 {
+			return Diag{"E010", fmt.Sprintf("variable $%s was not substituted; the datasource must interpolate it before the query runs", vs[0])}
+		}
 		if _, err := regexp.Compile(m.Regex); err != nil {
 			return Diag{"E001", fmt.Sprintf("invalid regex /%s/: %v", m.Regex, err)}
 		}
 		return check(m.Label)
+	case e.Has != "":
+		// HAS and MISSING name a label just as the comparisons do, so an
+		// unknown one is the same E004. Exempting them meant `MISSING
+		// nosuchlabel` validated and matched every row.
+		return check(e.Has)
+	case e.Missing != "":
+		return check(e.Missing)
 	}
 	return nil
+}
+
+// regexVariables lists the "$name" references inside a regex literal.
+//
+// '$' is also the end-of-line anchor, so only a '$' immediately followed
+// by an identifier counts: /foo$/ is an anchor, /$env/ is a variable that
+// was never substituted. A backslash-escaped '$' is a literal dollar and
+// is left alone.
+func regexVariables(re string) []string {
+	var out []string
+	rs := []rune(re)
+	for i := 0; i < len(rs); i++ {
+		if rs[i] == '\\' {
+			i++ // whatever it escapes is not a reference
+			continue
+		}
+		if rs[i] != '$' {
+			continue
+		}
+		j := i + 1
+		if j >= len(rs) || !isIdentStart(rs[j]) {
+			continue
+		}
+		for j < len(rs) && isIdentRune(rs[j]) {
+			j++
+		}
+		// '.' and '-' are identifier runes but are also regex syntax, so
+		// a trailing one belongs to the pattern, not to the name.
+		for j > i+1 && (rs[j-1] == '.' || rs[j-1] == '-') {
+			j--
+		}
+		out = append(out, string(rs[i+1:j]))
+		i = j - 1
+	}
+	return out
 }
 
 // IsVariable reports whether a predicate value is still an unsubstituted
@@ -352,6 +402,17 @@ func Variables(q *Query) []string {
 		if e.In != nil {
 			for _, v := range e.In.Values {
 				add(v)
+			}
+		}
+		// Regex clauses carry variables too. Skipping them here meant the
+		// plugin reported no dependency on a variable the panel plainly
+		// used, so the query was never re-run when it changed.
+		for _, m := range []*MatchExpr{e.Match, e.NoMatch} {
+			if m == nil {
+				continue
+			}
+			for _, v := range regexVariables(m.Regex) {
+				add("$" + v)
 			}
 		}
 	}

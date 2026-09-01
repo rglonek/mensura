@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -620,5 +621,167 @@ func TestAmbiguousLabelSetsStayDistinctRows(t *testing.T) {
 	}
 	if rows != 2 {
 		t.Fatalf("stored %d row(s) for two distinct samples", rows)
+	}
+}
+
+// A fault in what the client sent must come back as a 4xx.
+//
+// wire.Client classifies >= 500 as retryable and the ingest sink drops a
+// batch that runs out of retries, so answering 500 to a spec typo -- a
+// negative retention, say -- destroyed every batch the ingester produced,
+// at full rate, for the life of the process: the poison metadata was
+// requeued for the next flush every time.
+func TestClientInputFaultsAreNotServerErrors(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20})
+	h := api.Handler()
+
+	neg := int64(-5000)
+	unknown := int64(1000)
+	for _, tc := range []struct {
+		name string
+		req  wire.WriteRequest
+	}{
+		{"negative retention", wire.WriteRequest{SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &neg}}}},
+		{"negative shard", wire.WriteRequest{SetMeta: []wire.SetMeta{{Set: "app", ShardMs: &neg}}}},
+		{"unknown key scheme", wire.WriteRequest{SetMeta: []wire.SetMeta{{Set: "app", ShardMs: &unknown, KeyScheme: "sideways"}}}},
+		{"reserved set in field meta", wire.WriteRequest{FieldMeta: []wire.FieldMeta{{Set: "_mensura_nope", Field: "v"}}}},
+	} {
+		body, err := json.Marshal(tc.req)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", tc.name, err)
+		}
+		rec := newRecorder()
+		req := httptest.NewRequest("POST", "/v1/write", bytes.NewReader(body))
+		h.ServeHTTP(rec, req)
+		if rec.code != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400 -- a %d is retryable and ends in a dropped batch", tc.name, rec.code, rec.code)
+		}
+	}
+}
+
+// A genuine store failure is still a 500: a 400 would tell the client to
+// fix a batch that is not the problem.
+func TestEngineFailuresAreStillServerErrors(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20})
+	h := api.Handler()
+	_ = s.db.Close()
+
+	body, err := json.Marshal(wire.WriteRequest{Batches: []model.Batch{{Set: "http", Samples: []model.Sample{{
+		TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)},
+	}}}}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rec := newRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/write", bytes.NewReader(body)))
+	if rec.code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want 500", rec.code)
+	}
+}
+
+// The query listener is the read surface. Mounting the full mux on it meant
+// an address published to Grafana also accepted writes and admin calls.
+func TestQueryHandlerCarriesNoWriteOrAdminSurface(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20})
+	h := api.QueryHandler()
+	for _, path := range []string{"/v1/write", "/v1/admin/compact", "/v1/admin/quiesce", "/v1/admin/sets/http"} {
+		rec := newRecorder()
+		h.ServeHTTP(rec, newRequest("POST", path, "10.0.0.1:5000"))
+		if rec.code != http.StatusNotFound {
+			t.Errorf("%s is reachable on the query listener (got %d)", path, rec.code)
+		}
+	}
+	rec := newRecorder()
+	h.ServeHTTP(rec, newRequest("GET", "/v1/catalogue", "10.0.0.1:5000"))
+	if rec.code != http.StatusOK {
+		t.Fatalf("the read surface is missing from the query listener: /v1/catalogue got %d", rec.code)
+	}
+}
+
+// LABELS <key> WHERE ... is the path a dashboard hits on every variable
+// refresh. It scans every set carrying the label across the whole range
+// and accumulates into a map, so it needs the same bound a graph has.
+func TestLabelsFilterScanIsBounded(t *testing.T) {
+	s := openTuned(t, func(c *Config) { c.MaxSeriesPerGraph = 3 })
+	now := time.Now().UnixMilli()
+	for i := 0; i < 20; i++ {
+		put(t, s, "app", model.Sample{
+			TSMs:   now + int64(i),
+			Labels: map[string]string{"host": fmt.Sprintf("h%02d", i), "dc": "eu"},
+			Fields: map[string]model.Value{"v": model.Int(1)},
+		})
+	}
+	resp, err := s.Query(context.Background(), &wire.QueryRequest{
+		AST: mustParse(t, `LABELS host WHERE dc = "eu"`), FromMs: 0, ToMs: math.MaxInt64,
+	})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if resp.Error == "" || !resp.Stats.Truncated {
+		t.Fatalf("the filter scan ran past the ceiling unreported: %d value(s), err=%q", len(resp.Rows), resp.Error)
+	}
+	if len(resp.Rows) > 3 {
+		t.Fatalf("returned %d values with a ceiling of 3", len(resp.Rows))
+	}
+}
+
+// A truncated table used to set Stats.Truncated and nothing else. The
+// plugin renders warnings and the error, so the operator saw the first
+// rows of a range with nothing saying there were more.
+func TestTabularTruncationIsVisible(t *testing.T) {
+	s := openTestStore(t)
+	t0 := base()
+	for i := 0; i < 5; i++ {
+		put(t, s, "http", model.Sample{TSMs: t0 + int64(i), Fields: map[string]model.Value{"v": model.Int(int64(i))}})
+	}
+	resp := query(t, s, `FROM http SELECT v FORMAT table LIMIT POINTS 2`, t0-1000, t0+1000)
+	if len(resp.Rows) != 2 || !resp.Stats.Truncated {
+		t.Fatalf("expected 2 truncated rows, got %d (truncated=%v)", len(resp.Rows), resp.Stats.Truncated)
+	}
+	if resp.Error == "" {
+		t.Fatal("a truncated table reported no error")
+	}
+	if !hasWarning(resp.Warnings, "W401") {
+		t.Fatalf("a truncated table carried no W401: %+v", resp.Warnings)
+	}
+}
+
+func hasWarning(ds []mql.Diag, code string) bool {
+	for _, d := range ds {
+		if d.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// The spec accepts any duration for max_interval, so the wire has to carry
+// milliseconds. Whole seconds truncated "500ms" to zero -- gap detection
+// silently off, and a query then claiming the field has no declared
+// cadence -- and rounded "1500ms" down to a tighter gap than declared.
+func TestFieldMetaCarriesSubSecondCadence(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.applyFieldMeta([]wire.FieldMeta{
+		{Set: "http", Field: "fast", Kind: model.KindGauge, MaxIntervalMs: 500},
+		{Set: "http", Field: "odd", Kind: model.KindGauge, MaxIntervalMs: 1500},
+		{Set: "http", Field: "legacy", Kind: model.KindGauge, MaxIntervalS: 5},
+	}); err != nil {
+		t.Fatalf("field meta: %v", err)
+	}
+	sc := s.Schema()
+	for _, tc := range []struct {
+		field string
+		want  int64
+	}{{"fast", 500}, {"odd", 1500}, {"legacy", 5000}} {
+		fi, ok := sc.Field("http", tc.field)
+		if !ok {
+			t.Fatalf("%s is missing from the catalogue", tc.field)
+		}
+		if fi.MaxInterval != tc.want {
+			t.Errorf("%s: MaxInterval = %d ms, want %d", tc.field, fi.MaxInterval, tc.want)
+		}
 	}
 }

@@ -141,6 +141,21 @@ func (i *Ingest) Batch(ctx context.Context, sources []string) error {
 // was describing 02-ingest.md section 4.1 rather than this code.
 func (i *Ingest) resolve(sources []string) ([]string, error) {
 	var out []string
+	// Overlapping sources are ordinary -- "/logs" and "/logs/*.log" name
+	// the same files -- and without this every record in the overlap was
+	// extracted, delivered and counted twice.
+	seen := map[string]struct{}{}
+	add := func(p string) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		if _, dup := seen[abs]; dup {
+			return
+		}
+		seen[abs] = struct{}{}
+		out = append(out, p)
+	}
 	for _, src := range sources {
 		matches, err := filepath.Glob(src)
 		if err != nil {
@@ -163,7 +178,7 @@ func (i *Ingest) resolve(sources []string) ([]string, error) {
 						return err
 					}
 					if !d.IsDir() {
-						out = append(out, p)
+						add(p)
 					}
 					return nil
 				})
@@ -172,7 +187,7 @@ func (i *Ingest) resolve(sources []string) ([]string, error) {
 				}
 				continue
 			}
-			out = append(out, m)
+			add(m)
 		}
 	}
 	return out, nil
@@ -278,6 +293,11 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 	br := bufio.NewReaderSize(rc, 64<<10)
 	// The byte offset each record starts at is the second half of its key
 	// hint, so a set keyed by `offset` keeps every occurrence distinct.
+	// The first half is the stream id, which is what the follow paths
+	// use: keying on the raw path here gave the same record two different
+	// keys depending on whether the file was imported or followed, and so
+	// two rows under `key: offset`.
+	streamID := StreamID(path)
 	var consumed int64
 	for {
 		select {
@@ -296,7 +316,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			results, err := stream.Process(string(rec.Line))
 			i.recordOutcome(err)
 			for n, r := range results {
-				if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(path, offsetPos(recStart), n)); err != nil {
+				if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, offsetPos(recStart), n)); err != nil {
 					return err
 				}
 			}
@@ -309,7 +329,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		}
 	}
 	for n, r := range stream.Flush() {
-		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(path, flushPos(0), n)); err != nil {
+		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, flushPos(0), n)); err != nil {
 			return err
 		}
 	}

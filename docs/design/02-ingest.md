@@ -153,8 +153,6 @@ on a timer and on clean shutdown.
   "file_id": {"dev": 2049, "ino": 3410221, "fingerprint": "b41a…"},
   "offset": 918273645,
   "acked_offset": 918200000,
-  "last_ts_ms": 1756400000000,
-  "spec_hash": "6d2e…",
   "updated": "2026-08-28T10:41:02Z"
 }
 ```
@@ -165,11 +163,19 @@ Rules:
   advances when the store acks a batch, to the highest byte offset fully
   covered by acked samples. `offset` is a read-ahead pointer, kept for
   diagnostics only.
-- A checkpoint is invalidated (and the file re-read from 0) when `spec_hash`
-  changes *and* the spec's `on_spec_change:` policy is `reread` (default is
-  `continue`; `reread` is opt-in because it duplicates historical samples,
-  which is harmless only when the deduplicating primary key is content-based —
-  see [04-wire-protocol.md §6](04-wire-protocol.md)).
+- Spec-change invalidation (`spec_hash` plus an `on_spec_change: reread`
+  policy, re-reading the file from 0) is **not implemented**. The fields it
+  needed were written into every checkpoint and never read by anything, so
+  they have been removed rather than left looking like a working feature; a
+  spec change currently always behaves as `continue`.
+- A batch that the sink gave up on freezes this file's resume point, because a
+  checkpoint is a single offset and moving it past the missing records would
+  bury them. The freeze is lifted by the first delivery that succeeds
+  afterwards, which rewinds the reader to the frozen offset and re-reads from
+  there. Duplicates that produces collapse under a content-addressed primary
+  key. Before that, a restart was the only way out, so a few seconds of store
+  unavailability stopped checkpointing every followed file until someone
+  noticed.
 - `file_id.fingerprint` is a hash of the first 256 bytes of the file. It is what
   makes rotation detection correct on filesystems where inode numbers are
   reused (and over SSH, where inodes are not directly observable).
@@ -322,6 +328,15 @@ The write client is one per process, shared across shards.
   offending sample, and *dropped* — the batch is not retried, because retrying
   a malformed batch forever is how a pipeline stalls silently. Beyond
   `--max-fatal-drops` the process exits non-zero so a supervisor notices.
+- **Retry exhaustion is back-pressure, not a verdict.** A store that sheds load
+  answers `503` with `Retry-After`, which is a request to slow down; running out
+  of client-side retries a few seconds later says nothing about the batch. It
+  goes back at the head of its buffer, delivery is held for `Retry-After` (or a
+  short fixed interval), and the readers feel it through the buffer filling up
+  — the same shape as the `401` path. Only when the sink's buffer cap
+  (`SinkConfig.MaxBufferedSamples`, 100 000 samples) is reached is anything
+  discarded, and then it is counted and logged with the reason. Discarding on retry exhaustion instead
+  meant a compaction stall or a rolling restart cost data at full rate.
 - **Backpressure**: when the in-flight request budget is exhausted, `submit`
   blocks, which stops the sample workers, which stops the readers, which stops
   the TCP window / file reads. Loss is confined to UDP, by design.
@@ -348,7 +363,9 @@ an ingest that cannot reach its store is still observable.
 | Failure | Behaviour |
 | --- | --- |
 | Store unreachable | Retry with backoff; checkpoints stop advancing; follow readers stall (no data loss for files); UDP drops counted |
+| Store sheds load past the retry budget | Batch requeued, delivery held, readers throttled by the filling buffer; only a full buffer drops, counted and logged |
 | Store returns 400 for a batch | Batch dropped, counted, first sample logged; ingest continues |
+| A dropped batch froze a checkpoint | The first delivery that succeeds afterwards lifts the freeze and rewinds the reader to the frozen offset; no restart needed |
 | Spec fails to compile | Startup fails; a running follow keeps the last good spec on reload failure and logs loudly |
 | Log file deleted mid-read | Drain to EOF, close, wait for the path to reappear |
 | Disk full on state dir | Checkpoint writes fail → logged, in-memory offsets continue, restart replays from the last good checkpoint |

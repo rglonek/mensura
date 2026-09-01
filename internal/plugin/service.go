@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 
 	"github.com/rglonek/mensura/internal/store"
@@ -88,7 +89,11 @@ func (r *remoteService) Parse(ctx context.Context, text string) (*mql.Query, []m
 	}
 	cat, err := r.Catalogue(ctx)
 	if err != nil {
-		return q, nil, nil
+		// Not "q, nil, nil": the catalogue-dependent half of validation
+		// never ran, and answering with no diagnostics reports a query as
+		// valid when nothing checked it. An unreachable store is the
+		// answer here.
+		return q, nil, fmt.Errorf("the query could not be validated: the store's catalogue is unreachable: %w", err)
 	}
 	// The upstream store's ceilings, so proxy mode validates a LIMIT the
 	// same way embedded mode does rather than accepting anything.

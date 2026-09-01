@@ -37,18 +37,27 @@ type SetMeta struct {
 // catalogue and on into the query builder's defaults. It is sent once per
 // process start and on spec reload, not per sample.
 type FieldMeta struct {
-	Set          string     `json:"set"`
-	Field        string     `json:"field"`
-	Kind         model.Kind `json:"kind,omitempty"`
-	Unit         string     `json:"unit,omitempty"`
-	UnitHint     string     `json:"unit_hint,omitempty"`
-	Description  string     `json:"description,omitempty"`
-	MaxIntervalS int        `json:"max_interval_s,omitempty"`
-	LimitMin     *float64   `json:"limit_min,omitempty"`
-	LimitMax     *float64   `json:"limit_max,omitempty"`
-	BucketSet    string     `json:"bucket_set,omitempty"`
-	BucketIndex  int        `json:"bucket_index,omitempty"`
-	BucketEdge   float64    `json:"bucket_edge,omitempty"`
+	Set         string     `json:"set"`
+	Field       string     `json:"field"`
+	Kind        model.Kind `json:"kind,omitempty"`
+	Unit        string     `json:"unit,omitempty"`
+	UnitHint    string     `json:"unit_hint,omitempty"`
+	Description string     `json:"description,omitempty"`
+	// MaxIntervalMs is the declared cadence. It is milliseconds because
+	// the spec accepts any duration: carrying whole seconds truncated
+	// "500ms" to zero, which switched gap detection off and then had the
+	// query warn that the field has no declared cadence, and rounded
+	// "1500ms" down to a *tighter* gap than declared, so a series
+	// arriving exactly on time drew a connect-break at every point.
+	MaxIntervalMs int64 `json:"max_interval_ms,omitempty"`
+	// MaxIntervalS is the original whole-second form. It is still read so
+	// an older ingester's metadata still lands, and never written.
+	MaxIntervalS int      `json:"max_interval_s,omitempty"`
+	LimitMin     *float64 `json:"limit_min,omitempty"`
+	LimitMax     *float64 `json:"limit_max,omitempty"`
+	BucketSet    string   `json:"bucket_set,omitempty"`
+	BucketIndex  int      `json:"bucket_index,omitempty"`
+	BucketEdge   float64  `json:"bucket_edge,omitempty"`
 }
 
 // WriteResponse reports what happened to a batch. Partial rejection is

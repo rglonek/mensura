@@ -56,7 +56,7 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	case mql.KindLabelKeys:
 		return s.queryLabelKeys(q.From), nil
 	case mql.KindLabels:
-		resp, err := s.queryLabelValues(ctx, q, req)
+		resp, err := s.queryLabelValues(ctx, q, req, narrower(seriesCeiling, q.Limits.Series), narrower(pointsCeiling, q.Limits.Points))
 		if err == nil && resp != nil {
 			resp.Warnings = append(warns, resp.Warnings...)
 		}
@@ -470,9 +470,14 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 
 	for _, a := range out {
 		spec := a.field.spec
+		// The end of the range, so a series that stops mid-range draws a
+		// connect-break where the cadence was first missed instead of
+		// running to its last point and stopping.
+		spec.EndMs = req.ToMs
 		if req.Options.FromAlert {
 			// Synthetic padding must never contribute to a rule evaluation.
 			spec.SSE = render.SSE{Mode: render.SSEOff}
+			spec.EndMs = 0
 		}
 		pts := render.Series(a.points, spec, window)
 		ser := wire.Series{Name: a.name, Labels: a.labels, Meta: a.field.meta}
@@ -716,6 +721,18 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
 	resp.Stats.Truncated = truncated
+	if truncated {
+		// Truncation used to be recorded in Stats alone, which nothing
+		// renders: a table quietly showed the first rows of a range with
+		// nothing saying there were more. The timeseries and heatmap
+		// paths say so with the same error and the same code.
+		msg := fmt.Sprintf("more rows matched than the limit of %d; the newest were kept -- narrow the range, add filters or raise LIMIT POINTS", limit)
+		if !p.reverse {
+			msg = fmt.Sprintf("more rows matched than the limit of %d; the oldest were kept -- narrow the range, add filters or raise LIMIT POINTS", limit)
+		}
+		resp.Error = msg
+		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: msg})
+	}
 	for _, r := range rows {
 		resp.Rows = append(resp.Rows, wire.Row{Values: r.vals})
 	}
@@ -886,7 +903,7 @@ func (s *Store) queryLabelKeys(set string) *wire.QueryResponse {
 // stored in the AST, printed back — and then silently dropped here, so a
 // dashboard variable written as `LABELS host WHERE dc = "eu-west-1"`
 // returned the hosts of every datacentre.
-func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.QueryRequest) (*wire.QueryResponse, error) {
+func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.QueryRequest, maxSeries, maxPoints int) (*wire.QueryResponse, error) {
 	resp := &wire.QueryResponse{Columns: []wire.Column{{Name: "value", Type: "string"}}}
 	if q.Where.Empty() {
 		for _, v := range s.LabelValues(q.Label) {
@@ -903,8 +920,18 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 		return nil, ctx.Err()
 	}
 
+	// The same two ceilings the graph paths are bounded by. This scan
+	// walks every set carrying the label across the whole time range and
+	// accumulates into a map, and it is the path a dashboard hits on
+	// every variable refresh, so leaving it unbounded made a variable
+	// query the cheapest way to exhaust the process.
 	seen := map[string]struct{}{}
+	var gateErr string
+	points := 0
 	for _, set := range s.setsWithLabel(q.Label) {
+		if gateErr != "" {
+			break
+		}
 		proj := map[string]struct{}{model.TimestampField: {}, q.Label: {}}
 		expr, warns, impossible := s.buildExpr(set, q.Where, proj)
 		resp.Warnings = append(resp.Warnings, warns...)
@@ -928,7 +955,20 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 			if !ok {
 				return true
 			}
-			if str, ok := s.labelValue(q.Label, int32(idx)); ok {
+			points++
+			if maxPoints > 0 && points > maxPoints {
+				gateErr = "too many datapoints received; narrow the range or add filters to the LABELS predicate"
+				return false
+			}
+			str, ok := s.labelValue(q.Label, int32(idx))
+			if !ok {
+				return true
+			}
+			if _, dup := seen[str]; !dup {
+				if maxSeries > 0 && len(seen) >= maxSeries {
+					gateErr = "too many distinct label values; add filters to the LABELS predicate"
+					return false
+				}
 				seen[str] = struct{}{}
 			}
 			return true
@@ -944,6 +984,11 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 	sort.Strings(out)
 	for _, v := range out {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
+	}
+	if gateErr != "" {
+		resp.Error = gateErr
+		resp.Stats.Truncated = true
+		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
 	}
 	return resp, nil
 }

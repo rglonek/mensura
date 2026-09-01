@@ -210,7 +210,7 @@ implementation, each with a dedicated property test:
 | | Property | Test |
 | --- | --- | --- |
 | C1 | Output timestamps are strictly increasing | property test over random series |
-| C2 | No false continuity: any raw gap wider than `gapMs` yields a null at `ts-1` | property test with injected gaps |
+| C2 | No false continuity: any raw gap wider than `gapMs` yields a null at `ts-1`, including a *trailing* gap between the last sample and the end of the range, which yields a null at `last + gapMs` | property test with injected gaps |
 | C3 | `ELSE RAW` substitutes the raw sample, and `PER SECOND` may still divide it | table test per flag combination |
 | C4 | Both window extrema appear, at their original raw timestamps | property test comparing against a brute-force per-window min/max |
 | C5 | Ties are won by the earliest sample | table test with plateaus |
@@ -250,6 +250,11 @@ so the mapping is stated explicitly:
 - **No cross-series arithmetic at render time.** Per-series window anchoring
   makes `a / b` ill-defined. If it is needed, compute it at ingest.
 - **No user-supplied aggregators.** Min and max per window are the contract.
+- **A trailing gap is a gap.** A null is injected when a later sample arrives,
+  and also at `last + gapMs` when the range ends more than `gapMs` after the
+  last sample, so a series that stops mid-range draws a connect-break rather
+  than ending at its last point. `spec.EndMs` carries the range end; it is left
+  at zero for alert evaluation, where no synthetic point may contribute.
 - **No interpolation across gaps, ever.**
 - **No smoothing of counter-reset recovery.** The jump from delta values to a
   raw counter reading is visually abrupt, and abrupt is correct: every smoothed

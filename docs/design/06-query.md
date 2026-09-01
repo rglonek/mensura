@@ -211,7 +211,9 @@ LABEL KEYS FROM http                   -- label keys present on a set
 
 These are the backing endpoints for Grafana variable queries and are cheap:
 `SETS`, `FIELDS` and `LABEL KEYS` are catalogue reads; `LABELS` is a dictionary
-read plus an optional filter scan.
+read plus an optional filter scan. The filter scan is bounded by the same two
+size gates as a graph (§9): it walks every set carrying the label across the
+whole range, and a dashboard refreshes its variables on every load.
 
 ## 6. Histograms and heatmaps
 
@@ -335,7 +337,8 @@ The partial-result behaviour is part of the contract:
 | `MaxSeriesPerGraph` | 1 000 | Return the series collected so far plus the error "too many series; narrow filters or add BY" |
 | `MaxDataPointsReceived` | 34 560 000 | Return partial data plus "too many datapoints; zoom in or filter" |
 | Per-query wall clock | none (client context governs) | Client disconnect unwinds the scan |
-| `LIMIT POINTS` (table/logs) | 1 000 | Truncate, flag `truncated: true` |
+| `LIMIT POINTS` (table/logs) | 1 000 | Truncate, flag `truncated: true`, and return the error plus `W401` — a table that silently shows the first rows of a range is indistinguishable from one that shows all of them |
+| `LABELS <key> WHERE …` filter scan | the two size gates above | Return the values collected so far plus the error and `W401` |
 
 Both size gates can be disabled per query via datasource-level toggles exposed
 as dashboard variables, because during an incident the operator sometimes

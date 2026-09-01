@@ -94,19 +94,33 @@ func HashSecret(secret string) string {
 
 // Handler builds the public mux: write, query and catalogue reads.
 func (a *API) Handler() http.Handler {
+	mux := a.readOnlyMux()
+	mux.HandleFunc("/v1/write", a.wrap(ScopeWrite, a.handleWrite))
+	mux.HandleFunc("/v1/admin/compact", a.wrap(ScopeAdmin, a.handleCompact))
+	mux.HandleFunc("/v1/admin/retention/run", a.wrap(ScopeAdmin, a.handleRetention))
+	mux.HandleFunc("/v1/admin/quiesce", a.wrap(ScopeAdmin, a.handleQuiesce))
+	mux.HandleFunc("/v1/admin/sets/", a.wrap(ScopeAdmin, a.handleDropSet))
+	return mux
+}
+
+// QueryHandler is the read surface only: no /v1/write, no /v1/admin.
+//
+// The query listener exists so an operator can hand a separate address to
+// Grafana. Mounting the full mux on it meant that address also accepted
+// writes and admin calls -- dropping a set among them -- with nothing but
+// bearer scopes between them, and with auth.mode: none, nothing at all.
+// A listener an operator describes as read-only has to be read-only.
+func (a *API) QueryHandler() http.Handler { return a.readOnlyMux() }
+
+func (a *API) readOnlyMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/hello", a.wrap(ScopeQuery, a.handleHello))
-	mux.HandleFunc("/v1/write", a.wrap(ScopeWrite, a.handleWrite))
 	mux.HandleFunc("/v1/query", a.wrap(ScopeQuery, a.handleQuery))
 	mux.HandleFunc("/v1/catalogue", a.wrap(ScopeQuery, a.handleCatalogue))
 	mux.HandleFunc("/v1/labels", a.wrap(ScopeQuery, a.handleLabels))
 	mux.HandleFunc("/v1/stats", a.wrap(ScopeQuery, a.handleStats))
 	mux.HandleFunc("/v1/parse", a.wrap(ScopeQuery, a.handleParse))
 	mux.HandleFunc("/v1/print", a.wrap(ScopeQuery, a.handlePrint))
-	mux.HandleFunc("/v1/admin/compact", a.wrap(ScopeAdmin, a.handleCompact))
-	mux.HandleFunc("/v1/admin/retention/run", a.wrap(ScopeAdmin, a.handleRetention))
-	mux.HandleFunc("/v1/admin/quiesce", a.wrap(ScopeAdmin, a.handleQuiesce))
-	mux.HandleFunc("/v1/admin/sets/", a.wrap(ScopeAdmin, a.handleDropSet))
 	return mux
 }
 
@@ -265,6 +279,17 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 	resp, err := a.store.Write(&req, r.Header.Get("Idempotency-Key"), client)
 	if err != nil {
 		a.writeErrs.Add(1)
+		// A fault in what the client sent is a 400, not a 500. The client
+		// classifies >= 500 as retryable and its sink drops a batch that
+		// runs out of retries, so answering 500 to a spec typo turned one
+		// bad metadata field into permanent, full-rate data loss: every
+		// batch failed, was retried six times, was dropped -- and the
+		// poison metadata was requeued for the next flush.
+		var bad *ErrBadRequest
+		if errors.As(err, &bad) {
+			writeErr(w, http.StatusBadRequest, bad.Msg)
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

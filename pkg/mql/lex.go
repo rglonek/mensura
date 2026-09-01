@@ -179,8 +179,17 @@ func (l *lexer) lexNumber(start int) {
 	// A duration is a number immediately followed by a unit, with no space:
 	// 90s, not 1m30s.
 	us := l.pos
-	for l.pos < len(l.src) && unicode.IsLetter(rune(l.src[l.pos])) {
-		l.pos++
+	// Decoded, not byte-cast: rune(l.src[i]) turns each byte of a
+	// multi-byte character into its own Latin-1 rune, which is the
+	// conversion the identifier scanner was moved away from. Only the
+	// rewind below keeps it harmless here, and a scanner that is correct
+	// only because its caller undoes it is a trap for the next change.
+	for l.pos < len(l.src) {
+		r, w := utf8.DecodeRuneInString(l.src[l.pos:])
+		if !unicode.IsLetter(r) {
+			break
+		}
+		l.pos += w
 	}
 	unit := l.src[us:l.pos]
 	switch unit {

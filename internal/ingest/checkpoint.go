@@ -18,12 +18,10 @@ type Checkpoint struct {
 	Fingerprint string `json:"fingerprint"`
 	// FingerprintBytes is how many bytes Fingerprint covers. Zero means a
 	// checkpoint written before the fingerprint carried its own width.
-	FingerprintBytes int    `json:"fingerprint_bytes,omitempty"`
-	Offset           int64  `json:"offset"`
-	AckedOffset      int64  `json:"acked_offset"`
-	LastTSMs         int64  `json:"last_ts_ms"`
-	SpecHash         string `json:"spec_hash"`
-	UpdatedUnix      int64  `json:"updated_unix"`
+	FingerprintBytes int   `json:"fingerprint_bytes,omitempty"`
+	Offset           int64 `json:"offset"`
+	AckedOffset      int64 `json:"acked_offset"`
+	UpdatedUnix      int64 `json:"updated_unix"`
 }
 
 // CheckpointStore persists checkpoints as one small JSON file per stream,

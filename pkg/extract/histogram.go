@@ -52,13 +52,32 @@ func (b *BucketSet) expand(raw string, fields map[string]model.Value) error {
 		return fmt.Errorf("extract: bucket set %s: unknown parse mode %q", b.Name, b.Parse)
 	}
 
+	// A bucket the payload did not carry is absent, not zero. Writing
+	// Int(0) for it drew on a heatmap as a measured zero -- the same
+	// invention the "captured no buckets group" guard above exists to
+	// prevent, one bucket at a time instead of a whole row.
 	var sum int64
+	present := 0
 	for _, name := range b.Buckets {
-		v := counts[name]
+		v, ok := counts[name]
+		if !ok {
+			continue
+		}
 		fields[name] = model.Int(v)
 		sum += v
+		present++
+	}
+	if present == 0 {
+		return fmt.Errorf("extract: bucket set %s: the payload carried none of the declared buckets", b.Name)
 	}
 	if !b.Cumulative && !b.Tail {
+		return nil
+	}
+	if present < len(b.Buckets) {
+		// Both derivations read every bucket: a tail is the total less
+		// the sum of all of them, and "<bucket>plus" is the count at or
+		// above that bucket. With some missing they would be wrong, and a
+		// wrong number is worse than an absent one.
 		return nil
 	}
 	total := sum

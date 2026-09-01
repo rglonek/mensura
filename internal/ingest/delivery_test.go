@@ -139,7 +139,7 @@ func TestObserversAccumulate(t *testing.T) {
 	var mu sync.Mutex
 	began, ended := 0, 0
 	for i := 0; i < 3; i++ {
-		sink.Observe(countingObserver{&mu, &began, &ended})
+		sink.Observe(countingObserver{mu: &mu, began: &began, ended: &ended})
 	}
 	if err := sink.AddSample(context.Background(), "s", sampleN(1)); err != nil {
 		t.Fatalf("add: %v", err)
@@ -163,14 +163,17 @@ func sampleN(n int64) model.Sample {
 }
 
 type countingObserver struct {
-	mu           *sync.Mutex
-	began, ended *int
+	mu                  *sync.Mutex
+	began, ended, drops *int
 }
 
 func (c countingObserver) BeginFlush() { c.mu.Lock(); *c.began++; c.mu.Unlock() }
-func (c countingObserver) EndFlush(int, bool) {
+func (c countingObserver) EndFlush(_ int, dropped bool) {
 	c.mu.Lock()
 	*c.ended++
+	if dropped && c.drops != nil {
+		*c.drops++
+	}
 	c.mu.Unlock()
 }
 

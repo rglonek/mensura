@@ -299,11 +299,16 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 	}
 	start("api", cfg.Listen.Write.Addr, api.Handler(), cfg.Listen.Write)
 	if cfg.Listen.Query.Addr != "" && cfg.Listen.Query.Addr != cfg.Listen.Write.Addr {
-		start("query", cfg.Listen.Query.Addr, api.Handler(), cfg.Listen.Query)
+		// The read surface only. An address an operator publishes to
+		// Grafana must not also accept /v1/write and /v1/admin/*.
+		start("query", cfg.Listen.Query.Addr, api.QueryHandler(), cfg.Listen.Query)
 	}
-	// The debug surface is loopback-only and is never proxied.
-	start("debug", cfg.Listen.Debug.Addr, api.DebugHandler(), listenSpec{})
-	start("metrics", cfg.Listen.Metrics.Addr, api.MetricsHandler(), listenSpec{})
+	// The debug surface is loopback-only and is never proxied. Its own
+	// TLS settings are still honoured: loadConfig validates the cert/key
+	// pair for all four listeners, and passing a zero spec here made two
+	// of those four serve plaintext no matter what the config said.
+	start("debug", cfg.Listen.Debug.Addr, api.DebugHandler(), cfg.Listen.Debug)
+	start("metrics", cfg.Listen.Metrics.Addr, api.MetricsHandler(), cfg.Listen.Metrics)
 	go func() {
 		<-ctx.Done()
 		shutdown(servers)

@@ -1,6 +1,9 @@
 package mql
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // Printing must always produce text the lexer can read back. 'g'
 // formatting turns a million into "1e+06", which the number lexer cannot
@@ -168,3 +171,79 @@ func (oneFieldSchema) Field(set, field string) (FieldInfo, bool) {
 }
 func (oneFieldSchema) HasLabel(string, string) bool              { return true }
 func (oneFieldSchema) BucketSet(string, string) ([]string, bool) { return nil, false }
+
+// A variable that survives into a regex is the same configuration error as
+// one that survives into an equality. `host = "$env"` was a clear E010
+// while `host =~ /$env/` compiled as a literal regex, matched nothing, and
+// produced only a "matches no value" warning.
+func TestUnsubstitutedVariableInARegexIsDiagnosed(t *testing.T) {
+	sc := testSchema{}
+	q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "inflight"}},
+		Where: Expr{Match: &MatchExpr{Label: "host", Regex: "$env"}}}
+	_, err := Validate(q, sc, 0, 0)
+	d, ok := err.(Diag)
+	if !ok || d.Code != "E010" {
+		t.Fatalf("got %v, want E010", err)
+	}
+	// The same must hold for NOT MATCHES.
+	q.Where = Expr{NoMatch: &MatchExpr{Label: "host", Regex: "web-$env-.*"}}
+	if _, err := Validate(q, sc, 0, 0); err == nil {
+		t.Fatal("a variable inside a NOT MATCHES regex was accepted")
+	}
+	// And a real regex must still be accepted: '$' is the end-of-line
+	// anchor far more often than it is a variable, and an escaped '$' is
+	// a literal dollar.
+	for _, re := range []string{"web-.*$", `^\$total$`, "a|b$"} {
+		q.Where = Expr{Match: &MatchExpr{Label: "host", Regex: re}}
+		if _, err := Validate(q, sc, 0, 0); err != nil {
+			t.Errorf("regex /%s/ was refused: %v", re, err)
+		}
+	}
+}
+
+// Variables() drives the plugin's dependency reporting, so a variable used
+// only inside a regex has to be listed or the panel is never re-run when
+// it changes.
+func TestVariablesFindsRegexReferences(t *testing.T) {
+	q := &Query{From: "http", Where: Expr{Or: []Expr{
+		{Match: &MatchExpr{Label: "host", Regex: "^$env-"}},
+		{Eq: &Compare{Label: "dc", Value: "$region"}},
+	}}}
+	got := Variables(q)
+	want := map[string]bool{"env": true, "region": true}
+	if len(got) != 2 || !want[got[0]] || !want[got[1]] {
+		t.Fatalf("Variables() = %v, want env and region", got)
+	}
+}
+
+// HAS and MISSING name a label just as the comparisons do. Exempting them
+// from the unknown-label check meant `MISSING nosuchlabel` validated and
+// matched every row.
+func TestHasAndMissingCheckTheLabelName(t *testing.T) {
+	sc := testSchema{}
+	for _, e := range []Expr{{Has: "nosuchlabel"}, {Missing: "nosuchlabel"}} {
+		q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "inflight"}}, Where: e}
+		if _, err := Validate(q, sc, 0, 0); err == nil {
+			t.Errorf("%+v was accepted against a catalogue that has no such label", e)
+		}
+	}
+	// A label that does exist is still fine.
+	q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "inflight"}}, Where: Expr{Has: "host"}}
+	if _, err := Validate(q, sc, 0, 0); err != nil {
+		t.Fatalf("HAS host was refused: %v", err)
+	}
+}
+
+// The lexer emits "1.5" as a number, so ParseInt on it surfaced a bare
+// strconv error with no position in it while every other syntax fault in
+// the parser comes back positioned.
+func TestFractionalIntegerIsAPositionedParseError(t *testing.T) {
+	_, err := Parse(`FROM http SELECT v LIMIT SERIES 1.5`)
+	if err == nil {
+		t.Fatal("a fractional LIMIT SERIES was accepted")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("got %T (%v), want a *ParseError", err, err)
+	}
+}

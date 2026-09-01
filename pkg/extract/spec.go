@@ -347,10 +347,17 @@ func (s *Spec) Compile() error {
 		if err := model.ValidateSetName(name); err != nil {
 			return fmt.Errorf("extract: sets: %w", err)
 		}
+		// A range check, not only a syntax check: ParseDuration accepts a
+		// leading sign so that Print -> Parse round-trips an unvalidated
+		// AST, so "-5s" here parsed cleanly and was carried all the way to
+		// the store, which refused it on every single write.
 		if opt.Retention != "" {
 			ms, err := mql.ParseDuration(opt.Retention)
 			if err != nil {
 				return fmt.Errorf("extract: set %s retention: %w", name, err)
+			}
+			if ms < 0 {
+				return fmt.Errorf("extract: set %s retention %q must not be negative", name, opt.Retention)
 			}
 			opt.retentionMs = &ms
 		}
@@ -358,6 +365,9 @@ func (s *Spec) Compile() error {
 			ms, err := mql.ParseDuration(opt.Shard)
 			if err != nil {
 				return fmt.Errorf("extract: set %s shard: %w", name, err)
+			}
+			if ms <= 0 {
+				return fmt.Errorf("extract: set %s shard %q must be positive", name, opt.Shard)
 			}
 			opt.shardMs = &ms
 		}
@@ -494,6 +504,9 @@ func (p *Profile) compile(s *Spec) error {
 			ms, err := mql.ParseDuration(fs.MaxInterval)
 			if err != nil {
 				return fmt.Errorf("field %s: %w", name, err)
+			}
+			if ms <= 0 {
+				return fmt.Errorf("field %s: max_interval %q must be positive", name, fs.MaxInterval)
 			}
 			fs.maxIntervalMs = ms
 		}

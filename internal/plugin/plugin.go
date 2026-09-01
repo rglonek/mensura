@@ -262,11 +262,18 @@ func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequ
 	}
 	msg := fmt.Sprintf("mensura-store %s (%s mode, protocol v%d): %d set(s)",
 		hello.Version, hello.Mode, hello.Protocol, len(cat.Sets))
-	if last > 0 {
+	switch {
+	case last > 0 && first > 0:
 		msg += fmt.Sprintf(", data from %s to %s",
 			time.UnixMilli(first).UTC().Format(time.RFC3339),
 			time.UnixMilli(last).UTC().Format(time.RFC3339))
-	} else {
+	case last > 0:
+		// Sets that carry a last timestamp but no first one leave the
+		// minimum at zero, which printed as "data from 1970-01-01" --
+		// a date nothing in the store has ever held.
+		msg += fmt.Sprintf(", data up to %s (no start recorded)",
+			time.UnixMilli(last).UTC().Format(time.RFC3339))
+	default:
 		msg += ", no data yet"
 	}
 	return &backend.CheckHealthResult{Status: backend.HealthStatusOk, Message: msg}, nil

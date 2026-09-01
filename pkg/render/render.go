@@ -55,6 +55,12 @@ type Spec struct {
 	ClampMax     *float64 // stage 6
 	ClampElseRaw bool     // stage 6: substitute the raw sample, not the bound
 	SSE          SSE
+	// EndMs is the end of the requested range. It is what makes a
+	// *trailing* gap drawable: a null is otherwise only ever injected
+	// when a later sample arrives, so a series that stopped mid-range
+	// ended at its last point and a source that went away drew as a line
+	// that simply stopped. Zero leaves the behaviour unchanged.
+	EndMs int64
 }
 
 // ssePadMs is the visual half-width of singular-series padding: long
@@ -216,6 +222,19 @@ func Series(points []Point, spec Spec, window int64) []Output {
 	if len(out) == 1 && !out[0].Null {
 		if lo, hi, ok := ssePair(spec.SSE, out[0]); ok {
 			out = []Output{lo, out[0], hi}
+		}
+	}
+
+	// Trailing connect-break: the declared cadence was missed between the
+	// last sample and the end of the range, so the line stops there
+	// rather than running to the edge of the panel. The break is placed
+	// at the moment the cadence was first missed, and only if it is
+	// strictly later than everything already emitted, because points must
+	// stay strictly increasing in time (C1).
+	if spec.GapMs != 0 && spec.EndMs > 0 && lastPointTime != -1 && spec.EndMs-lastPointTime > spec.GapMs {
+		at := lastPointTime + spec.GapMs
+		if len(out) == 0 || at > out[len(out)-1].TSMs {
+			out = append(out, Output{TSMs: at, Null: true})
 		}
 	}
 	return out
