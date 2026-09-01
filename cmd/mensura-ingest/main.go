@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -147,6 +148,18 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	return ing, sink, nil
 }
 
+// isFlagSet reports whether the operator supplied a flag, as opposed to
+// it holding its default.
+func isFlagSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 // splitList splits a comma-separated flag, dropping empty entries so a
 // trailing comma is not read as a request to ingest "".
 func splitList(v string) []string {
@@ -239,7 +252,14 @@ func runFollow(argv []string) error {
 	common.register(fs)
 	paths := fs.String("path", "", "comma-separated paths or globs to tail")
 	startAt := fs.String("start-at", "checkpoint", "checkpoint | beginning | end")
-	poll := fs.Duration("poll-interval", 250*time.Millisecond, "how often to check followed files")
+	poll := fs.Duration("poll-interval", 250*time.Millisecond, "how often to check followed files (local follow only)")
+	// A separate flag, not a reuse of --poll-interval: a local poll is a
+	// stat() and defaults to 250ms, while a remote probe is an SSH round
+	// trip running `wc -c`. Wiring the local cadence into the remote path
+	// would hammer the target host; leaving the remote path with no flag
+	// at all, which is what happened before, meant --poll-interval was
+	// silently ignored whenever --ssh-host was given.
+	probe := fs.Duration("ssh-probe-interval", 15*time.Second, "how often to re-check a remote file's size (SSH follow only)")
 	sshHost := fs.String("ssh-host", "", "follow on a remote host over SSH instead of locally")
 	sshUser := fs.String("ssh-user", "", "remote user")
 	sshPort := fs.Int("ssh-port", 0, "remote port")
@@ -278,11 +298,19 @@ func runFollow(argv []string) error {
 
 	list := splitList(*paths)
 	if *sshHost != "" {
+		// Say so rather than ignoring it: the flag looks like it is doing
+		// something and is not.
+		if isFlagSet(fs, "poll-interval") {
+			log.Printf("WARNING --poll-interval applies to a local follow only; use --ssh-probe-interval for a remote one")
+		}
 		return ing.FollowRemote(ctx, ingest.RemoteOptions{
 			Host: *sshHost, User: *sshUser, Port: *sshPort,
 			CredentialPath: *sshCred, InsecureHostKey: !*strictHost, Paths: list,
-			StartAt: *startAt,
+			StartAt: *startAt, ProbeInterval: *probe,
 		})
+	}
+	if isFlagSet(fs, "ssh-probe-interval") {
+		log.Printf("WARNING --ssh-probe-interval applies to an SSH follow only; a local follow uses --poll-interval")
 	}
 	return ing.Follow(ctx, ingest.FollowOptions{
 		Paths: list, StartAt: *startAt, PollInterval: *poll,
@@ -411,7 +439,14 @@ func startReporting(ctx context.Context, ing *ingest.Ingest, sink *ingest.Sink, 
 		interval = 30 * time.Second
 	}
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		// Closed on the way out so the stop function can wait. Without
+		// it, close(done) returned while this goroutine was still inside
+		// Report, which could queue a progress sample into a sink whose
+		// final flush had already happened -- so the sample was buffered
+		// and never delivered.
+		defer close(stopped)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -436,5 +471,9 @@ func startReporting(ctx context.Context, ing *ingest.Ingest, sink *ingest.Sink, 
 			}
 		}
 	}()
-	return func() { close(done) }
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-stopped
+	}
 }

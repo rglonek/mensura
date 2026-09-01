@@ -181,7 +181,30 @@ func (r *receiver) permitted(peer string) bool {
 // stream returns the extraction state for one peer, creating it on first
 // contact. One stream per peer keeps multiline and aggregation state from
 // bleeding between senders.
-func (r *receiver) stream(peer string) (*peerStream, map[string]string, error) {
+func (r *receiver) stream(ctx context.Context, peer string) (*peerStream, map[string]string, error) {
+	ps, labels, evicted, err := r.streamLocked(peer)
+	// Outside r.mu on purpose: emit delivers into the sink, and doing
+	// that from under this lock would invert two locks. Evicting without
+	// flushing is what the previous version did -- evictLocked returns
+	// the peers precisely so they can be drained, and discarding the
+	// return value threw away every open multiline record and
+	// half-filled aggregation window they still held.
+	r.drain(ctx, evicted)
+	return ps, labels, err
+}
+
+// drain flushes peers that have been retired, so nothing they buffered is
+// lost with them.
+func (r *receiver) drain(ctx context.Context, peers []*peerStream) {
+	for _, ps := range peers {
+		ps.mu.Lock()
+		results := ps.ex.Flush()
+		ps.mu.Unlock()
+		r.emit(ctx, ps, results)
+	}
+}
+
+func (r *receiver) streamLocked(peer string) (*peerStream, map[string]string, []*peerStream, error) {
 	labels := map[string]string{"host": peer, "source": r.opts.Listener}
 	for k, v := range r.ing.cfg.Labels {
 		labels[k] = v
@@ -191,29 +214,26 @@ func (r *receiver) stream(peer string) (*peerStream, map[string]string, error) {
 	defer r.mu.Unlock()
 	if ps, ok := r.streams[peer]; ok {
 		ps.seen = now
-		return ps, ps.labels, nil
+		return ps, ps.labels, nil, nil
 	}
-	// Evicted peers are flushed by the idle loop, not dropped here: this
-	// runs under r.mu and delivering into the sink from under it would
-	// invert two locks.
-	r.evictLocked(now)
+	evicted := r.evictLocked(now)
 	if len(r.streams) >= r.opts.MaxPeers {
-		return nil, labels, fmt.Errorf("too many active senders (%d); %s is not being tracked", r.opts.MaxPeers, peer)
+		return nil, labels, evicted, fmt.Errorf("too many active senders (%d); %s is not being tracked", r.opts.MaxPeers, peer)
 	}
 	profile := r.ing.cfg.Spec.SelectProfile("", nil, labels, r.opts.Listener)
 	if profile == nil {
-		return nil, labels, fmt.Errorf("no profile matched listener %q", r.opts.Listener)
+		return nil, labels, evicted, fmt.Errorf("no profile matched listener %q", r.opts.Listener)
 	}
 	ex, err := r.ing.cfg.Spec.NewStream(profile, extract.StreamOptions{
 		RefTime: now, From: r.ing.cfg.From, To: r.ing.cfg.To,
 	})
 	if err != nil {
-		return nil, labels, err
+		return nil, labels, evicted, err
 	}
 	r.ing.cfg.Sink.DeclareFields(profile)
 	ps := &peerStream{ex: ex, labels: labels, seen: now}
 	r.streams[peer] = ps
-	return ps, labels, nil
+	return ps, labels, evicted, nil
 }
 
 // evictLocked drops peers that have been silent for longer than PeerIdle
@@ -267,12 +287,7 @@ func (r *receiver) flushIdle(ctx context.Context, now time.Time) {
 	r.mu.Lock()
 	evicted := r.evictLocked(now)
 	r.mu.Unlock()
-	for _, ps := range evicted {
-		ps.mu.Lock()
-		results := ps.ex.Flush()
-		ps.mu.Unlock()
-		r.emit(ctx, ps, results)
-	}
+	r.drain(ctx, evicted)
 	for _, ps := range r.peers() {
 		ps.mu.Lock()
 		results := ps.ex.FlushIdle(now)
@@ -290,12 +305,7 @@ func (r *receiver) flushAll(ctx context.Context) {
 		delete(r.streams, peer)
 	}
 	r.mu.Unlock()
-	for _, ps := range peers {
-		ps.mu.Lock()
-		results := ps.ex.Flush()
-		ps.mu.Unlock()
-		r.emit(ctx, ps, results)
-	}
+	r.drain(ctx, peers)
 }
 
 func (r *receiver) serveTCP(ctx context.Context) error {
@@ -487,6 +497,12 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 				s.TSMs = time.Now().UnixMilli()
 				s.Labels["ts_source"] = "receiver"
 			}
+			// An offset-keyed set needs a hint or the store refuses the
+			// sample. A caller that supplied its own knows its stream
+			// better than this listener does, so it wins.
+			if s.KeyHint == "" {
+				s.KeyHint = keyHint(peer, r.arrivalPos(), i)
+			}
 			if err := r.ing.cfg.Sink.AddSample(req.Context(), body.Set, s); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -541,9 +557,15 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 		for k, v := range r.ing.cfg.Labels {
 			sample.Labels[k] = v
 		}
+		// The hint travels on this path too. It used to be supplied only
+		// in logs mode, so a set declared `key: offset` and fed by the
+		// line protocol had every one of its samples rejected by the
+		// store for carrying no hint -- a listener that could never
+		// write to the very sets the scheme exists for.
+		sample.KeyHint = keyHint(peer, r.arrivalPos(), 0)
 		return r.ing.cfg.Sink.AddSample(ctx, set, sample)
 	}
-	ps, labels, err := r.stream(peer)
+	ps, labels, err := r.stream(ctx, peer)
 	if err != nil {
 		return err
 	}
@@ -555,13 +577,20 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 	r.ing.recordOutcome(perr)
 	// A received record has no byte offset, so the hint is the listener's
 	// own arrival sequence: still one distinct value per occurrence.
-	pos := "recv:" + strconv.FormatInt(r.seq.Add(1), 10)
+	pos := r.arrivalPos()
 	for n, res := range results {
 		if err := r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(peer, pos, n)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// arrivalPos is the hint position for a record that has no byte offset of
+// its own: the listener's arrival sequence, which is the closest thing a
+// datagram has to one.
+func (r *receiver) arrivalPos() string {
+	return "recv:" + strconv.FormatInt(r.seq.Add(1), 10)
 }
 
 func hostOf(addr string) string {

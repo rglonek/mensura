@@ -324,6 +324,8 @@ func (i *Ingest) recordOutcome(err error) {
 		i.cfg.Progress.Unmatched()
 	case extract.ErrNoTimestamp:
 		i.cfg.Progress.TSError()
+	case extract.ErrNoJoin:
+		i.cfg.Progress.Unjoined()
 	default:
 		i.cfg.Progress.ExtractError()
 	}

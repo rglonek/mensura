@@ -170,19 +170,30 @@ func (l *lazyRow) get(name string) (model.Value, bool) {
 		return v, v.Valid()
 	}
 	var found model.Value
+	var bad error
 	if err := walkRow(l.payload, func(n string, t model.ValueType, raw []byte) bool {
 		if n != name {
 			return true
 		}
-		if v, err := decodeValue(t, raw); err == nil {
-			found = v
+		v, err := decodeValue(t, raw)
+		if err != nil {
+			// Recorded, not swallowed. Leaving found invalid made the
+			// column read as absent, so a pushdown filter quietly
+			// excluded the row instead of letting the scan report the
+			// corruption -- the same asymmetry decodeRow was changed to
+			// remove.
+			bad = err
+			return false
 		}
+		found = v
 		return false
 	}); err != nil {
 		// A corrupt payload must not read as "the column is absent": a
 		// pushdown filter would then quietly exclude the row instead of
 		// letting the scan report the corruption.
 		l.err = err
+	} else if bad != nil {
+		l.err = bad
 	}
 	l.cache[name] = found
 	return found, found.Valid()

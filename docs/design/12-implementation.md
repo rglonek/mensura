@@ -107,6 +107,18 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Printed MQL always re-parses (large floats, unicode, regexes) | `pkg/mql/regression_test.go:TestRoundTripSurvivesExtremeNumbersAndUnicode` |
 | An unsubstituted `$variable` is an error | `…:TestUnsubstitutedVariableIsAnError` |
 | Extraction: patterns, labels vs fields, multiline, routes, buckets, aggregation | `pkg/extract/extract_test.go` |
+| A non-finite field value is refused, not encoded | `pkg/model/regression_test.go:TestNonFiniteFieldValueIsRejectedByName` |
+| Two label sets that differ only in framing bytes stay two rows | `…:TestPrimaryKeySeparatesAmbiguousLabelSets`, `internal/store/regression_test.go:TestAmbiguousLabelSetsStayDistinctRows` |
+| `field_meta` cannot forge a set name | `internal/store/regression_test.go:TestFieldMetaCannotForgeASetName` |
+| Re-declared metadata does not churn the catalogue version | `…:TestRedeclaringFieldMetaDoesNotChurnTheCatalogueVersion` |
+| One unencodable sample does not lose its batch | `internal/ingest/regression_test.go:TestUnencodableSampleDoesNotPoisonItsBatch` |
+| A rejected credential holds the batch rather than dropping it | `…:TestRejectedCredentialHoldsTheBatchInsteadOfDroppingIt` |
+| The read offset stays before an undelivered record | `…:TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord` |
+| Every received sample carries a key hint | `…:TestReceivedSamplesCarryAKeyHint` |
+| An evicted peer is drained, not dropped | `…:TestEvictedPeerIsFlushedNotDropped` |
+| Unimplemented spec keys are refused | `pkg/extract/regression_test.go:TestUnimplementedFramingOptionsAreRefused`, `…:TestUnknownAggregateModeIsRefused` |
+| Closed windows survive an aggregation error | `…:TestExpiredWindowsSurviveAnAggregationError` |
+| An absent `FORMAT` validates as a timeseries | `pkg/mql/regression_test.go:TestAbsentFormatIsValidatedAsTimeseries` |
 
 ## 5. Implementation status
 
@@ -472,6 +484,188 @@ and disk usage to anyone who could reach the port. The metrics handler now
 requires the `query` scope like every other read. **Operational note:** a
 scrape against a `bearer`-mode store now needs a token with that scope.
 
+### 6.23 A non-finite field value is a rejection, not a poisoned batch
+
+`strconv.ParseFloat` accepts `NaN`, `Inf` and `+Infinity`, so `Coerce`
+turned any of those tokens in a log line into a `float64` that
+`encoding/json` refuses to marshal. The failure landed on the *request*
+rather than the sample: the whole batch became undeliverable, every retry
+failed the same way, and because an undeliverable batch is reported to the
+delivery observers as a lost one, it froze every followed file's
+checkpoint for the life of the process — after which a restart re-read the
+same line and did it again. One log line stopped a pipeline permanently.
+
+`Sample.Validate` now rejects a non-finite value by name, and the sink
+screens a sample for encodability before it enters a buffer, counting what
+it refuses in `SinkStats.Unencodable`. `Value.MarshalJSON` names the value
+rather than leaving `encoding/json` to say `unsupported value: NaN` with
+no field attached. A batch that cannot be encoded is also classed as
+fatal rather than as an exhausted retry, so a caller that builds one by
+hand is told it is malformed.
+
+### 6.24 Row-key components are length-prefixed
+
+[04](04-wire-protocol.md) §6 derives the content key from the set, the
+timestamp, the canonical labels and the field values. The implementation
+hashed each label as `key '=' value 0x00`, with no length prefix — and a
+label value is any valid UTF-8, so it may contain both of those framing
+bytes. `{a: "b", c: "d"}` and `{a: "b\x00c=d"}` therefore produced the
+same 16 bytes. `PutBatch` assumes a key is either new or carries the same
+indexed value, so the second sample silently overwrote the first while the
+write API reported both as accepted. The same held for string field values
+on the content path.
+
+Every variable-length component now carries a uvarint length, which cannot
+be forged from content. *Consequence*: content keys computed by this build
+differ from those computed by an earlier one. Nothing on the read path
+compares them, so existing rows stay queryable and existing shards open
+unchanged; the only effect is that re-ingesting data first written by an
+older build creates a second row rather than collapsing onto the first.
+
+### 6.25 `field_meta` is validated exactly as a batch is
+
+`applySetMeta` checked the set name and the reserved prefix;
+`applyFieldMeta` checked neither, and `entryLocked` creates whatever it is
+given. Any client holding the `write` scope could therefore put a reserved
+name — or one carrying the `@` that separates a set from its shard suffix
+— into the catalogue. The entry was persisted, served from
+`/v1/catalogue`, accepted by the MQL validator as a real set, and could
+not be removed through `DELETE /v1/admin/sets/`, which does validate. A
+name containing `@` additionally broke the logical/shard split in
+`shardsByLogical`.
+
+Set names, the reserved prefix (with the documented `_mensura_ingest`
+exception) and field names are now checked before anything is recorded,
+and the request is refused rather than partially applied.
+
+The same function also bumped `catalogue_version` unconditionally. Since
+metadata travels on every ingest process start, that reintroduced exactly
+the ETag churn `CatalogueVersion` exists to avoid. It now moves only when
+the schema actually changed.
+
+### 6.26 A rejected credential holds the batch instead of dropping it
+
+Every non-retryable status was `ErrFatal`, which the sink treats as a
+malformed batch: dropped, counted, and reported to the observers as a
+hole — so a rotated or mistyped token destroyed up to `MaxFatalDrops`
+batches *and* froze every checkpoint permanently. The batch was never the
+problem.
+
+`401` and `403` are now `wire.ErrAuth`, which is neither fatal nor
+retryable: the client returns at once (retrying the same rejected token in
+the same request is pointless), and the sink puts the batch back in its
+buffer, tells no observer anything, and holds delivery for 30 seconds
+before trying again. `Close` lifts the hold for one final attempt.
+
+*Consequence*: a long authentication outage grows the sink's buffer rather
+than shedding it, which is the same trade the cancelled-context path
+already makes. §7 names it.
+
+### 6.27 Declared-but-unimplemented spec keys are refused
+
+`framing.record: json` was accepted and every record was still framed by
+line. `timestamp.on_parse_error: fail` and `drop-stream` were accepted and
+the error was still merely counted. Both are the shape §6.2 and §7 already
+refuse for `store_stream_label` and `listen.*.tls.client_ca`: a
+declaration that does nothing is worse than one that is rejected, because
+an operator cannot tell the difference from the outside. They are now
+compile errors naming what is and is not implemented, as is an unknown
+`timestamp.anchor`.
+
+`aggregate.mode` was validated nowhere. The accumulator's update switch
+has no default, so an unrecognised mode — `avg` is the obvious typo — kept
+whichever value the first record of a window carried and ignored every
+later one, drawing a flat and entirely plausible series. The four
+implemented modes are now the only ones that compile, and a non-positive
+`every` is refused with them.
+
+### 6.28 `check` frames the way the acquisition paths do
+
+§6.19 put every acquisition path on one framing. `mensura-ingest check`
+was not one of them: it still used a `bufio.Scanner` capped at a
+megabyte, so a single longer line failed it with `ErrTooLong` and it
+reported nothing, on a file the import would have read to the end with the
+record truncated and counted. The tool whose purpose is to predict the
+import now uses the same `ReadRecord`, and reports the unjoined-
+continuation count alongside the other rates.
+
+### 6.29 A record's bytes are consumed only once its samples are queued
+
+The local follower advanced `tailer.offset` past a record before handing
+that record's samples to the sink. A delivery failure part-way through
+therefore left the remaining samples unqueued while the read offset had
+already moved past the bytes that produced them, and a later record's own
+advance carried the skipped range into the acknowledged one. The offset is
+now moved after the last sample of the record reaches the sink, so a
+failure re-reads the record whole — redelivering the samples that did get
+through, which is the at-least-once contract and what content-addressed
+row keys collapse back to one row.
+
+### 6.30 Receiver state and hints
+
+Two holes on the receive path, both of the kind §6.20 and §6.15 closed
+elsewhere:
+
+- `evictLocked` returns the peers it retires precisely so the caller can
+  drain them. `stream()` discarded that return value, so a peer evicted on
+  the arrival of a new sender lost its open multiline record and its
+  half-filled aggregation window. It is now drained, outside `r.mu`,
+  because delivering into the sink from under that lock would invert two
+  locks.
+- The `key_hint` of §6.15 was supplied only in `logs` mode. A set declared
+  `key: offset` and fed by the line protocol, or by
+  `POST /ingest/v1/samples`, had every sample refused by the store for
+  carrying no hint — a listener that could never write to the sets the
+  scheme exists for. Both paths now attach the listener's arrival
+  sequence, and a caller-supplied hint still wins.
+
+### 6.31 Smaller corrections
+
+- The remote follower shared one `Checkpoint` between its tail loop, which
+  rewinds it on a rotation, and the sink's flush goroutine, which advances
+  it — and `CheckpointStore`'s lock protects the file, not the struct. It
+  now goes through a `checkpointBox` that hands `Save` a copy, which is
+  what the local follower already did and for the same reason.
+- `lazyRow.get` recorded a structural payload error but swallowed a
+  per-value decode error, so a corrupt column read as absent and a
+  pushdown filter quietly excluded the row — the asymmetry `decodeRow` was
+  changed to remove. Both are reported now.
+- The forward pointer stored under a `D/` key carries a tag byte. It was
+  recognised by its length alone, and a small row legitimately stored
+  there — one column, a three-character name, a one-byte value — encodes
+  to exactly the same eight bytes. The untagged form written by an earlier
+  build is still read.
+- `Validate` normalises an absent `FORMAT` to `timeseries` before its
+  format-dependent checks. An AST with no `format` key executes as a
+  timeseries but skipped `W103`, the warning that says outages will be
+  drawn as continuous lines — and a hand-authored panel model, which §7
+  says is the only kind there is until the frontend exists, is exactly
+  that shape.
+- `extract.Stream.process` returns the aggregation windows it closed
+  *alongside* an error rather than instead of them. They have already been
+  removed from the stream, so a caller that dropped them on the error lost
+  every window that happened to expire on the same record as a spec fault.
+  `Flush` and `FlushIdle` no longer double-count those results in
+  `Stats.Samples`.
+- A continuation line that matched `continue_regex` but no `join` rule
+  used to vanish from both the samples and the unmatched tally. It is
+  counted, reported as `ErrNoJoin`, and surfaced by `check` and by the
+  progress document.
+- An over-long record is truncated onto a rune boundary. Cutting mid-rune
+  produced an invalid-UTF-8 label value, which the store rejects by name —
+  so the record lost its whole sample rather than its tail.
+- `mensura-store query --explain` prints the plan from `/v1/debug/plan`
+  rather than the request body. It needs `--debug-store`, because the plan
+  is served by the loopback debug listener and not by the API.
+- `mensura-ingest follow --poll-interval` is local-only and
+  `--ssh-probe-interval` is its remote counterpart; supplying one to the
+  other path now says so instead of being ignored. A local poll is a
+  `stat`, a remote probe is an SSH round trip, so they cannot share a
+  default.
+- `startReporting`'s stop function waits for its goroutine, so a progress
+  sample can no longer be queued into a sink whose final flush has already
+  happened.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
@@ -493,3 +687,14 @@ scrape against a `bearer`-mode store now needs a token with that scope.
   recovering it needs the per-set dictionaries ADR-004 rejected.
 - **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
   is the only mitigation for a query with no `BY`.
+- **A label value that is literally `$name` cannot be queried.** The AST
+  stores a variable reference as the plain string `"$name"`, so it is
+  indistinguishable from a literal of the same text, and §6.14's `E010`
+  refuses both. Separating them needs a tagged value on `Compare` and
+  `InList`, which changes the JSON shape of every stored panel; the
+  round-trip is otherwise lossless.
+- **The sink's buffer is not bounded.** A cancelled context (§ shutdown)
+  and a rejected credential (§6.26) both requeue rather than shed, so a
+  long outage of either kind grows memory until the store comes back.
+  Shedding instead would lose data that is still good, so the bound
+  belongs with a spill-to-disk queue rather than with a drop.

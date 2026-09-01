@@ -7,6 +7,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -64,6 +65,33 @@ type Sink struct {
 	// concurrent flushes would otherwise let a later batch acknowledge
 	// before an earlier one.
 	sendMu sync.Mutex
+
+	// holdMu guards holdUntil, the point in time before which delivery
+	// is not worth attempting. It exists for the auth case: the batch is
+	// requeued rather than dropped, so without a gate the very next Add
+	// would find the buffer still full, flush again, and spin on a
+	// credential that will not change for minutes.
+	holdMu    sync.Mutex
+	holdUntil time.Time
+	// now is the clock, overridable in tests.
+	now func() time.Time
+}
+
+// deliveryHold is how long the sink waits after a rejected credential
+// before trying again. Long enough that a restart or a config reload can
+// land, short enough that recovery is automatic.
+const deliveryHold = 30 * time.Second
+
+func (s *Sink) holding() bool {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	return !s.holdUntil.IsZero() && s.now().Before(s.holdUntil)
+}
+
+func (s *Sink) holdDelivery(d time.Duration) {
+	s.holdMu.Lock()
+	s.holdUntil = s.now().Add(d)
+	s.holdMu.Unlock()
 }
 
 // SinkStats counts delivery outcomes.
@@ -75,12 +103,20 @@ type SinkStats struct {
 	Retried   int64
 	Dropped   int64
 	FatalDrop int64
+	// Unencodable counts samples refused before they entered a buffer
+	// because they could not be marshalled. They never reach the store,
+	// so the store cannot name them; this counter is the only place they
+	// are visible.
+	Unencodable int64
 }
 
 func (s *SinkStats) snapshot() SinkStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return SinkStats{Sent: s.Sent, Accepted: s.Accepted, Rejected: s.Rejected, Retried: s.Retried, Dropped: s.Dropped, FatalDrop: s.FatalDrop}
+	return SinkStats{
+		Sent: s.Sent, Accepted: s.Accepted, Rejected: s.Rejected, Retried: s.Retried,
+		Dropped: s.Dropped, FatalDrop: s.FatalDrop, Unencodable: s.Unencodable,
+	}
 }
 
 // Logger is the small logging surface ingest needs.
@@ -109,6 +145,7 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 		buffers:  map[string][]model.Sample{},
 		metaSent: map[string]struct{}{},
 		stopCh:   make(chan struct{}),
+		now:      time.Now,
 	}
 	s.wg.Add(1)
 	go s.flushLoop()
@@ -186,6 +223,9 @@ func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[strin
 		labels[k] = v
 	}
 	sample := model.Sample{TSMs: r.TSMs, Labels: labels, Fields: r.Fields, KeyHint: keyHint}
+	if !s.encodable(r.Set, &sample) {
+		return nil
+	}
 
 	s.mu.Lock()
 	s.buffers[r.Set] = append(s.buffers[r.Set], sample)
@@ -198,9 +238,57 @@ func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[strin
 	return nil
 }
 
+// encodable refuses a sample that would make the whole request
+// unmarshallable, and reports whether it may be buffered.
+//
+// One sample can poison a batch: a field carrying NaN or an infinity --
+// which strconv.ParseFloat produces from the literal text "NaN" or "Inf"
+// in a log line -- makes encoding/json fail on the *request*, so the
+// batch is undeliverable no matter how many times it is retried. A
+// dropped batch is reported to the delivery observers as a hole, and a
+// hole freezes every followed file's checkpoint until the process
+// restarts, at which point the same line does it again. Screening the
+// one sample keeps the other thousand moving.
+func (s *Sink) encodable(set string, sample *model.Sample) bool {
+	var bad error
+	for k, v := range sample.Fields {
+		if err := model.ValidateFieldValue(v); err != nil {
+			bad = fmt.Errorf("field %q: %w", k, err)
+			break
+		}
+	}
+	if bad == nil {
+		return true
+	}
+	s.Stats.mu.Lock()
+	s.Stats.Unencodable++
+	n := s.Stats.Unencodable
+	s.Stats.mu.Unlock()
+	// Logged on the powers of ten: a source emitting these emits many,
+	// and a line per sample would bury everything else.
+	if isLogMilestone(n) {
+		s.log.Printf("WARNING dropped %d sample(s) that cannot be encoded; most recent: set %q, %v", n, set, bad)
+	}
+	return false
+}
+
+// isLogMilestone reports whether a running count is worth another log
+// line: the first, then each power of ten.
+func isLogMilestone(n int64) bool {
+	for m := int64(1); m > 0 && m <= n; m *= 10 {
+		if m == n {
+			return true
+		}
+	}
+	return false
+}
+
 // AddSample queues an already-formed sample, which is what the receive
 // path and the progress reporter use.
 func (s *Sink) AddSample(ctx context.Context, set string, sample model.Sample) error {
+	if !s.encodable(set, &sample) {
+		return nil
+	}
 	s.mu.Lock()
 	s.buffers[set] = append(s.buffers[set], sample)
 	s.pending++
@@ -281,6 +369,12 @@ func (s *Sink) DeclareSets(spec *extract.Spec) {
 func (s *Sink) Flush(ctx context.Context) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	if s.holding() {
+		// Delivery is known to be failing for a reason a retry cannot
+		// fix. The buffer keeps what it has; nothing is dropped and no
+		// observer is told anything, so no checkpoint moves either way.
+		return nil
+	}
 	obs := s.snapshotObservers()
 	s.mu.Lock()
 	if s.pending == 0 {
@@ -345,6 +439,19 @@ func (s *Sink) Flush(ctx context.Context) error {
 			s.requeueMeta(meta, sets)
 			return err
 		}
+		// Nor is a rejected credential. The batch is well formed and the
+		// store is reachable; an operator has to fix a token. Dropping
+		// it would lose good data and, because a dropped batch reads as
+		// a hole, freeze every checkpoint permanently -- so a mistyped
+		// token cost far more than the outage that caused it.
+		var authErr *wire.ErrAuth
+		if errors.As(err, &authErr) {
+			s.requeueBatches(batches, count)
+			s.requeueMeta(meta, sets)
+			s.holdDelivery(deliveryHold)
+			s.log.Printf("ERROR %v; holding %d buffered sample(s) and retrying in %s", authErr, count, deliveryHold)
+			return err
+		}
 		// The batch was taken out of the buffer before the write, so a
 		// retryable failure that ran out of retries loses it. Say so and
 		// count it: an uncounted drop is indistinguishable from success.
@@ -356,6 +463,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 		s.requeueMeta(meta, sets)
 		return err
 	}
+	s.holdMu.Lock()
+	s.holdUntil = time.Time{}
+	s.holdMu.Unlock()
 	s.Stats.mu.Lock()
 	s.Stats.Sent++
 	s.Stats.Accepted += int64(resp.Accepted)
@@ -410,6 +520,11 @@ func (s *Sink) flushMetaOnly(ctx context.Context) error {
 			s.log.Printf("ERROR store rejected spec metadata: %v", fatal)
 			return nil
 		}
+		var authErr *wire.ErrAuth
+		if errors.As(err, &authErr) {
+			s.holdDelivery(deliveryHold)
+			s.log.Printf("ERROR %v; retrying in %s", authErr, deliveryHold)
+		}
 		return err
 	}
 	return nil
@@ -438,10 +553,15 @@ func (s *Sink) flushLoop() {
 	}
 }
 
-// Close flushes and stops the background flusher.
+// Close flushes and stops the background flusher. A delivery hold is
+// cleared first: this is the last flush there will be, so it is worth one
+// attempt even against a store that was refusing the credential.
 func (s *Sink) Close(ctx context.Context) error {
 	s.stopOnce.Do(func() { close(s.stopCh) })
 	s.wg.Wait()
+	s.holdMu.Lock()
+	s.holdUntil = time.Time{}
+	s.holdMu.Unlock()
 	return s.Flush(ctx)
 }
 

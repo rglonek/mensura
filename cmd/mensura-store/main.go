@@ -207,6 +207,12 @@ func runProxy(ctx context.Context, cfg *fileConfig) error {
 // A name is not resolved and not trusted: "myhost:9631" may well resolve
 // to a routable address, so anything that is not a loopback IP literal is
 // treated as public. Guessing the other way would leave an open API.
+//
+// "localhost" is the one exception, and it is not a guess: RFC 6761
+// reserves the name and requires every resolver to answer it with a
+// loopback address, so a listener bound to it cannot reach the network.
+// Treating it as public instead would refuse the address the
+// documentation itself recommends.
 func isLoopbackAddr(addr string) (bool, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -353,7 +359,8 @@ func runQueryClient(argv []string) {
 	from := fs.String("from", "1h", "start of the range, as a duration before now")
 	maxPoints := fs.Int("max-points", 1000, "render budget")
 	interval := fs.Duration("interval", time.Second, "minimum interval hint")
-	explain := fs.Bool("explain", false, "print the plan instead of running the query")
+	explain := fs.Bool("explain", false, "print the plan instead of running the query; needs --debug-store")
+	debugURL := fs.String("debug-store", "", "loopback debug API URL, e.g. http://127.0.0.1:9632 (required by --explain)")
 	_ = fs.Parse(argv)
 	if fs.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "usage: mensura-store query [flags] '<MQL>'")
@@ -378,8 +385,23 @@ func runQueryClient(argv []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if *explain {
-		body, _ := json.Marshal(req)
-		fmt.Println(string(body))
+		// It used to print the request body, which is not a plan by any
+		// reading of the flag's own help. The plan comes from
+		// /v1/debug/plan, which lives on the loopback debug listener --
+		// a different address from the API, so it has to be named.
+		if *debugURL == "" {
+			fmt.Fprintln(os.Stderr, "--explain needs --debug-store: the plan is served by the loopback debug listener (--listen-debug), not the API")
+			os.Exit(2)
+		}
+		var plan map[string]any
+		debug := wire.NewClient(*debugURL, os.Getenv("MENSURA_STORE_TOKEN"))
+		if err := debug.PostJSON(ctx, "/v1/debug/plan", req, &plan); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(plan)
 		return
 	}
 	resp, err := client.Query(ctx, req)

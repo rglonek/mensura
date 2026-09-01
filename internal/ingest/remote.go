@@ -111,29 +111,34 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	// previous registration and those paths were never checkpointed at
 	// all. They replayed from offset zero on every restart, for the life
 	// of the deployment.
+	// The checkpoint is shared between two goroutines: the tail loop
+	// below, which rewinds it on a rotation, and the sink's flush
+	// goroutine, which advances it through the observer. Guarding it and
+	// handing Save a copy is what the local follower does for the same
+	// reason -- CheckpointStore's own lock protects the file, not the
+	// struct, so marshalling one goroutine's write while the other is
+	// mid-update is a race that can persist a torn record.
+	box := &checkpointBox{cp: cp}
+	save := func(off int64) {
+		snap := box.advance(off)
+		if err := cps.Save(&snap); err != nil {
+			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+		}
+	}
 	obs := &remoteObserver{
 		progress: &remoteProgress{},
-		save: func(acked int64) {
-			cp.AckedOffset, cp.Offset = acked, acked
-			cp.UpdatedUnix = time.Now().Unix()
-			if err := cps.Save(cp); err != nil {
-				i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
-			}
-		},
+		save:     save,
 		onHole: func(at int64) {
 			i.cfg.Log.Printf("ERROR a batch was lost, so the checkpoint for %s is frozen at offset %d; restart to re-read from there", target, at)
 		},
 	}
-	obs.progress.set(cp.AckedOffset)
+	obs.progress.set(box.ackedOffset())
 	progress := obs.progress
 	i.cfg.Sink.Observe(obs)
 
 	resetTo := func(off int64) {
 		progress.set(off)
-		cp.Offset, cp.AckedOffset, cp.UpdatedUnix = off, off, time.Now().Unix()
-		if err := cps.Save(cp); err != nil {
-			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
-		}
+		save(off)
 	}
 	// StartAt used to be accepted on the command line and then ignored on
 	// this path, so `--start-at end` against a remote host replayed the
@@ -186,6 +191,29 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		}
 	}
 	return nil
+}
+
+// checkpointBox owns one remote path's Checkpoint. Every read hands back
+// a copy, so the record being marshalled can never be the record being
+// written.
+type checkpointBox struct {
+	mu sync.Mutex
+	cp *Checkpoint
+}
+
+// advance moves the resume point and returns the record to persist.
+func (b *checkpointBox) advance(off int64) Checkpoint {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cp.Offset, b.cp.AckedOffset = off, off
+	b.cp.UpdatedUnix = time.Now().Unix()
+	return *b.cp
+}
+
+func (b *checkpointBox) ackedOffset() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cp.AckedOffset
 }
 
 // remoteProgress carries a remote tail's byte position between the reader

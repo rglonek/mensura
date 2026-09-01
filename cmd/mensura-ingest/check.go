@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"time"
 
+	"github.com/rglonek/mensura/internal/ingest"
 	"github.com/rglonek/mensura/pkg/extract"
 )
 
@@ -42,24 +45,34 @@ func checkSample(spec *extract.Spec, path string, verbose bool) error {
 	}
 	perSet := map[string]int{}
 	lines := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
-		lines++
-		results, _ := stream.Process(sc.Text())
-		for _, r := range results {
-			perSet[r.Set]++
-			if verbose {
-				fmt.Printf("  %s %s labels=%v fields=%v\n",
-					time.UnixMilli(r.TSMs).UTC().Format(time.RFC3339Nano), r.Set, r.Labels, r.Fields)
+	// readRecord, not a bufio.Scanner: a Scanner fails the whole file
+	// with ErrTooLong on one over-long line, so `check` used to abort on
+	// a file the import would have read to the end -- truncating that
+	// record and carrying on. The tool whose job is to predict the
+	// import has to frame the way the import does.
+	br := bufio.NewReader(f)
+	for {
+		rec, rerr := ingest.ReadRecord(br, 0)
+		if len(rec.Line) > 0 || rec.Terminated {
+			lines++
+			results, _ := stream.Process(string(rec.Line))
+			for _, r := range results {
+				perSet[r.Set]++
+				if verbose {
+					fmt.Printf("  %s %s labels=%v fields=%v\n",
+						time.UnixMilli(r.TSMs).UTC().Format(time.RFC3339Nano), r.Set, r.Labels, r.Fields)
+				}
 			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return rerr
 		}
 	}
 	for _, r := range stream.Flush() {
 		perSet[r.Set]++
-	}
-	if err := sc.Err(); err != nil {
-		return err
 	}
 
 	st := stream.Stats
@@ -76,6 +89,9 @@ func checkSample(spec *extract.Spec, path string, verbose bool) error {
 	fmt.Printf("  timestamp failures:   %d (%.1f%%)\n", st.TSParseErrors, pct(st.TSParseErrors, int64(lines)))
 	if st.Oversize > 0 {
 		fmt.Printf("  oversize records:     %d\n", st.Oversize)
+	}
+	if st.Unjoined > 0 {
+		fmt.Printf("  unjoined continuations: %d (matched continue_regex but no join rule)\n", st.Unjoined)
 	}
 	for i, l := range st.FirstUnmatched {
 		if i == 0 {

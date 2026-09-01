@@ -403,11 +403,34 @@ func (p *Profile) compile(s *Spec) error {
 		}
 		f.re = re
 	}
-	if p.Timestamp.Anchor == "" {
+	switch p.Timestamp.Anchor {
+	case "":
 		p.Timestamp.Anchor = "prefix"
+	case "prefix", "anywhere":
+	default:
+		return fmt.Errorf("timestamp anchor %q: expected prefix or anywhere", p.Timestamp.Anchor)
 	}
-	if p.Framing.Record == "" {
+	// `count` is what the code does. The other two values documented in
+	// 03-extraction.md are not implemented, and a declaration that does
+	// nothing is worse than one that is rejected -- the same principle
+	// that refuses store_stream_label and listen.*.tls.client_ca. An
+	// operator must not be able to believe a stream is being dropped or
+	// the process failed when neither happens.
+	switch p.Timestamp.OnParseError {
+	case "", "count":
+		p.Timestamp.OnParseError = "count"
+	case "drop-stream", "fail":
+		return fmt.Errorf("timestamp on_parse_error %q is not implemented; only `count` is, and it is the default", p.Timestamp.OnParseError)
+	default:
+		return fmt.Errorf("timestamp on_parse_error %q: expected count", p.Timestamp.OnParseError)
+	}
+	switch p.Framing.Record {
+	case "", "line":
 		p.Framing.Record = "line"
+	case "json":
+		return fmt.Errorf("framing record: json is not implemented; records are framed by line, and a JSON record would be parsed as one")
+	default:
+		return fmt.Errorf("framing record %q: expected line", p.Framing.Record)
 	}
 	if p.Framing.MaxRecordBytes == 0 {
 		p.Framing.MaxRecordBytes = 1 << 20
@@ -533,11 +556,24 @@ func (p *Profile) compile(s *Spec) error {
 				return fmt.Errorf("aggregate every: %w", err)
 			}
 			pat.Aggregate.every = d
+			if d <= 0 {
+				return fmt.Errorf("aggregate every %q must be positive", pat.Aggregate.Every)
+			}
 			if pat.Aggregate.Field == "" {
 				return fmt.Errorf("aggregate needs a field")
 			}
 			if pat.Aggregate.Mode == "" {
 				pat.Aggregate.Mode = "increment"
+			}
+			// An unrecognised mode used to compile. The accumulator's
+			// switch has no default, so the window kept whichever value
+			// the first record carried and ignored every later one:
+			// `mode: avg` produced a flat, entirely plausible series
+			// with no error anywhere.
+			switch pat.Aggregate.Mode {
+			case "increment", "sum", "max", "last":
+			default:
+				return fmt.Errorf("aggregate mode %q: expected increment, sum, max or last", pat.Aggregate.Mode)
 			}
 		}
 		searches = append(searches, pat.Search)

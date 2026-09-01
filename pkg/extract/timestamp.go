@@ -13,6 +13,9 @@ var (
 	ErrNoTimestamp = errors.New("extract: no timestamp format matched")
 	// ErrNoMatch means no pattern claimed the record.
 	ErrNoMatch = errors.New("extract: record matched no pattern")
+	// ErrNoJoin means a line matched a multiline continue_regex but no
+	// join rule captured anything from it, so it contributed nothing.
+	ErrNoJoin = errors.New("extract: continuation line matched no join rule")
 )
 
 // scanTimestamp finds the timestamp in a record and returns it plus the

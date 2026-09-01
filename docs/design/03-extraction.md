@@ -77,8 +77,13 @@ timestamp:
       regex:  '^\d{13}'
   anchor: prefix                              # prefix | anywhere
   strip: true                                 # remove the matched timestamp from the line
-  on_parse_error: count                       # count | drop-stream | fail
+  on_parse_error: count                       # count (the only value implemented)
 ```
+
+`drop-stream` and `fail` are **not implemented**, and the compiler refuses
+them rather than accepting the declaration and counting anyway: an
+operator must not be able to believe a stream is being dropped when it is
+not. See [12](12-implementation.md) section 6.27.
 
 Behaviour:
 
@@ -103,7 +108,7 @@ Behaviour:
 
 ```yaml
 framing:
-  record: line                 # line | json | multiline
+  record: line                 # line (the only value implemented; see below)
   max_record_bytes: 1048576    # oversize records are truncated + counted
   multiline:
     - start_contains: 'histogram dump'
@@ -121,8 +126,12 @@ start line, a timestamp regression, stream close, or `idle_timeout` flushes it.
 Timestamp regression inside a multiline record is an error for that record,
 not a silent join.
 
-`record: json` decodes each line as a JSON object; captures are then addressed
-by JSON pointer (`/http/status`) rather than by regex group.
+`record: json` would decode each line as a JSON object, with captures
+addressed by JSON pointer (`/http/status`) rather than by regex group. It
+is **not implemented**: every record is framed by line, and the compiler
+refuses `record: json` rather than silently applying line framing to a
+spec that asked for something else. Multiline framing is configured
+through `multiline:` above, not through `record:`.
 
 ## 5. Labels vs fields
 
@@ -282,7 +291,7 @@ far cheaper than storing one row each.
       every: 10s              # window length
       on: [error_class, host] # unique key: one accumulator per distinct tuple
       field: count            # field to accumulate into
-      mode: increment         # increment | sum | max | last
+      mode: increment         # increment | sum | max | last (an unknown mode is refused)
 ```
 
 Windows are anchored on the first record of each accumulator, close when a

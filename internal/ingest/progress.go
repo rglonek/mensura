@@ -26,6 +26,7 @@ type Snapshot struct {
 	UnmatchedLines  int64     `json:"unmatched_lines"`
 	TSParseErrors   int64     `json:"ts_parse_errors"`
 	ExtractErrors   int64     `json:"extract_errors"`
+	UnjoinedLines   int64     `json:"unjoined_lines"`
 	BinarySkipped   int64     `json:"binary_skipped"`
 	ArchivesSkipped []string  `json:"archives_skipped,omitempty"`
 	OversizeRecords int64     `json:"oversize_records"`
@@ -52,7 +53,12 @@ func (p *Progress) AddBytes(n int64)    { p.mu.Lock(); p.c.BytesRead += n; p.c.R
 func (p *Progress) Unmatched()          { p.mu.Lock(); p.c.UnmatchedLines++; p.mu.Unlock() }
 func (p *Progress) TSError()            { p.mu.Lock(); p.c.TSParseErrors++; p.mu.Unlock() }
 func (p *Progress) ExtractError()       { p.mu.Lock(); p.c.ExtractErrors++; p.mu.Unlock() }
-func (p *Progress) SkipBinary()         { p.mu.Lock(); p.c.BinarySkipped++; p.mu.Unlock() }
+
+// Unjoined counts a continuation line that matched a multiline
+// continue_regex but no join rule, so it was absorbed into nothing. It
+// used to be invisible on every counter.
+func (p *Progress) Unjoined()   { p.mu.Lock(); p.c.UnjoinedLines++; p.mu.Unlock() }
+func (p *Progress) SkipBinary() { p.mu.Lock(); p.c.BinarySkipped++; p.mu.Unlock() }
 
 // SkipArchive records a multi-file container that was not unpacked, so an
 // import that read nothing can say which inputs it declined and why.
@@ -141,6 +147,7 @@ func (p *Progress) Report(ctx context.Context, sink *Sink, client string, stream
 			"records":         model.Int(snap.Records),
 			"samples":         model.Int(snap.Samples),
 			"unmatched_lines": model.Int(snap.UnmatchedLines),
+			"unjoined_lines":  model.Int(snap.UnjoinedLines),
 			"ts_parse_errors": model.Int(snap.TSParseErrors),
 			"batches_sent":    model.Int(sinkStats.Sent),
 			"batches_dropped": model.Int(sinkStats.Dropped),

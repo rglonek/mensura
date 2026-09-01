@@ -109,3 +109,62 @@ func TestNegativeDurationRoundTrips(t *testing.T) {
 		t.Fatalf("got %d ms, want -30000", ms)
 	}
 }
+
+// An AST whose "format" key is absent decodes to "" and executes as a
+// timeseries -- that is the shape a hand-authored panel model is stored
+// in, because there is no frontend yet. Every format-dependent check
+// compared against the constant, so exactly that shape skipped the
+// warning saying outages will be drawn as continuous lines.
+func TestAbsentFormatIsValidatedAsTimeseries(t *testing.T) {
+	sc := oneFieldSchema{}
+	withFormat := &Query{Kind: KindQuery, From: "app", Format: FormatTimeseries,
+		Select: []FieldExpr{{Field: "latency"}}}
+	absent := &Query{Kind: KindQuery, From: "app",
+		Select: []FieldExpr{{Field: "latency"}}}
+
+	want, err := Validate(withFormat, sc, 0, 0)
+	if err != nil {
+		t.Fatalf("explicit timeseries: %v", err)
+	}
+	if !hasCode(want, "W103") {
+		t.Fatal("explicit timeseries did not warn about the missing cadence")
+	}
+	got, err := Validate(absent, sc, 0, 0)
+	if err != nil {
+		t.Fatalf("absent format: %v", err)
+	}
+	if !hasCode(got, "W103") {
+		t.Fatalf("an absent FORMAT skipped W103; got %+v", got)
+	}
+}
+
+// The timeseries-only modifier check must key off the same normalised
+// format, and an unknown one must still be refused.
+func TestFormatNormalisationDoesNotWidenWhatIsAccepted(t *testing.T) {
+	sc := oneFieldSchema{}
+	bad := &Query{Kind: KindQuery, From: "app", Format: Format("sideways"),
+		Select: []FieldExpr{{Field: "latency"}}}
+	if _, err := Validate(bad, sc, 0, 0); err == nil {
+		t.Fatal("an unknown format was accepted")
+	}
+	tabular := &Query{Kind: KindQuery, From: "app", Format: FormatTable,
+		Select: []FieldExpr{{Field: "latency", Modifiers: Modifiers{Delta: true}}}}
+	if _, err := Validate(tabular, sc, 0, 0); err == nil {
+		t.Fatal("a timeseries-only modifier was accepted with FORMAT table")
+	}
+}
+
+// oneFieldSchema is a catalogue holding one gauge with no declared
+// cadence, which is what W103 fires on.
+type oneFieldSchema struct{}
+
+func (oneFieldSchema) HasSet(set string) bool { return set == "app" }
+func (oneFieldSchema) Sets() []string         { return []string{"app"} }
+func (oneFieldSchema) Field(set, field string) (FieldInfo, bool) {
+	if set == "app" && field == "latency" {
+		return FieldInfo{Kind: "gauge"}, true
+	}
+	return FieldInfo{}, false
+}
+func (oneFieldSchema) HasLabel(string, string) bool              { return true }
+func (oneFieldSchema) BucketSet(string, string) ([]string, bool) { return nil, false }

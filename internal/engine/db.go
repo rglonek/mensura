@@ -344,9 +344,7 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 			if err := b.Set(ik, payload, nil); err != nil {
 				return err
 			}
-			var ptr [8]byte
-			binary.BigEndian.PutUint64(ptr[:], biasInt(ts))
-			if err := b.Set(dataKey(setID, recs[i].Key), ptr[:], nil); err != nil {
+			if err := b.Set(dataKey(setID, recs[i].Key), dataPointer(ts), nil); err != nil {
 				return err
 			}
 		} else if err := b.Set(dataKey(setID, recs[i].Key), payload, nil); err != nil {
@@ -380,13 +378,13 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 	payload := append([]byte(nil), val...)
 	_ = closer.Close()
 
-	// On an indexed set the D/ value is normally an 8-byte forward
+	// On an indexed set the D/ value is normally a tagged forward
 	// pointer, but PutBatch also stores a row that carries no indexed
-	// column there, payload and all. Follow the pointer when it leads
-	// somewhere and fall back to reading the bytes as a row when it does
-	// not, so such a row is returned rather than reported corrupt.
-	if sm.indexed != "" && len(payload) == 8 {
-		ts := unbiasInt(binary.BigEndian.Uint64(payload))
+	// column there, payload and all. The tag distinguishes them; the
+	// untagged 8-byte form an earlier build wrote is still followed, and
+	// falls back to reading the bytes as a row when the index key it
+	// names does not exist.
+	if ts, isPtr := readDataPointer(payload); isPtr && sm.indexed != "" {
 		v2, c2, err := d.pdb.Get(indexKey(sm.id, sm.indexCol, ts, pk))
 		switch {
 		case err == nil:

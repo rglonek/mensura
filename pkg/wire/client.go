@@ -53,6 +53,25 @@ func (e *ErrRetryable) Error() string {
 	return fmt.Sprintf("store is not accepting writes right now (%d): %s", e.Status, e.Msg)
 }
 
+// ErrAuth marks a credential the store would not accept.
+//
+// It is deliberately neither fatal nor retryable. Retrying the same
+// rejected token in the same request is pointless, so the client returns
+// immediately; but the batch is not malformed and must not be discarded
+// the way a malformed one is. A rotated or mistyped token is an operator
+// mistake that will be corrected, and losing every batch until then --
+// and freezing the checkpoints along with them, since a dropped batch
+// reads as a hole -- turns a five-minute misconfiguration into permanent
+// data loss.
+type ErrAuth struct {
+	Status int
+	Msg    string
+}
+
+func (e *ErrAuth) Error() string {
+	return fmt.Sprintf("the store refused this client's credential (%d): %s", e.Status, e.Msg)
+}
+
 func NewClient(baseURL, token string) *Client {
 	return &Client{
 		BaseURL:    baseURL,
@@ -69,7 +88,11 @@ func NewClient(baseURL, token string) *Client {
 func (c *Client) Write(ctx context.Context, req *WriteRequest) (*WriteResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		// Deterministic: the same batch will fail the same way on every
+		// attempt, so it is fatal rather than retryable. The sink
+		// screens samples for encodability before they are buffered, so
+		// reaching here means a caller built a batch by hand.
+		return nil, &ErrFatal{Status: 0, Msg: "the batch cannot be encoded: " + err.Error()}
 	}
 	sum := xxh3.Hash128(body).Bytes()
 	key := hex.EncodeToString(sum[:])
@@ -171,6 +194,9 @@ func (c *Client) postWrite(ctx context.Context, payload []byte, encoding, idempo
 			return nil, err
 		}
 		return &out, nil
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+		// Not fatal: the batch is fine, the credential is not.
+		return nil, &ErrAuth{Status: resp.StatusCode, Msg: apiMessage(rb)}
 	case resp.StatusCode == http.StatusTooManyRequests,
 		resp.StatusCode == http.StatusServiceUnavailable,
 		resp.StatusCode == http.StatusGatewayTimeout,
@@ -229,6 +255,36 @@ func (c *Client) GetJSON(ctx context.Context, path string, out any) error {
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GET %s failed (%d): %s", path, resp.StatusCode, apiMessage(rb))
+	}
+	return json.Unmarshal(rb, out)
+}
+
+// PostJSON sends a JSON body and decodes a JSON response, which is what
+// the debug plan endpoint needs.
+func (c *Client) PostJSON(ctx context.Context, path string, body, out any) error {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST %s failed (%d): %s", path, resp.StatusCode, apiMessage(rb))
+	}
+	if out == nil {
+		return nil
 	}
 	return json.Unmarshal(rb, out)
 }
