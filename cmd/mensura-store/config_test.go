@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,5 +39,70 @@ func TestExpandDaysRejectsCompoundForms(t *testing.T) {
 		if err == nil {
 			t.Errorf("%q was accepted as %v; a malformed duration must fail loudly", c.in, got)
 		}
+	}
+}
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mensura.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// The `db:` block is the one an operator reaches for to fit the store on a
+// small host (09-operations.md section 5). It used to be decoded and then
+// dropped on the floor, so the 1 GiB cache default stayed put with nothing
+// saying so.
+func TestEngineTuningReachesTheStoreConfig(t *testing.T) {
+	cfg, err := loadConfig(writeConfig(t, `
+data_dir: /tmp/x
+db:
+  cache_bytes: 268435456
+  memtable_size_bytes: 67108864
+  max_concurrent_compactions: 2
+  compression: zstd
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	sc, err := cfg.toStoreConfig()
+	if err != nil {
+		t.Fatalf("toStoreConfig: %v", err)
+	}
+	if sc.CacheBytes != 268435456 {
+		t.Errorf("cache_bytes did not reach the store config: %d", sc.CacheBytes)
+	}
+	if sc.MemTableSizeBytes != 67108864 {
+		t.Errorf("memtable_size_bytes did not reach the store config: %d", sc.MemTableSizeBytes)
+	}
+	if sc.MaxConcurrentCompactions != 2 {
+		t.Errorf("max_concurrent_compactions did not reach the store config: %d", sc.MaxConcurrentCompactions)
+	}
+	if sc.Compression != "zstd" {
+		t.Errorf("compression did not reach the store config: %q", sc.Compression)
+	}
+}
+
+// Two keys in the documented example were never implemented, and
+// KnownFields(true) reported them as an unmarshalling error naming the
+// whole anonymous struct. A key that is refused has to say why.
+func TestUnimplementedLimitKeysAreRefusedByName(t *testing.T) {
+	for _, body := range []string{
+		"limits:\n  max_concurrent_requests: 16\n",
+		"limits:\n  write_rate_per_client: {rps: 2000, burst: 8000}\n",
+	} {
+		_, err := loadConfig(writeConfig(t, body))
+		if err == nil {
+			t.Fatalf("%q was accepted", body)
+		}
+		if !strings.Contains(err.Error(), "not implemented") {
+			t.Errorf("refusal does not explain itself: %v", err)
+		}
+	}
+	// The keys that are implemented still load.
+	if _, err := loadConfig(writeConfig(t, "limits:\n  max_concurrent_writes: 8\n  max_concurrent_jobs: 4\n")); err != nil {
+		t.Fatalf("a supported limits block was refused: %v", err)
 	}
 }

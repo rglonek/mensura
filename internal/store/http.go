@@ -501,10 +501,15 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 		}
 		dropped++
 	}
-	a.store.mu.Lock()
-	delete(a.store.catalogue, name)
-	a.store.mu.Unlock()
-	a.store.catVer.Add(1)
+	// The catalogue entry and the spec-supplied retention and shard
+	// overrides go with the data, and the catalogue is persisted now
+	// rather than on the next 30-second tick: a crash in that window
+	// brought the entry back, advertising fields and a time range with
+	// nothing under them.
+	a.store.ForgetSet(name)
+	if err := a.store.SaveCatalogue(); err != nil {
+		a.store.cfg.Logger.Printf("ERROR saving catalogue after dropping %s: %v", name, err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"shards_dropped": dropped})
 }
 

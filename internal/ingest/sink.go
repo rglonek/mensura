@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -395,13 +397,16 @@ func (s *Sink) DeclareSets(spec *extract.Spec) {
 func (s *Sink) Flush(ctx context.Context) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	obs := s.snapshotObservers()
 	if s.holding() {
 		// Delivery is known to be failing for a reason a retry cannot
 		// fix. The buffer keeps what it has; nothing is dropped and no
-		// observer is told anything, so no checkpoint moves either way.
+		// observer is told anything, so no checkpoint moves either way --
+		// unless the wait has taken the buffer past its cap, which is the
+		// one thing holding cannot survive.
+		s.enforceBufferCap(obs)
 		return nil
 	}
-	obs := s.snapshotObservers()
 	s.mu.Lock()
 	if s.pending == 0 {
 		s.mu.Unlock()
@@ -410,19 +415,20 @@ func (s *Sink) Flush(ctx context.Context) error {
 		// the first sample happens to arrive.
 		return s.flushMetaOnly(ctx)
 	}
-	batches := make([]model.Batch, 0, len(s.buffers))
-	count := s.pending
-	for set, samples := range s.buffers {
-		if len(samples) == 0 {
-			continue
-		}
-		batches = append(batches, model.Batch{Set: set, Samples: samples})
-		delete(s.buffers, set)
+	batches, count, partial := s.takeLocked()
+	if !partial {
+		// Under the buffer lock: the batch is now fixed, and any Add
+		// racing this flush is either already in it or blocked until it
+		// is not.
+		//
+		// A partial take says nothing to the observers on purpose. Their
+		// high-water mark covers every byte handed to the sink, and some
+		// of those samples are still in the buffer, so announcing this
+		// batch would let a commit acknowledge bytes it does not carry.
+		// The checkpoint simply waits for a flush that empties the
+		// buffer.
+		s.beginFlush(obs)
 	}
-	s.pending = 0
-	// Under the buffer lock: the batch is now fixed, and any Add racing
-	// this flush is either already in it or blocked until it is not.
-	s.beginFlush(obs)
 	s.mu.Unlock()
 
 	s.metaMu.Lock()
@@ -447,11 +453,11 @@ func (s *Sink) Flush(ctx context.Context) error {
 			// The samples are gone. Telling the observers so is what stops
 			// a later successful flush from advancing a checkpoint over
 			// the hole they left.
-			s.endFlush(obs, 0, true)
+			s.reportLost(obs, partial)
+			s.discardMeta(meta, sets, fatal)
 			if s.cfg.MaxFatalDrops > 0 && drops >= int64(s.cfg.MaxFatalDrops) {
 				return err
 			}
-			s.requeueMeta(meta, sets)
 			return nil
 		}
 		// A cancelled context is not a delivery failure: the caller is
@@ -506,7 +512,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		s.Stats.mu.Unlock()
 		s.log.Printf("ERROR gave up delivering %d samples: %v; %d already buffered, which is the %d-sample limit (first set %q)",
 			count, err, s.buffered(), s.cfg.MaxBufferedSamples, firstSet(batches))
-		s.endFlush(obs, 0, true)
+		s.reportLost(obs, partial)
 		s.requeueMeta(meta, sets)
 		s.holdDelivery(s.retryHoldFor(err))
 		return err
@@ -524,6 +530,190 @@ func (s *Sink) Flush(ctx context.Context) error {
 	}
 	s.endFlush(obs, resp.Accepted, false)
 	return nil
+}
+
+// takeLocked moves buffered samples into batches, bounded by BatchBytes,
+// and reports how many it took and whether it left anything behind. It
+// must be called with the buffer lock held.
+//
+// The size bound is what BatchBytes was always documented to be and never
+// was: nothing read it, so a request was bounded only by a sample count.
+// A buffer that filled during an outage then went out as one body, and a
+// body past the store's max_request_bytes comes back 413 -- a status the
+// client classifies as fatal, so the whole buffer was dropped rather than
+// delivered in pieces.
+func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
+	sets := make([]string, 0, len(s.buffers))
+	for set := range s.buffers {
+		sets = append(sets, set)
+	}
+	sort.Strings(sets)
+
+	batches := make([]model.Batch, 0, len(sets))
+	taken, size := 0, 0
+	for _, set := range sets {
+		samples := s.buffers[set]
+		if len(samples) == 0 {
+			delete(s.buffers, set)
+			continue
+		}
+		n := 0
+		for n < len(samples) {
+			sz := sampleBytes(&samples[n])
+			// Always take at least one sample: a single sample bigger
+			// than the budget would otherwise never leave the buffer.
+			if taken+n > 0 && s.cfg.BatchBytes > 0 && size+sz > s.cfg.BatchBytes {
+				break
+			}
+			size += sz
+			n++
+		}
+		if n == 0 {
+			break
+		}
+		batches = append(batches, model.Batch{Set: set, Samples: samples[:n]})
+		taken += n
+		if n == len(samples) {
+			delete(s.buffers, set)
+			continue
+		}
+		// Copied, not resliced: requeueBatches prepends to the batch it
+		// was handed, and a leftover sharing that array would be written
+		// over by the prepend.
+		s.buffers[set] = append([]model.Sample(nil), samples[n:]...)
+		break
+	}
+	s.pending -= taken
+	return batches, taken, s.pending > 0
+}
+
+// sampleBytes estimates what one sample costs in the request body. An
+// estimate on purpose: marshalling everything twice to find out exactly
+// would cost more than the bound saves.
+func sampleBytes(s *model.Sample) int {
+	n := 48 + len(s.KeyHint)
+	for k, v := range s.Labels {
+		n += len(k) + len(v) + 8
+	}
+	for k, v := range s.Fields {
+		n += len(k) + 14
+		if v.T == model.TypeString {
+			n += len(v.S) + 2
+		} else {
+			n += 20
+		}
+	}
+	return n
+}
+
+// reportLost tells the observers a batch is gone.
+//
+// A partial take was never announced to them, so the announcement is made
+// here before the loss is: the freeze it installs is what stops a later
+// flush acknowledging the bytes these samples came from.
+func (s *Sink) reportLost(obs []DeliveryObserver, partial bool) {
+	if partial {
+		s.mu.Lock()
+		s.beginFlush(obs)
+		s.mu.Unlock()
+	}
+	s.endFlush(obs, 0, true)
+}
+
+// enforceBufferCap drops the oldest buffered samples when a held delivery
+// has let the buffer pass MaxBufferedSamples.
+//
+// Holding is only worth doing while there is somewhere to put the batch.
+// The cap used to be consulted only where a batch was put back, so while
+// delivery was held -- 30 seconds after a rejected credential, or as long
+// as a Retry-After the store chose -- Add kept appending with nothing
+// bounding it at all, and the outage the cap exists to survive became an
+// out-of-memory kill instead.
+func (s *Sink) enforceBufferCap(obs []DeliveryObserver) {
+	if s.cfg.MaxBufferedSamples <= 0 {
+		return
+	}
+	s.mu.Lock()
+	over := s.pending - s.cfg.MaxBufferedSamples
+	if over <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	sets := make([]string, 0, len(s.buffers))
+	for set := range s.buffers {
+		sets = append(sets, set)
+	}
+	sort.Strings(sets)
+	dropped := 0
+	for _, set := range sets {
+		if over <= 0 {
+			break
+		}
+		b := s.buffers[set]
+		n := over
+		if n > len(b) {
+			n = len(b)
+		}
+		if n == len(b) {
+			delete(s.buffers, set)
+		} else {
+			s.buffers[set] = append([]model.Sample(nil), b[n:]...)
+		}
+		over -= n
+		dropped += n
+	}
+	s.pending -= dropped
+	// The observers hear that the sink took these samples and lost them:
+	// a checkpoint that moved past them would bury them for good.
+	s.beginFlush(obs)
+	s.mu.Unlock()
+
+	s.Stats.mu.Lock()
+	s.Stats.Dropped += int64(dropped)
+	total := s.Stats.Dropped
+	s.Stats.mu.Unlock()
+	// On the milestones: a store that is refusing writes makes this fire
+	// on every flush tick, and a line each would bury everything else.
+	if isLogMilestone(total) {
+		s.log.Printf("ERROR delivery is held and the buffer is full: dropped %d of the oldest sample(s), %d dropped in total, which is the %d-sample limit",
+			dropped, total, s.cfg.MaxBufferedSamples)
+	}
+	s.endFlush(obs, 0, true)
+}
+
+// discardMeta drops declarations the store refused outright.
+//
+// They are deliberately not requeued. The store applies metadata before
+// any batch and answers a bad declaration with 400, which the client
+// classifies as fatal -- so putting it back at the head of the queue made
+// the next batch fail for the same reason, and the one after that: one
+// unusable line in a spec dropped every sample the ingester produced,
+// at full rate, until MaxFatalDrops gave up on the process. Losing those
+// kinds and units for the life of the process is the far smaller loss,
+// and it is said out loud so the spec gets fixed.
+func (s *Sink) discardMeta(meta []wire.FieldMeta, sets []wire.SetMeta, cause error) {
+	if len(meta) == 0 && len(sets) == 0 {
+		return
+	}
+	names := make([]string, 0, len(meta)+len(sets))
+	for _, m := range meta {
+		names = append(names, m.Set+"."+m.Field)
+		if len(names) == 8 {
+			break
+		}
+	}
+	for _, m := range sets {
+		if len(names) == 8 {
+			break
+		}
+		names = append(names, m.Set+" (set options)")
+	}
+	more := ""
+	if len(meta)+len(sets) > len(names) {
+		more = fmt.Sprintf(" and %d more", len(meta)+len(sets)-len(names))
+	}
+	s.log.Printf("ERROR the store refused these declarations, so they are discarded rather than resent with every later batch: %s%s (%v)",
+		strings.Join(names, ", "), more, cause)
 }
 
 // requeueBatches puts an undelivered batch back at the head of its set's
@@ -585,12 +775,14 @@ func (s *Sink) flushMetaOnly(ctx context.Context) error {
 		return nil
 	}
 	if _, err := s.client.Write(ctx, &wire.WriteRequest{FieldMeta: meta, SetMeta: sets}); err != nil {
-		s.requeueMeta(meta, sets)
 		var fatal *wire.ErrFatal
 		if errors.As(err, &fatal) {
-			s.log.Printf("ERROR store rejected spec metadata: %v", fatal)
+			// Not requeued: it would be refused identically forever, and
+			// every batch it travelled with would be refused with it.
+			s.discardMeta(meta, sets, fatal)
 			return nil
 		}
+		s.requeueMeta(meta, sets)
 		var authErr *wire.ErrAuth
 		if errors.As(err, &authErr) {
 			s.holdDelivery(deliveryHold)
@@ -633,7 +825,19 @@ func (s *Sink) Close(ctx context.Context) error {
 	s.holdMu.Lock()
 	s.holdUntil = time.Time{}
 	s.holdMu.Unlock()
+	// Flushed until the buffer is empty or a flush stops making progress:
+	// one flush carries at most BatchBytes, so a buffer that grew during
+	// an outage needs more than one to leave.
 	err := s.Flush(ctx)
+	for err == nil {
+		before := s.buffered()
+		if before == 0 {
+			break
+		}
+		if err = s.Flush(ctx); err != nil || s.buffered() >= before {
+			break
+		}
+	}
 	// Whatever the last flush could not deliver stays in memory and dies
 	// with the process, so it is counted and named here. It is not
 	// reported to the observers as a hole: the checkpoints never advanced

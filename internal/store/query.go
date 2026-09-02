@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"sort"
@@ -510,7 +511,16 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	var bs wire.BucketSetInfo
 	name := q.Select[0].Histogram
 	if ok {
-		bs = entry.BucketSets[name]
+		// Copied, not aliased: the buckets and edges travel into the
+		// response and are marshalled long after the lock is released,
+		// while a concurrent write carrying bucket metadata rewrites the
+		// same slices in place.
+		stored := entry.BucketSets[name]
+		bs = wire.BucketSetInfo{
+			Buckets: append([]string(nil), stored.Buckets...),
+			Edges:   append([]float64(nil), stored.Edges...),
+			Unit:    stored.Unit,
+		}
 	}
 	s.mu.RUnlock()
 	if len(bs.Buckets) == 0 {
@@ -815,16 +825,28 @@ func (s *Store) rowLabels(row engine.Row, by []string) map[string]string {
 	return out
 }
 
+// seriesKey is the grouping identity of one series: the BY values in
+// declared order, then the field's display name.
+//
+// Every component is length-prefixed rather than separated by a delimiter,
+// for the reason model.PrimaryKey is: a label value is any valid UTF-8, so
+// it may contain the '=' and the NUL that framed it. With delimiters,
+// {a: "x", ab: "y\x00ab=z"} and {a: "x\x00ab=y", ab: "z"} built the same
+// key, so two distinct series were silently merged into one plotted line.
 func seriesKey(labels map[string]string, by []string, field string) string {
 	var b strings.Builder
 	for _, l := range by {
-		b.WriteString(l)
-		b.WriteByte('=')
-		b.WriteString(labels[l])
-		b.WriteByte(0)
+		writeKeyPart(&b, l)
+		writeKeyPart(&b, labels[l])
 	}
-	b.WriteString(field)
+	writeKeyPart(&b, field)
 	return b.String()
+}
+
+func writeKeyPart(b *strings.Builder, s string) {
+	var buf [binary.MaxVarintLen64]byte
+	b.Write(buf[:binary.PutUvarint(buf[:], uint64(len(s)))])
+	b.WriteString(s)
 }
 
 // seriesName is the legend: the BY values in declared order, then the

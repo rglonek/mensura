@@ -347,6 +347,14 @@ func (s *Spec) Compile() error {
 		if err := model.ValidateSetName(name); err != nil {
 			return fmt.Errorf("extract: sets: %w", err)
 		}
+		// The same rule the patterns are held to. Without it a spec
+		// declaring retention for a reserved name compiled, and the
+		// declaration then travelled with every write as metadata the
+		// store refuses outright -- one spec typo turning into a 400 on
+		// every batch the ingester produced.
+		if model.IsReserved(name) {
+			return fmt.Errorf("extract: set %q uses the reserved prefix %q", name, model.ReservedPrefix)
+		}
 		// A range check, not only a syntax check: ParseDuration accepts a
 		// leading sign so that Print -> Parse round-trips an unvalidated
 		// AST, so "-5s" here parsed cleanly and was carried all the way to

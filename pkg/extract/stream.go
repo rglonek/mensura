@@ -405,7 +405,11 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 		st.aggs[key] = a
 		switch ag.Mode {
 		case "increment":
-			a.value = incoming + 1
+			// One occurrence, counted. Seeding with the captured value
+			// plus one meant a pattern that also extracted the field it
+			// counts started every window at that value, so the first
+			// window of each key reported a number nothing had counted.
+			a.value = 1
 		default:
 			a.value = incoming
 		}

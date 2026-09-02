@@ -34,20 +34,23 @@ listen:
 # calls even with auth.mode: none.
 
 auth:
-  mode: bearer                   # bearer | mtls | none (loopback only)
+  mode: bearer                   # bearer | none (loopback only); mTLS is not implemented
   clients:
     - {name: web1, hash: "sha256:…", scopes: [write]}
     - {name: grafana, hash: "sha256:…", scopes: [query]}
 
 limits:
   max_request_bytes: 33554432
-  max_concurrent_writes: 8
-  max_concurrent_requests: 16
-  max_concurrent_jobs: 8
+  max_concurrent_writes: 8        # write slots; past them the store sheds with 503
+  max_concurrent_jobs: 8          # concurrent queries
   max_series_per_graph: 1000
   max_datapoints_received: 34560000
   max_label_cardinality: 100000
-  write_rate_per_client: {rps: 2000, burst: 8000}
+
+# Per-client rate limiting is not implemented (12-implementation.md §5), so
+# there is no write_rate_per_client key and no max_concurrent_requests:
+# back-pressure is write-slot shedding. The loader refuses both by name
+# rather than accepting a limit it would not enforce.
 
 retention:
   default: 30d
@@ -217,9 +220,11 @@ per window, and windows scale with the range. Zoom in to recover detail; the
 extremes of a coarse window are always the extremes of some contained window
 ([07-downsampling.md](07-downsampling.md)).
 
-**"Writes are failing with 429."** The client is over its rate budget, or the
-store is shedding. Check `store_write_queue_depth` and the client's
-`write_rate_per_client`. Ingest retries; no data is lost except UDP.
+**"Writes are failing with 503."** The store is shedding: every write slot is
+busy, so it answers `503` with `Retry-After` rather than queueing. Check
+`mensura_store_l0_sublevels` and raise `max_concurrent_writes` only if the
+engine is keeping up. Ingest holds the batch and retries; no data is lost
+until the sink's own buffer limit is reached, which it counts and logs.
 
 **"Store will not start: storage version mismatch."** The data directory was
 written by a different layout version. For batch deployments, wipe and

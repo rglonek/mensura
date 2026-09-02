@@ -45,6 +45,17 @@ type fileConfig struct {
 		MaxSeriesPerGraph     int   `yaml:"max_series_per_graph"`
 		MaxDatapointsReceived int   `yaml:"max_datapoints_received"`
 		MaxLabelCardinality   int   `yaml:"max_label_cardinality"`
+
+		// Accepted by the decoder only so they can be refused by name.
+		// Neither is implemented, and KnownFields(true) reported them as
+		// an unmarshalling error naming the whole anonymous struct --
+		// which is what an operator got for copying the example config
+		// out of docs/design/09-operations.md.
+		MaxConcurrentRequests *int `yaml:"max_concurrent_requests"`
+		WriteRatePerClient    *struct {
+			RPS   int `yaml:"rps"`
+			Burst int `yaml:"burst"`
+		} `yaml:"write_rate_per_client"`
 	} `yaml:"limits"`
 
 	Retention struct {
@@ -108,6 +119,12 @@ func loadConfig(path string) (*fileConfig, error) {
 			}
 		}
 	}
+	if cfg.Limits.MaxConcurrentRequests != nil {
+		return nil, fmt.Errorf("config %s: limits.max_concurrent_requests is not implemented; use max_concurrent_writes for the write API and max_concurrent_jobs for queries", path)
+	}
+	if cfg.Limits.WriteRatePerClient != nil {
+		return nil, fmt.Errorf("config %s: limits.write_rate_per_client is not implemented; back-pressure is by write-slot shedding (max_concurrent_writes)", path)
+	}
 	switch cfg.Auth.Mode {
 	case "", "none", "bearer":
 	default:
@@ -152,6 +169,13 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 	if c.Limits.MaxConcurrentJobs > 0 {
 		sc.MaxConcurrentJobs = c.Limits.MaxConcurrentJobs
 	}
+	// The `db:` block reaches the engine. It used to be decoded and then
+	// dropped, so an operator sizing the store for a small host kept the
+	// 1 GiB cache default with nothing saying otherwise.
+	sc.CacheBytes = c.DB.CacheBytes
+	sc.MemTableSizeBytes = c.DB.MemtableSizeBytes
+	sc.MaxConcurrentCompactions = c.DB.MaxConcurrentCompactions
+	sc.Compression = c.DB.Compression
 	var err error
 	if sc.Retention, err = durationOr(c.Retention.Default, sc.Retention); err != nil {
 		return sc, err

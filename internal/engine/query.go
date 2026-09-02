@@ -92,9 +92,29 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 		q.where.columns(proj)
 	}
 
+	// keepAsPredicate demotes a range on a column the scan cannot seek on
+	// into a per-row filter. Dropping it instead would silently widen the
+	// query to the whole set, which is the one failure mode a range test
+	// must never have.
+	keepAsPredicate := func() {
+		if !q.hasBet {
+			return
+		}
+		e := BetweenExpr(q.betCol, model.Int(q.betLo), model.Int(q.betHi))
+		if q.where == nil {
+			q.where = e
+		} else {
+			q.where = And(q.where, e)
+		}
+		if proj != nil {
+			proj[q.betCol] = struct{}{}
+		}
+	}
+
 	var lower, upper []byte
 	indexed := false
-	if q.hasBet && sm.indexed != "" && q.betCol == sm.indexed {
+	switch {
+	case q.hasBet && sm.indexed != "" && q.betCol == sm.indexed:
 		indexed = true
 		lower = indexBound(sm.id, sm.indexCol, q.betLo)
 		hi := q.betHi
@@ -103,25 +123,19 @@ func (q *QueryBuilder) Run(ctx context.Context) (*Iter, error) {
 		} else {
 			upper = indexBound(sm.id, sm.indexCol, hi+1)
 		}
-	} else if sm.indexed != "" {
+	case sm.indexed != "":
 		p := indexPrefix(sm.id, sm.indexCol)
 		lower, upper = p, prefixEnd(p)
 		indexed = true
-		if q.hasBet {
-			// Range on a non-indexed column: keep it as a predicate.
-			e := BetweenExpr(q.betCol, model.Int(q.betLo), model.Int(q.betHi))
-			if q.where == nil {
-				q.where = e
-			} else {
-				q.where = And(q.where, e)
-			}
-			if proj != nil {
-				proj[q.betCol] = struct{}{}
-			}
-		}
-	} else {
+		keepAsPredicate()
+	default:
 		p := dataPrefix(sm.id)
 		lower, upper = p, prefixEnd(p)
+		// A set with no indexed column has no seekable range at all, so
+		// the bound has to become a predicate here too. It used to be
+		// dropped on this branch alone: Between() on an unindexed set
+		// returned every row in it.
+		keepAsPredicate()
 	}
 
 	snap := d.pdb.NewSnapshot()
