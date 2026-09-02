@@ -235,6 +235,11 @@ walk: a line asks what the extreme was, a heatmap column asks how many fell in
 the bucket ([12-implementation.md §6.4](12-implementation.md)). Grouping by a label yields one heatmap per group, so
 "per host" is a `BY` clause rather than a feature request.
 
+`HISTOGRAM(name)` is only meaningful under `FORMAT heatmap`, and the
+validator refuses it anywhere else (`E008`) rather than planning a query with
+no series in it: a bucket set resolves to no plottable field, so the panel
+would come back empty with nothing to explain why.
+
 With `FORMAT timeseries`, `HISTOGRAM(hdr24) PERCENTILE 99` (planned for M5,
 not yet implemented) emits an estimated
 p99 series computed from the cumulative buckets (linear interpolation within
@@ -401,7 +406,7 @@ in tests. Warnings never fail a query; errors always do.
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
 | `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
 | `E007` | error | `LIMIT` above the datasource maximum |
-| `E008` | error | `FORMAT logs` or `table` combined with a timeseries-only modifier |
+| `E008` | error | an unknown `FORMAT`, `SSE` mode or `CLAMP ELSE`; `FORMAT logs`/`table` combined with a timeseries-only modifier; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |
 | `W101` | warning | Modifiers written in non-canonical order; canonical order applies |
 | `W102` | warning | Counter-kind field selected without `RATE`/`DELTA` |

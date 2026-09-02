@@ -239,6 +239,17 @@ func isLoopbackAddr(addr string) (bool, error) {
 // authentication of its own in any mode, so it may only ever be bound to
 // loopback.
 func checkAuthPosture(cfg *fileConfig) error {
+	// Checked here rather than in loadConfig, because the write address
+	// is not settled until the flags and the default have been applied.
+	//
+	// A read-only address that is also the write address is not
+	// read-only. startListeners can only mount one handler per address,
+	// so it used to keep the full mux and skip the query listener
+	// entirely: the address an operator publishes to Grafana then
+	// accepted /v1/write and DELETE /v1/admin/sets/ as well, silently.
+	if cfg.Listen.Query.Addr != "" && cfg.Listen.Query.Addr == cfg.Listen.Write.Addr {
+		return fmt.Errorf("listen.query.addr and listen.write.addr are both %s; the query listener is the read-only surface, so it needs an address of its own (or leave listen.query unset to serve everything on the write address)", cfg.Listen.Query.Addr)
+	}
 	if cfg.Listen.Debug.Addr != "" {
 		ok, err := isLoopbackAddr(cfg.Listen.Debug.Addr)
 		if err != nil {
@@ -298,11 +309,11 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 		logger.Printf("%s listener on %s", name, addr)
 	}
 	start("api", cfg.Listen.Write.Addr, api.Handler(), cfg.Listen.Write)
-	if cfg.Listen.Query.Addr != "" && cfg.Listen.Query.Addr != cfg.Listen.Write.Addr {
-		// The read surface only. An address an operator publishes to
-		// Grafana must not also accept /v1/write and /v1/admin/*.
-		start("query", cfg.Listen.Query.Addr, api.QueryHandler(), cfg.Listen.Query)
-	}
+	// The read surface only. An address an operator publishes to Grafana
+	// must not also accept /v1/write and /v1/admin/*. checkAuthPosture
+	// refuses a query address equal to the write address rather than
+	// letting this silently fall back to the full mux on one listener.
+	start("query", cfg.Listen.Query.Addr, api.QueryHandler(), cfg.Listen.Query)
 	// The debug surface is loopback-only and is never proxied. Its own
 	// TLS settings are still honoured: loadConfig validates the cert/key
 	// pair for all four listeners, and passing a zero spec here made two

@@ -106,3 +106,37 @@ func TestUnimplementedLimitKeysAreRefusedByName(t *testing.T) {
 		t.Fatalf("a supported limits block was refused: %v", err)
 	}
 }
+
+// A read-only address that is also the write address is not read-only.
+// startListeners can only mount one handler per address, so it kept the
+// full mux and skipped the query listener entirely: the address an
+// operator publishes to Grafana then accepted /v1/write and DELETE
+// /v1/admin/sets/ as well, silently.
+//
+// The check lives in checkAuthPosture rather than loadConfig because the
+// write address is not settled until the flags and the default have been
+// applied.
+func TestQueryListenerMayNotShareTheWriteAddress(t *testing.T) {
+	cfg := &fileConfig{}
+	cfg.Auth.Mode = "bearer"
+	cfg.Listen.Write.Addr = "0.0.0.0:9631"
+	cfg.Listen.Query.Addr = "0.0.0.0:9631"
+	err := checkAuthPosture(cfg)
+	if err == nil {
+		t.Fatal("expected the shared address to be refused")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("refusal does not explain itself: %v", err)
+	}
+
+	// A distinct address is fine, and so is leaving the query listener
+	// unset to serve everything on the write address.
+	cfg.Listen.Query.Addr = "0.0.0.0:9632"
+	if err := checkAuthPosture(cfg); err != nil {
+		t.Fatalf("distinct addresses were refused: %v", err)
+	}
+	cfg.Listen.Query.Addr = ""
+	if err := checkAuthPosture(cfg); err != nil {
+		t.Fatalf("an unset query listener was refused: %v", err)
+	}
+}

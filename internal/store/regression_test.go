@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -1029,5 +1030,188 @@ func TestEngineTuningReachesTheEngine(t *testing.T) {
 	if err == nil {
 		_ = bad.Close()
 		t.Fatal("an unknown compression profile was accepted; the engine falls back to snappy for one it does not know")
+	}
+}
+
+// A set whose every shard has aged out is forgotten completely, not just
+// removed from the catalogue.
+//
+// The spec-supplied retention and shard width live in their own maps and
+// are persisted on the catalogue entry, so deleting only the entry left
+// them stranded twice over: a set later created with the same name
+// inherited the policy of the one that aged out, and after a restart the
+// persisted declaration was gone -- an ingester that is already running
+// never repeats it -- so with the documented "--retention 0 globally,
+// per-set retention from the spec" deployment the set came back with no
+// retention at all and was routed to the unsharded shard the sweep skips.
+func TestRetentionSweepForgetsThePolicyWithTheSet(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	cfg.Retention = 0 // the documented "keep everything unless a spec says otherwise"
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	day := int64(24 * 60 * 60 * 1000)
+	retention := 7 * day
+	shard := day
+	old := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
+	if _, err := s.Write(&wire.WriteRequest{
+		SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &retention, ShardMs: &shard}},
+		Batches: []model.Batch{{Set: "app", Samples: []model.Sample{
+			{TSMs: old, Fields: map[string]model.Value{"v": model.Int(1)}},
+		}}},
+	}, "", "test"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := s.retentionFor("app"); got != time.Duration(retention)*time.Millisecond {
+		t.Fatalf("spec retention did not take effect: %v", got)
+	}
+
+	n, err := s.RunRetention(time.Now())
+	if err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected the aged-out shard to be dropped")
+	}
+	// The override went with the entry, so a set recreated under the same
+	// name does not silently inherit a dead set's policy.
+	s.retentionMu.RLock()
+	_, keptRetention := s.setRetention["app"]
+	_, keptShard := s.setShard["app"]
+	s.retentionMu.RUnlock()
+	if keptRetention || keptShard {
+		t.Fatalf("retention sweep left the spec policy behind: retention=%v shard=%v", keptRetention, keptShard)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// And it is gone after a restart too, rather than the entry being
+	// absent while the in-memory maps still held it.
+	s2, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if got := s2.retentionFor("app"); got != 0 {
+		t.Fatalf("expected the default retention after the set aged out, got %v", got)
+	}
+}
+
+// Close is called from a deferred cleanup that an error path may already
+// have taken. A second saveCatalogue and a second db.Close is at best
+// wasted work and at worst a write against a closed engine -- which is
+// what the second call used to attempt, logging an error about a
+// shutdown that had already succeeded.
+func TestCloseIsIdempotent(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	cfg.Logger = log.New(&logs, "", 0)
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second close should be a no-op, got %v", err)
+	}
+	if strings.Contains(logs.String(), "ERROR") {
+		t.Fatalf("a second Close must not touch the closed engine: %s", logs.String())
+	}
+}
+
+// The cardinality budget counts values, not holes. A lost dictionary
+// record leaves a hole that takeHole exists to reuse, so counting it
+// against MaxLabelCardinality refused writes on a key that was under its
+// budget -- and charged for the same position twice.
+func TestCardinalityBudgetCountsLiveValuesNotHoles(t *testing.T) {
+	s := openTestStore(t)
+	s.cfg.MaxLabelCardinality = 3
+
+	for _, v := range []string{"a", "b", "c"} {
+		if _, err := s.intern("host", v); err != nil {
+			t.Fatalf("intern %q: %v", v, err)
+		}
+	}
+	if _, err := s.intern("host", "d"); err == nil {
+		t.Fatal("expected the fourth value to exceed the limit of 3")
+	}
+
+	// Punch a hole the way a lost record does, then rebuild the free list
+	// exactly as loadDictionaries does on the next open.
+	s.dictMu.Lock()
+	d := s.dict["host"]
+	delete(d.index, "b")
+	d.Entries[1] = ""
+	d.rebuildHoles()
+	s.dictMu.Unlock()
+
+	if _, err := s.intern("host", "d"); err != nil {
+		t.Fatalf("a freed position must be reusable within the budget: %v", err)
+	}
+	if _, err := s.intern("host", "e"); err == nil {
+		t.Fatal("the budget must still bind once the hole is filled")
+	}
+}
+
+// HISTOGRAM under a timeseries format used to validate with no diagnostic
+// and then draw nothing: the planner resolves no field for a bucket set,
+// so runTimeseries iterates an empty list. An empty panel that nothing
+// explains is the failure the validator exists to prevent.
+func TestHistogramOutsideHeatmapIsRefusedByTheStore(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{{
+		TSMs:   base(),
+		Fields: map[string]model.Value{"b0": model.Int(3), "b1": model.Int(4)},
+	}},
+		wire.FieldMeta{Set: "app", Field: "b0", BucketSet: "lat", BucketIndex: 0},
+		wire.FieldMeta{Set: "app", Field: "b1", BucketSet: "lat", BucketIndex: 1, BucketEdge: 1},
+	)
+
+	q := &mql.Query{Kind: mql.KindQuery, From: "app", Select: []mql.FieldExpr{{Histogram: "lat"}}}
+	_, err := s.Query(context.Background(), &wire.QueryRequest{
+		AST: q, FromMs: base() - 1000, ToMs: base() + 1000, MaxPoints: 100, IntervalMs: 1000,
+	})
+	if err == nil {
+		t.Fatal("expected a HISTOGRAM without FORMAT heatmap to be refused rather than drawing an empty panel")
+	}
+	// The heatmap form still runs.
+	q.Format = mql.FormatHeatmap
+	resp, err := s.Query(context.Background(), &wire.QueryRequest{
+		AST: q, FromMs: base() - 1000, ToMs: base() + 1000, MaxPoints: 100, IntervalMs: 1000,
+	})
+	if err != nil {
+		t.Fatalf("FORMAT heatmap should still run: %v", err)
+	}
+	if len(resp.Series) == 0 {
+		t.Fatal("expected heatmap series")
+	}
+}
+
+// Explain must report the window the executor would really use. It
+// clamps a negative EVERY to zero; reporting the raw value made the plan
+// describe something that never runs.
+func TestExplainReportsTheClampedWindow(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}}})
+	every := int64(-5)
+	q := &mql.Query{Kind: mql.KindQuery, From: "app", Select: []mql.FieldExpr{{Field: "v"}}, EveryMs: &every}
+	plan, err := s.Explain(q, &wire.QueryRequest{FromMs: base() - 1000, ToMs: base() + 1000, MaxPoints: 100})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	if got := plan["downsample_window"].(int64); got != 0 {
+		t.Fatalf("expected the window Explain reports to be clamped like the executor's, got %d", got)
 	}
 }

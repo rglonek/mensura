@@ -143,35 +143,46 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		progress.set(off)
 		save(off)
 	}
-	// StartAt used to be accepted on the command line and then ignored on
-	// this path, so `--start-at end` against a remote host replayed the
-	// whole history instead of starting at the tail.
-	first := true
+	// startAtPending records that --start-at has not been honoured yet.
+	// The flag used to be accepted on the command line and ignored on
+	// this path entirely, so `--start-at end` against a remote host
+	// replayed the whole history; then it was honoured only inside the
+	// else arm of the size probe below, so a single transient SSH
+	// failure on the first pass -- which this loop logs and carries on
+	// from -- silently dropped it again, for the life of the process.
+	// It is cleared where the flag is actually applied.
+	startAtPending := opts.StartAt == "beginning" || (opts.StartAt == "end" && !hadCheckpoint)
 	flushSeq := 0
 	for ctx.Err() == nil {
+		// "beginning" needs no size, so it is honoured even when the
+		// remote host cannot be reached to measure the file.
+		if startAtPending && opts.StartAt == "beginning" {
+			resetTo(0)
+			startAtPending = false
+		}
 		// The size is the only rotation signal this path has. A file
 		// shorter than what has already been read was truncated,
 		// copytruncated or replaced, and resuming at the stored byte
 		// offset would seek past the whole of the new one.
 		if size, serr := i.remoteSize(ctx, opts, path); serr != nil {
+			// The probe is retried on the next pass rather than treated
+			// as an answer; startAtPending stays set until it succeeds.
 			i.cfg.Log.Printf("WARNING cannot size %s: %v", target, serr)
 		} else {
 			switch {
-			case first && opts.StartAt == "beginning":
-				resetTo(0)
-			case first && opts.StartAt == "end" && !hadCheckpoint:
+			case startAtPending:
 				// Only when there is no checkpoint, which is what the
 				// local follower does with the same flag. Honouring it
 				// unconditionally meant a restart of a remote follow
 				// skipped everything written while it was down, while
 				// the identical local command resumed.
 				resetTo(size)
+				startAtPending = false
 			case size < progress.ackedOffset():
 				i.cfg.Log.Printf("INFO %s was truncated or rotated; re-reading from the start", target)
 				resetTo(0)
 			}
 		}
-		first = false
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
 			RefTime: time.Now(), From: i.cfg.From, To: i.cfg.To,
 		})

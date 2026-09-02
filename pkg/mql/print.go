@@ -207,10 +207,14 @@ func quoteMQL(s string) string {
 	return b.String()
 }
 
-// printFloat emits a form the lexer can read back. 'g' would produce
-// "1e+06" for a million, which the number lexer cannot parse, so printing
-// a query with a large or small CLAMP bound would break the round trip
-// that the AST and the text are supposed to have.
+// printFloat emits a form the lexer can read back.
+//
+// 'f' is preferred because it is what an operator recognises: a million
+// reads as 1000000, not 1e+06. It stops being readable well before it
+// stops being correct, though -- MaxFloat64 in 'f' is a 310-digit
+// literal, and so is any CLAMP bound near it -- so past a threshold the
+// exponent form wins. The number lexer accepts an exponent for exactly
+// this reason, so both forms round-trip.
 func printFloat(f float64) string {
 	if math.IsInf(f, 0) || math.IsNaN(f) {
 		// Neither is expressible in the grammar; the nearest finite bound
@@ -219,12 +223,39 @@ func printFloat(f float64) string {
 			return "0"
 		}
 		if f > 0 {
-			return strconv.FormatFloat(math.MaxFloat64, 'f', -1, 64)
+			f = math.MaxFloat64
+		} else {
+			f = -math.MaxFloat64
 		}
-		return strconv.FormatFloat(-math.MaxFloat64, 'f', -1, 64)
 	}
-	return strconv.FormatFloat(f, 'f', -1, 64)
+	plain := strconv.FormatFloat(f, 'f', -1, 64)
+	if len(plain) <= maxPlainFloatDigits {
+		return plain
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
 }
+
+// lexerDecodesEscape reports whether lexQuoted would turn a backslash
+// followed by c into something other than the two bytes themselves. Those
+// are exactly the positions where a backslash in a regex has to be
+// doubled to survive a round trip; anywhere else it is passed through and
+// doubling it would only make the printed pattern harder to read.
+//
+// It is derived from lexQuoted's switch rather than restated from
+// memory: the two must agree, and a table that drifts from its decoder is
+// worse than no table.
+func lexerDecodesEscape(c byte) bool {
+	switch c {
+	case 'n', 't', 'r', '\\', '/':
+		return true
+	}
+	return false
+}
+
+// maxPlainFloatDigits is how long a decimal literal may get before the
+// exponent form is the more honest rendering. Every value an operator
+// would plausibly type as a CLAMP bound or an SSE constant is far shorter.
+const maxPlainFloatDigits = 24
 
 // printDuration picks the largest unit that divides the value exactly, so
 // 30000 prints as 30s rather than 30000ms.
@@ -264,10 +295,36 @@ func quoteIdent(s string) string {
 	return s
 }
 
-// escapeRegex prepares a regex for /.../ delimiters. Backslashes are
-// escaped first: the lexer collapses "\\" to "\", so escaping only the
-// delimiter would let a regex lose a backslash on every round trip.
+// escapeRegex prepares a regex for /.../ delimiters.
+//
+// Only the two sequences the lexer actually decodes are escaped, and a
+// backslash only where leaving it bare would be ambiguous: before the
+// delimiter, before another backslash, or at the very end of the pattern
+// (where it would otherwise escape the closing "/" and run off the end of
+// the query). Everything else passes through verbatim, because
+// lexQuoted's default branch already reproduces "\" plus its character
+// unchanged.
+//
+// Doubling every backslash also round-tripped, but it printed /\d+/ for
+// the pattern \d+ -- so the canonical text of a query, which is what the
+// builder shows and what Grafana reports as the executed query, read as a
+// different regex from the one that was written.
 func escapeRegex(re string) string {
-	re = strings.ReplaceAll(re, `\`, `\\`)
-	return strings.ReplaceAll(re, "/", `\/`)
+	var b strings.Builder
+	b.Grow(len(re) + 4)
+	for i := 0; i < len(re); i++ {
+		switch c := re[i]; c {
+		case '/':
+			b.WriteString(`\/`)
+		case '\\':
+			if i+1 >= len(re) || lexerDecodesEscape(re[i+1]) {
+				b.WriteString(`\\`)
+			} else {
+				b.WriteByte('\\')
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }

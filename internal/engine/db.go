@@ -193,7 +193,57 @@ func (d *DB) loadMeta() error {
 			d.nextID = sm.ID + 1
 		}
 	}
-	return it.Error()
+	if err := it.Error(); err != nil {
+		return err
+	}
+
+	// The high-water mark is read back as well as derived, and the larger
+	// wins. Deriving it from the surviving sets alone made it *regress*
+	// across a restart: DropSet removes the meta record, so dropping the
+	// highest-numbered shard -- which retention does on every sweep --
+	// let the next set created after a restart take that id back. Set ids
+	// are what the D/ and I/ key prefixes are built from, so reuse only
+	// stays harmless while the range deletes that emptied the old set are
+	// still intact, which is an assumption nothing here should depend on.
+	hw, err := d.loadNextID()
+	if err != nil {
+		return err
+	}
+	if hw > d.nextID {
+		d.nextID = hw
+	}
+	if hw != d.nextID {
+		// Only when it actually moved: a directory written by an earlier
+		// build has no record, and one that is merely reopened should not
+		// pay a synced meta write for nothing.
+		return d.persistNextID()
+	}
+	return nil
+}
+
+// nextIDKey holds the set-id high-water mark, so an id is never reissued
+// even after the set that held it has been dropped.
+func nextIDKey() []byte { return metaKey("next_set_id") }
+
+func (d *DB) loadNextID() (uint32, error) {
+	v, closer, err := d.pdb.Get(nextIDKey())
+	if err == pebble.ErrNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	if len(v) < 4 {
+		return 0, nil
+	}
+	return binary.BigEndian.Uint32(v), nil
+}
+
+func (d *DB) persistNextID() error {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], d.nextID)
+	return d.pdb.Set(nextIDKey(), b[:], d.metaOpts)
 }
 
 func (d *DB) persistSet(sm *setMeta) error {
@@ -223,6 +273,11 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 		d.nextID++
 		d.sets[name] = sm
 		d.byID[sm.ID] = sm
+		// Persisted before the set that uses it, so a crash between the
+		// two loses the set rather than reissuing its id.
+		if err := d.persistNextID(); err != nil {
+			return nil, err
+		}
 	}
 	changed := !ok
 	for _, c := range cols {

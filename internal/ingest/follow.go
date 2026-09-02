@@ -601,10 +601,18 @@ func (f *follower) retire(ctx context.Context, t *tailer) {
 	f.mu.Lock()
 	delete(f.tailers, t.path)
 	f.mu.Unlock()
-	// The replacement file starts from its beginning. The checkpoint is
-	// rewritten by the next successful flush; it is not forced here,
-	// because nothing has been delivered yet.
+	// The replacement file starts from its beginning, and the record on
+	// disk is rewound to say so now rather than on the next flush: a
+	// crash in between would otherwise resume the *new* file at the old
+	// one's offset.
+	//
+	// The fingerprint is cleared with the offsets. It described the file
+	// that has just been rotated away, and leaving it behind left a
+	// checkpoint whose content hash names bytes that are gone -- so
+	// ensure() would compare the new file against the old one's hash,
+	// which is a question with no useful answer either way.
 	t.reset(0)
+	t.setFingerprint("", 0)
 	cp := t.checkpointSnapshot()
 	cp.Offset, cp.AckedOffset, cp.UpdatedUnix = 0, 0, time.Now().Unix()
 	if err := f.cps.Save(&cp); err != nil {

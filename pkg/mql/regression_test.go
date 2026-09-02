@@ -2,6 +2,8 @@ package mql
 
 import (
 	"errors"
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -245,5 +247,128 @@ func TestFractionalIntegerIsAPositionedParseError(t *testing.T) {
 	var pe *ParseError
 	if !errors.As(err, &pe) {
 		t.Fatalf("got %T (%v), want a *ParseError", err, err)
+	}
+}
+
+// A HISTOGRAM under anything but FORMAT heatmap has no series to draw:
+// the planner resolves no field for a bucket set, so the executor
+// iterates an empty list and the panel comes back empty -- with no error
+// and no warning, which is the failure this validator exists to prevent.
+// Only the mirror image, heatmap without HISTOGRAM, used to be refused.
+func TestHistogramNeedsFormatHeatmap(t *testing.T) {
+	s := testSchema{}
+	for _, src := range []string{
+		`FROM http SELECT HISTOGRAM(hdr24)`,
+		`FROM http SELECT HISTOGRAM(hdr24) FORMAT timeseries`,
+		`FROM http SELECT HISTOGRAM(hdr24) FORMAT table`,
+		`FROM http SELECT HISTOGRAM(hdr24) FORMAT logs`,
+	} {
+		q := mustParse(t, src)
+		_, err := Validate(q, s, 1000, 10000)
+		if err == nil {
+			t.Fatalf("%s: expected the bucket set to be refused outside FORMAT heatmap", src)
+		}
+		var d Diag
+		if !errors.As(err, &d) || d.Code != "E008" {
+			t.Fatalf("%s: expected E008, got %v", src, err)
+		}
+	}
+	// A hand-authored AST with no format at all decodes to "" and
+	// executes as a timeseries, so it has to be refused too.
+	q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Histogram: "hdr24"}}}
+	if _, err := Validate(q, s, 1000, 10000); err == nil {
+		t.Fatal("expected an AST with no format to be refused")
+	}
+	// The one form that is meant to work still does.
+	if _, err := Validate(mustParse(t, `FROM http SELECT HISTOGRAM(hdr24) FORMAT heatmap`), s, 1000, 10000); err != nil {
+		t.Fatalf("FORMAT heatmap should validate: %v", err)
+	}
+}
+
+// `WHERE HAS ""` parsed into Expr{Has: ""}, which Expr.Empty reports as
+// carrying no predicate at all: Print dropped the whole clause and the
+// store's lowering produced a nil expression, so a query that asked for
+// one thing silently widened to every row in the set.
+func TestEmptyNameIsRefusedRatherThanSilentlyDroppingThePredicate(t *testing.T) {
+	for _, src := range []string{
+		`FROM http SELECT x WHERE HAS ""`,
+		`FROM http SELECT x WHERE MISSING ""`,
+		`FROM http SELECT x WHERE "" = "y"`,
+		`FROM "" SELECT x`,
+		`FROM http SELECT ""`,
+		`FROM http SELECT x BY ""`,
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Fatalf("%s: expected an empty name to be refused", src)
+		}
+	}
+}
+
+// The number lexer has to read back what printFloat writes, or a query
+// carrying a large CLAMP bound does not survive Print -> Parse.
+func TestLargeAndSmallNumbersRoundTrip(t *testing.T) {
+	for _, v := range []float64{1e6, 1e300, -1e300, 1.5e-8, math.MaxFloat64, -math.MaxFloat64, 0.5, 0, -3} {
+		txt := printFloat(v)
+		q, err := Parse(`FROM http SELECT x CLAMP MIN ` + txt)
+		if err != nil {
+			t.Fatalf("printFloat(%g) = %q, which does not lex back: %v", v, txt, err)
+		}
+		got := *q.Select[0].Modifiers.Clamp.Min
+		if got != v {
+			t.Fatalf("printFloat(%g) = %q parsed back as %g", v, txt, got)
+		}
+		if len(txt) > maxPlainFloatDigits+2 {
+			t.Fatalf("printFloat(%g) = %q is %d characters; the exponent form should have been used", v, txt, len(txt))
+		}
+	}
+	// A bare "e" is still an identifier, not an exponent.
+	if _, err := Parse(`FROM http SELECT x GAP 30s`); err != nil {
+		t.Fatalf("durations must still lex: %v", err)
+	}
+}
+
+// A regex is escaped for its delimiters, not doubled wholesale. Doubling
+// every backslash round-tripped but printed /\\d+/ for the pattern \d+,
+// so the canonical text of a query -- what the builder shows and what
+// Grafana reports as the executed query -- read as a different regex from
+// the one that was written.
+func TestRegexPrintsReadablyAndRoundTrips(t *testing.T) {
+	for _, re := range []string{
+		`\d+`, `a/b`, `a\/b`, `a\\b`, `\.`, `^x$`, `[a-z]\s*=\s*\d`, `back\`, `\n`, `\t`,
+		`(?P<n>\w+)`, `a\\/b`, `//`, `\\`,
+	} {
+		q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "x"}},
+			Where: Expr{Match: &MatchExpr{Label: "host", Regex: re}}}
+		txt := Print(q)
+		back, err := Parse(txt)
+		if err != nil {
+			t.Fatalf("regex %q printed as %q, which does not parse: %v", re, txt, err)
+		}
+		if got := back.Where.Match.Regex; got != re {
+			t.Fatalf("regex %q printed as %q and parsed back as %q", re, txt, got)
+		}
+	}
+	// The readable form is the point: a plain regex escape is not doubled.
+	q := &Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "x"}},
+		Where: Expr{Match: &MatchExpr{Label: "host", Regex: `\d+`}}}
+	if txt := Print(q); !strings.Contains(txt, `/\d+/`) {
+		t.Fatalf("expected /\\d+/ in the printed query, got %q", txt)
+	}
+}
+
+// Every syntax fault in this parser comes back positioned, so the editor
+// can underline it. A number that will not parse used to be the one
+// exception, and it moved the cursor past the token on the way out.
+func TestBadNumberIsAPositionedError(t *testing.T) {
+	_, err := Parse(`FROM http SELECT x CLAMP MIN 1.2.3`)
+	if err == nil {
+		t.Fatal("expected a parse error")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a positioned ParseError, got %T: %v", err, err)
+	}
+	if pe.Pos <= 0 {
+		t.Fatalf("expected a position pointing into the query, got %d", pe.Pos)
 	}
 }

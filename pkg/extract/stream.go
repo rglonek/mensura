@@ -179,7 +179,20 @@ func (st *Stream) Process(line string) ([]Result, error) {
 		for i := range m.Join {
 			j := &m.Join[i]
 			if g := j.re.FindStringSubmatch(line); len(g) > j.Capture {
-				buf.line += g[j.Capture]
+				// Capped the way a single record is. Appending without a
+				// bound let a stream of continuation lines grow one
+				// string for as long as the idle timeout allowed, with
+				// max_record_bytes capping only the lines going in. The
+				// overflow is counted, so a truncated joined record is
+				// not mistaken for one that arrived whole.
+				if room := m.maxRecordBytes - len(buf.line); m.maxRecordBytes > 0 && len(g[j.Capture]) > room {
+					if room > 0 {
+						buf.line += trimToRune(g[j.Capture][:room])
+					}
+					st.Stats.Oversize++
+				} else {
+					buf.line += g[j.Capture]
+				}
 				buf.seen = time.Now()
 				return nil, nil
 			}

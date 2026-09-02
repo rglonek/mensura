@@ -32,9 +32,12 @@ type SinkConfig struct {
 	// down, so running out of retries is back-pressure, not a licence to
 	// discard: the batch goes back in the buffer and delivery is held.
 	// That trade only holds while there is somewhere to put it, and this
-	// is where "somewhere" ends -- past it the oldest batch is dropped
-	// and counted, because an unbounded buffer turns a store outage into
-	// an out-of-memory kill that loses everything rather than the tail.
+	// is where "somewhere" ends -- past it the excess is dropped and
+	// counted, because an unbounded buffer turns a store outage into an
+	// out-of-memory kill that loses everything rather than the tail. The
+	// cut is taken from the oldest end of every buffered set in
+	// proportion to its size, so no one stream goes dark while another
+	// is left untouched.
 	MaxBufferedSamples int
 }
 
@@ -200,8 +203,15 @@ type DeliveryObserver interface {
 	// BeginFlush is called with the sink's buffer lock held, immediately
 	// after the batch is taken. It must not call back into the sink.
 	BeginFlush()
-	// EndFlush is called after the write, in commit order. dropped is
-	// true when the batch was abandoned rather than committed.
+	// EndFlush is called after the write, in commit order, and always
+	// pairs with a BeginFlush. dropped is true when the batch was
+	// abandoned rather than committed.
+	//
+	// A flush that could only take part of the buffer reports neither
+	// half on success: the mark BeginFlush would have taken covers
+	// samples this batch does not carry, so there is nothing that batch
+	// entitles an observer to acknowledge. Such a flush is invisible
+	// here, and the checkpoint waits for one that empties the buffer.
 	EndFlush(accepted int, dropped bool)
 }
 
@@ -528,7 +538,19 @@ func (s *Sink) Flush(ctx context.Context) error {
 	if len(resp.Rejected) > 0 {
 		s.log.Printf("WARNING store rejected %d sample(s): %s", len(resp.Rejected), resp.Rejected[0].Reason)
 	}
-	s.endFlush(obs, resp.Accepted, false)
+	// Symmetric with the beginFlush above. A partial take deliberately
+	// announces nothing, because some of the buffer's samples are not in
+	// this batch and a high-water mark that covered them would let a
+	// commit acknowledge bytes the store does not hold. Ending a flush
+	// that was never begun leaned on commitInflight happening to no-op
+	// when inflight has not moved -- an invariant no observer contract
+	// states, so the next implementation of one would have advanced its
+	// checkpoint over undelivered data. A hole left frozen here is
+	// released by the first flush that empties the buffer, which is also
+	// the first moment a rewind would not throw away a backlog.
+	if !partial {
+		s.endFlush(obs, resp.Accepted, false)
+	}
 	return nil
 }
 
@@ -644,7 +666,52 @@ func (s *Sink) enforceBufferCap(obs []DeliveryObserver) {
 		sets = append(sets, set)
 	}
 	sort.Strings(sets)
+	// Every set gives up the same share of its own oldest end, rather
+	// than the first set alphabetically giving up everything.
+	//
+	// The buffers are per-set FIFOs with no cross-set ordering to read,
+	// so "the globally oldest samples" is not a thing this structure can
+	// name. Draining the sorted list in order was the worst available
+	// approximation of it: with sets `access` and `zzz` over the cap,
+	// the whole of `access` was discarded before `zzz` lost a single
+	// sample, so one stream went dark while another was untouched. A
+	// proportional cut takes the oldest samples *within* each set and
+	// leaves every stream equally thinned, which is what an operator
+	// reading "the oldest buffered samples are dropped" would expect to
+	// see on a dashboard.
 	dropped := 0
+	target := over
+	for _, set := range sets {
+		if over <= 0 {
+			break
+		}
+		b := s.buffers[set]
+		if len(b) == 0 {
+			delete(s.buffers, set)
+			continue
+		}
+		// Rounded up, so a set holding a handful of samples still
+		// contributes and the loop always makes progress.
+		n := (len(b)*target + s.pending - 1) / s.pending
+		if n > over {
+			n = over
+		}
+		if n > len(b) {
+			n = len(b)
+		}
+		if n <= 0 {
+			continue
+		}
+		if n == len(b) {
+			delete(s.buffers, set)
+		} else {
+			s.buffers[set] = append([]model.Sample(nil), b[n:]...)
+		}
+		over -= n
+		dropped += n
+	}
+	// A rounding shortfall is finished off in order; by construction it
+	// is at most one sample per set.
 	for _, set := range sets {
 		if over <= 0 {
 			break
@@ -653,6 +720,9 @@ func (s *Sink) enforceBufferCap(obs []DeliveryObserver) {
 		n := over
 		if n > len(b) {
 			n = len(b)
+		}
+		if n <= 0 {
+			continue
 		}
 		if n == len(b) {
 			delete(s.buffers, set)
@@ -675,7 +745,7 @@ func (s *Sink) enforceBufferCap(obs []DeliveryObserver) {
 	// On the milestones: a store that is refusing writes makes this fire
 	// on every flush tick, and a line each would bury everything else.
 	if isLogMilestone(total) {
-		s.log.Printf("ERROR delivery is held and the buffer is full: dropped %d of the oldest sample(s), %d dropped in total, which is the %d-sample limit",
+		s.log.Printf("ERROR delivery is held and the buffer is full: dropped %d sample(s) from the oldest end of every buffered set, %d dropped in total, which is the %d-sample limit",
 			dropped, total, s.cfg.MaxBufferedSamples)
 	}
 	s.endFlush(obs, 0, true)

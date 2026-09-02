@@ -106,10 +106,11 @@ type Store struct {
 	// jobs bounds concurrent query execution.
 	jobs chan struct{}
 
-	started  time.Time
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	started   time.Time
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 // setEntry is the catalogue record for one logical set.
@@ -160,6 +161,12 @@ type fieldEntry struct {
 type dictionary struct {
 	Entries []string `json:"entries"`
 	index   map[string]int32
+	// live is how many positions actually hold a value. It is not
+	// len(Entries): a lost record leaves a hole, and counting holes
+	// against MaxLabelCardinality refused writes on a key that was
+	// under its budget -- while takeHole below exists precisely so
+	// those positions are reused rather than paid for twice.
+	live int
 	// holes lists free positions left by lost records, newest last.
 	//
 	// It is a list rather than a scan because interning used to walk the
@@ -171,13 +178,17 @@ type dictionary struct {
 	holes []int32
 }
 
-// rebuildHoles records the free positions in a freshly loaded dictionary.
+// rebuildHoles records the free positions in a freshly loaded dictionary,
+// and the count of positions that are not holes.
 func (d *dictionary) rebuildHoles() {
 	d.holes = nil
+	d.live = 0
 	for i, e := range d.Entries {
 		if e == "" {
 			d.holes = append(d.holes, int32(i))
+			continue
 		}
+		d.live++
 	}
 }
 
@@ -313,13 +324,22 @@ func (s *Store) warnInexactShardWidths() {
 	}
 }
 
+// Close stops the background sweep, persists the catalogue and closes the
+// engine. It is safe to call twice: runWithEngine defers it while an
+// error path may already have taken it, and a second saveCatalogue plus a
+// second db.Close is at best wasted work and at worst a write against a
+// closed engine.
 func (s *Store) Close() error {
-	s.stopOnce.Do(func() { close(s.stopCh) })
-	s.wg.Wait()
-	if err := s.saveCatalogue(); err != nil {
-		s.cfg.Logger.Printf("ERROR saving catalogue on close: %v", err)
-	}
-	return s.db.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		s.stopOnce.Do(func() { close(s.stopCh) })
+		s.wg.Wait()
+		if serr := s.saveCatalogue(); serr != nil {
+			s.cfg.Logger.Printf("ERROR saving catalogue on close: %v", serr)
+		}
+		err = s.db.Close()
+	})
+	return err
 }
 
 func (s *Store) DB() *engine.DB        { return s.db }
@@ -523,7 +543,7 @@ func (s *Store) intern(key, value string) (int32, error) {
 	if idx, hit := d.index[value]; hit {
 		return idx, nil
 	}
-	if s.cfg.MaxLabelCardinality > 0 && len(d.Entries) >= s.cfg.MaxLabelCardinality {
+	if s.cfg.MaxLabelCardinality > 0 && d.live >= s.cfg.MaxLabelCardinality {
 		return 0, fmt.Errorf("label %q exceeds the cardinality limit of %d distinct values", key, s.cfg.MaxLabelCardinality)
 	}
 	// A hole left by a lost record is reused rather than skipped, so the
@@ -546,6 +566,7 @@ func (s *Store) intern(key, value string) (int32, error) {
 	} else {
 		d.Entries = append(d.Entries, value)
 	}
+	d.live++
 	d.index[value] = idx
 	return idx, nil
 }
@@ -843,10 +864,18 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		if len(s.shardsFor(logical, math.MinInt64, math.MaxInt64)) > 0 {
 			continue
 		}
-		s.mu.Lock()
-		delete(s.catalogue, logical)
-		s.mu.Unlock()
-		s.catVer.Add(1)
+		// ForgetSet, not a bare catalogue delete. The spec-supplied
+		// retention and shard width live in their own maps and are
+		// persisted on the catalogue entry, so deleting only the entry
+		// left them stranded in two ways at once: a set later created
+		// with the same name silently inherited the policy of the one
+		// that aged out, and after a restart the persisted declaration
+		// was gone -- an ingester that is already running never repeats
+		// it, so with the documented "--retention 0 globally, per-set
+		// retention from the spec" deployment the set came back with no
+		// retention, was routed to the unsharded shard that the sweep
+		// skips, and was then kept forever with nothing saying so.
+		s.ForgetSet(logical)
 	}
 	return dropped, nil
 }

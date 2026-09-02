@@ -8,6 +8,12 @@ import (
 	"github.com/rglonek/mensura/pkg/model"
 )
 
+// tailField is the column `tail: true` writes: the count beyond the
+// declared buckets. The name is part of the spec surface
+// (03-extraction.md section 8), so it is a constant both the writer here
+// and the compile-time collision check in spec.go can share.
+const tailField = "tail"
+
 // expand splits a raw histogram payload into one field per declared
 // bucket, then derives the cumulative and tail fields. Doing this at
 // ingest keeps the query path a plain scan.
@@ -93,7 +99,7 @@ func (b *BucketSet) expand(raw string, fields map[string]model.Value) error {
 		tail = 0
 	}
 	if b.Tail {
-		fields["tail"] = model.Int(tail)
+		fields[tailField] = model.Int(tail)
 	}
 	if b.Cumulative {
 		// <bucket>plus is the count at or above that bucket, which is what

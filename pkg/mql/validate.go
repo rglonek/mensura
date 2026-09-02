@@ -105,6 +105,17 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		names[fe.Name()] = true
 
 		if fe.Histogram != "" {
+			// Both directions, not one. Only heatmap-without-HISTOGRAM
+			// used to be refused, so the mirror image -- a HISTOGRAM
+			// under any other format -- validated with no diagnostic at
+			// all and then drew nothing: the planner has no resolved
+			// field to read for a bucket set, so runTimeseries iterates
+			// an empty list and the panel comes back empty, with no
+			// error and no warning. An empty panel that nothing explains
+			// is the failure this validator exists to prevent.
+			if format != FormatHeatmap {
+				return nil, Diag{"E008", fmt.Sprintf("HISTOGRAM(%s) needs FORMAT heatmap; under FORMAT %s a bucket set has no series to draw", fe.Histogram, format)}
+			}
 			if s != nil {
 				if _, ok := s.BucketSet(q.From, fe.Histogram); !ok {
 					return nil, Diag{"E009", fmt.Sprintf("unknown bucket set %q on set %q", fe.Histogram, q.From)}
