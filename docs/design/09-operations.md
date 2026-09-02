@@ -31,7 +31,9 @@ listen:
 # Every listener honours its own tls: block. A separate `query` address is a
 # separate *surface*, not only a separate port: it mounts the read endpoints
 # and nothing else, so publishing it to Grafana cannot expose writes or admin
-# calls even with auth.mode: none.
+# calls even with auth.mode: none. It therefore needs an address of its own:
+# setting it equal to listen.write.addr is refused at startup, because one
+# address can only carry one handler and the write surface would win.
 
 auth:
   mode: bearer                   # bearer | none (loopback only); mTLS is not implemented

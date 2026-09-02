@@ -376,3 +376,304 @@ profiles:
 		t.Errorf("increment counted %d occurrences, want 3: the captured value seeded the window", got)
 	}
 }
+
+// `parse: json_object` is listed in 03-extraction.md section 8 and in the
+// Parse field's own comment, but expand() has no case for it. Left
+// unchecked it compiled cleanly -- so `check --spec` reported the spec
+// good -- and then failed on every single record at run time, losing the
+// whole histogram.
+func TestUnimplementedBucketParseModeIsRefusedAtCompileTime(t *testing.T) {
+	body := `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: lat
+        search: "hist"
+        bucket_set: b
+        extract: ['hist (?P<buckets>.*)']
+    bucket_sets:
+      - name: b
+        parse: %s
+        buckets: ['00','01']
+`
+	for _, mode := range []string{"paren_pairs", "csv", "key_value"} {
+		mustSpec(t, strings.Replace(body, "%s", mode, 1))
+	}
+	for _, mode := range []string{"json_object", "yaml", "Paren_Pairs"} {
+		msg := specError(t, strings.Replace(body, "%s", mode, 1))
+		if !strings.Contains(msg, mode) {
+			t.Fatalf("mode %q: expected the message to name it, got %q", mode, msg)
+		}
+	}
+}
+
+// process() refuses a bucket-set pattern that captured no histogram
+// payload, per record, for the life of the process. It is decidable from
+// the regexes alone, so it is decided at compile time instead.
+func TestBucketSetPatternNeedsABucketsCapture(t *testing.T) {
+	body := `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: lat
+        search: "hist"
+        bucket_set: b
+        extract: ['hist (?P<op>\S+)']
+    bucket_sets:
+      - name: b
+        buckets: ['00','01']
+`
+	if msg := specError(t, body); !strings.Contains(msg, "buckets") {
+		t.Fatalf("expected the message to name the missing capture, got %q", msg)
+	}
+}
+
+// The accumulator keys a window on labels[on]. An `on` key that no regex
+// captures, or that is captured but never classified as a label, makes
+// every record fail with "aggregation key is not a declared label" and
+// the pattern produce nothing. Both halves are decidable from the spec.
+func TestAggregationKeyMustBeCapturedAndDeclaredALabel(t *testing.T) {
+	const body = `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    labels: [%s]
+    patterns:
+      - set: errors
+        search: "ERR"
+        extract: ['ERR (?P<class>\w+)']
+        aggregate: {every: 10s, on: [%s], field: n, mode: increment}
+`
+	mustSpec(t, strings.NewReplacer("%s", "class").Replace(body))
+	// Captured, but not declared as a label: it lands in fields, so the
+	// lookup never finds it.
+	if msg := specError(t, strings.Replace(strings.Replace(body, "%s", "other", 1), "%s", "class", 1)); !strings.Contains(msg, "class") {
+		t.Fatalf("expected the undeclared label to be named, got %q", msg)
+	}
+	// Declared, but nothing captures it.
+	if msg := specError(t, strings.Replace(strings.Replace(body, "%s", "nope", 1), "%s", "nope", 1)); !strings.Contains(msg, "nope") {
+		t.Fatalf("expected the uncaptured key to be named, got %q", msg)
+	}
+}
+
+// `tail: true` writes a field literally called "tail", so a pattern that
+// also captures something by that name had one silently overwrite the
+// other -- expand() runs after the captures are collected, so the
+// histogram tail always won.
+func TestTailFieldCollisionIsRefused(t *testing.T) {
+	body := `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: lat
+        search: "hist"
+        bucket_set: b
+        extract: ['hist (?P<tail>\d+) (?P<buckets>.*)']
+    bucket_sets:
+      - name: b
+        buckets: ['00','01']
+        tail: %s
+`
+	mustSpec(t, strings.Replace(body, "%s", "false", 1))
+	if msg := specError(t, strings.Replace(body, "%s", "true", 1)); !strings.Contains(msg, "tail") {
+		t.Fatalf("expected the clash to be named, got %q", msg)
+	}
+}
+
+// A joined multiline record is bounded like a single one. max_record_bytes
+// capped each input line and the buffer a join appends into was capped by
+// nothing, so a stream of continuation lines grew one string for as long
+// as the idle timeout allowed -- per rule, and on the receive path per
+// peer.
+func TestMultilineJoinIsBoundedByMaxRecordBytes(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    framing:
+      max_record_bytes: 64
+      multiline:
+        - start_contains: "BEGIN"
+          continue_regex: '^\d+ more '
+          join: [{regex: 'more (.*)$', capture: 1}]
+    patterns:
+      - set: s
+        search: "BEGIN"
+        extract: ['BEGIN (?P<v>\d+)']
+`)
+	st, err := s.NewStream(s.Profile("p"), StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if _, err := st.Process("1000 BEGIN 7"); err != nil {
+		t.Fatalf("start line: %v", err)
+	}
+	for i := 0; i < 200; i++ {
+		if _, err := st.Process(fmt.Sprintf("%d more %s", 1001+i, strings.Repeat("x", 100))); err != nil {
+			t.Fatalf("continuation %d: %v", i, err)
+		}
+	}
+	out := st.Flush()
+	if len(out) != 1 {
+		t.Fatalf("expected one joined record, got %d", len(out))
+	}
+	if n := len(out[0].Line); n > 64 {
+		t.Fatalf("joined record is %d bytes, past the 64-byte cap", n)
+	}
+	if st.Stats.Oversize == 0 {
+		t.Fatal("truncation that nothing counts is indistinguishable from data that was never there")
+	}
+}
+
+// An identity rule that declares both keys is one rule: match_path
+// selects which files it applies to, and regex says what to pull out of
+// their heads. Running the two halves independently attached a
+// path-scoped rule's content labels to files its own match_path had just
+// declined.
+func TestIdentityMatchPathScopesTheContentRegex(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+identity:
+  - match_path: 'web/(?P<host>[^/]+)\.log$'
+    regex: 'node-id (?P<node>[0-9a-f]+)'
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: s
+        search: "x"
+        extract: ['(?P<v>x)']
+`)
+	head := []byte("node-id deadbeef\n")
+	in := s.DiscoverIdentity("web/w1.log", head)
+	if in["host"] != "w1" || in["node"] != "deadbeef" {
+		t.Fatalf("a matching path should yield both halves, got %v", in)
+	}
+	out := s.DiscoverIdentity("db/d1.log", head)
+	if len(out) != 0 {
+		t.Fatalf("a path the rule declined must yield nothing, got %v", out)
+	}
+}
+
+// acMatcher.FirstIndex returns the lowest pattern index whose literal
+// occurs, and process() uses that one pattern and no other. So a pattern
+// whose search contains an earlier pattern's search is dead: its set is
+// never written, and nothing at run time says so, because the line did
+// match something. 03-extraction.md section 1 promises `check` reports it.
+func TestLintReportsUnreachablePatterns(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    labels: [pool]
+    fields:
+      v: {kind: gauge}
+    patterns:
+      - set: general
+        search: "stats: "
+        extract: ['stats: (?P<v>\d+)']
+      - set: specific
+        search: "stats: pool="
+        extract: ['stats: pool=(?P<pool>\S+) (?P<v>\d+)']
+`)
+	lints := s.Lint()
+	var found bool
+	for _, l := range lints {
+		if l.Code == "L001" && strings.Contains(l.Msg, "specific") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the shadowed pattern to be reported, got %v", lints)
+	}
+
+	// An empty search shadows everything after it.
+	s2 := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    fields:
+      v: {kind: gauge}
+    patterns:
+      - set: catchall
+        search: ""
+        extract: ['(?P<v>\d+)']
+      - set: never
+        search: "ERROR"
+        extract: ['ERROR (?P<v>\d+)']
+`)
+	if lints := s2.Lint(); len(lints) == 0 || lints[0].Code != "L001" {
+		t.Fatalf("expected an empty search to shadow the rest, got %v", lints)
+	}
+
+	// The correct ordering reports nothing.
+	s3 := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    labels: [pool]
+    fields:
+      v: {kind: gauge}
+    patterns:
+      - set: specific
+        search: "stats: pool="
+        extract: ['stats: pool=(?P<pool>\S+) (?P<v>\d+)']
+      - set: general
+        search: "stats: "
+        extract: ['stats: (?P<v>\d+)']
+`)
+	for _, l := range s3.Lint() {
+		if l.Code == "L001" {
+			t.Fatalf("the specific-first ordering is reachable: %v", l)
+		}
+	}
+}
+
+// The other half of what 03-extraction.md section 1 promises: captures
+// and declarations that resolve to nothing.
+func TestLintReportsUnresolvedCapturesAndDeclarations(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    labels: [pool]
+    fields:
+      declared_but_never_captured: {kind: gauge}
+    patterns:
+      - set: s
+        search: "x"
+        extract: ['x (?P<pool>\S+) (?P<undeclared>\d+)']
+`)
+	codes := map[string]string{}
+	for _, l := range s.Lint() {
+		codes[l.Code] = l.Msg
+	}
+	if msg, ok := codes["L002"]; !ok || !strings.Contains(msg, "undeclared") {
+		t.Fatalf("expected the unresolved capture to be reported, got %v", codes)
+	}
+	if msg, ok := codes["L003"]; !ok || !strings.Contains(msg, "declared_but_never_captured") {
+		t.Fatalf("expected the orphaned field declaration to be reported, got %v", codes)
+	}
+}

@@ -397,10 +397,30 @@ func runCheck(argv []string) error {
 		fmt.Printf("  profile %s: %d pattern(s), %d field(s), %d bucket set(s)\n",
 			p.Name, len(p.Patterns), len(p.Fields), len(p.BucketSets))
 	}
-	if *sample == "" {
-		return nil
+	// The static analysis 03-extraction.md section 1 promises: patterns
+	// that can never be reached, and captures or declarations that
+	// resolve to nothing. It used to promise both and perform neither, so
+	// a spec whose second pattern was shadowed by its first -- and whose
+	// destination set was therefore never written -- passed `check` with
+	// nothing said.
+	lints := spec.Lint()
+	if len(lints) > 0 {
+		fmt.Printf("\n%d spec problem(s):\n", len(lints))
+		for _, l := range lints {
+			fmt.Printf("  %s\n", l)
+		}
 	}
-	return checkSample(spec, *sample, *verbose)
+	if *sample != "" {
+		if err := checkSample(spec, *sample, *verbose); err != nil {
+			return err
+		}
+	}
+	if len(lints) > 0 {
+		// A non-zero exit, so a spec with a dead pattern fails the
+		// pipeline that runs `check` instead of shipping.
+		return fmt.Errorf("%d spec problem(s) reported above", len(lints))
+	}
+	return nil
 }
 
 func runQuery(argv []string) error {

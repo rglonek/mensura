@@ -1042,3 +1042,257 @@ func TestSplitCRLFIsStillATerminator(t *testing.T) {
 		t.Errorf("Terminated = %v, Consumed = %d, want true and 17", rec.Terminated, rec.Consumed)
 	}
 }
+
+// The buffer cap takes its cut from the oldest end of every buffered set
+// in proportion to its size.
+//
+// Draining the sorted set list in order was the worst available
+// approximation of "the oldest samples": with sets `access` and `zzz`
+// over the cap, the whole of `access` was discarded before `zzz` lost a
+// single sample, so one stream went dark on the dashboard while another
+// was untouched.
+func TestBufferCapDoesNotEmptyOneSetBeforeTouchingAnother(t *testing.T) {
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize = 1 << 20 // never auto-flush
+	cfg.FlushEvery = time.Hour
+	cfg.MaxBufferedSamples = 100
+	s := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = s.Close(context.Background()) }()
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := s.AddSample(ctx, "access", sampleN(int64(i))); err != nil {
+			t.Fatalf("add access: %v", err)
+		}
+		if err := s.AddSample(ctx, "zzz", sampleN(int64(1000+i))); err != nil {
+			t.Fatalf("add zzz: %v", err)
+		}
+	}
+	// Delivery is held, so Flush enforces the cap instead of writing.
+	s.holdDelivery(time.Hour)
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	s.mu.Lock()
+	access, zzz := len(s.buffers["access"]), len(s.buffers["zzz"])
+	pending := s.pending
+	s.mu.Unlock()
+	if pending != cfg.MaxBufferedSamples {
+		t.Fatalf("expected the buffer to be trimmed to %d, got %d", cfg.MaxBufferedSamples, pending)
+	}
+	if access == 0 || zzz == 0 {
+		t.Fatalf("one set was emptied while the other was spared: access=%d zzz=%d", access, zzz)
+	}
+	// Each set gave up roughly the same share, and each kept its newest.
+	if access < 40 || zzz < 40 {
+		t.Fatalf("the cut was not proportional: access=%d zzz=%d", access, zzz)
+	}
+	s.mu.Lock()
+	first, _ := s.buffers["access"][0].Fields["n"].AsInt()
+	s.mu.Unlock()
+	if first == 0 {
+		t.Fatal("the cut must come off the oldest end of each set")
+	}
+}
+
+// A flush that could only take part of the buffer announces neither half.
+// The mark BeginFlush would take covers samples the batch does not carry,
+// so there is nothing it entitles an observer to acknowledge. Ending a
+// flush that was never begun leaned on commitInflight happening to no-op,
+// an invariant no observer contract states.
+func TestPartialFlushReportsNeitherHalfToObservers(t *testing.T) {
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize = 1 << 20
+	cfg.FlushEvery = time.Hour
+	// Small enough that a hundred samples cannot leave in one batch.
+	cfg.BatchBytes = 256
+	s := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = s.Close(context.Background()) }()
+
+	var mu sync.Mutex
+	var began, ended, drops int
+	s.Observe(countingObserver{mu: &mu, began: &began, ended: &ended, drops: &drops})
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := s.AddSample(ctx, "a", sampleN(int64(i))); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if s.buffered() == 0 {
+		t.Fatal("this test needs a flush that leaves samples behind")
+	}
+	mu.Lock()
+	b, e := began, ended
+	mu.Unlock()
+	if b != 0 || e != 0 {
+		t.Fatalf("a partial take must announce neither half, got began=%d ended=%d", b, e)
+	}
+
+	// Drain to empty; the flush that clears the buffer is a matched pair.
+	for s.buffered() > 0 {
+		if err := s.Flush(ctx); err != nil {
+			t.Fatalf("drain flush: %v", err)
+		}
+	}
+	mu.Lock()
+	b, e = began, ended
+	mu.Unlock()
+	if b == 0 || b != e {
+		t.Fatalf("Begin and End must pair, got began=%d ended=%d", b, e)
+	}
+}
+
+// retire() rewinds the checkpoint for the replacement file. The
+// fingerprint has to go with the offsets: it described the file that was
+// just rotated away, so the record left on disk named an offset of zero
+// in the new file alongside a content hash of the old one -- and if the
+// process stopped in that window, the next start compared the
+// replacement against a hash belonging to a file that no longer exists.
+//
+// This drives retire() directly rather than racing a live follow, because
+// the stale record only exists between the rotation and the next
+// successful flush, which promptly overwrites it.
+func TestRotationClearsTheCheckpointFingerprintWithTheOffset(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 20)
+
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: stateDir, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &follower{ing: ing, cps: cps, tailers: map[string]*tailer{}, noProfile: map[string]time.Time{}}
+
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	// Read the file so the tailer carries a real offset and fingerprint,
+	// which is the state a rotation finds it in.
+	if err := f.read(context.Background(), tl); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if width := fingerprintWidth(tl.offset); width > 0 {
+		if fp, n := fingerprintAt(tl.file, width); n == width {
+			tl.setFingerprint(fp, width)
+		}
+	}
+	if tl.fingerprint == "" {
+		t.Fatal("this test needs a fingerprinted tailer")
+	}
+
+	f.retire(context.Background(), tl)
+
+	cp, ok := cps.Load(StreamID(path))
+	if !ok {
+		t.Fatal("retire must leave a checkpoint behind")
+	}
+	if cp.AckedOffset != 0 || cp.Offset != 0 {
+		t.Fatalf("retire must rewind the offsets for the replacement file: %+v", cp)
+	}
+	if cp.Fingerprint != "" || cp.FingerprintBytes != 0 {
+		t.Fatalf("retire left the rotated-away file's fingerprint on a rewound checkpoint: %+v", cp)
+	}
+}
+
+// --start-at is honoured where it is applied, not where the loop happens
+// to reach the bottom. Handling it inside the else arm of the size probe
+// meant a single transient SSH failure on the first pass -- which the
+// loop logs and carries on from -- silently dropped the flag for the life
+// of the process.
+func TestRemoteStartAtSurvivesAFailedFirstSizeProbe(t *testing.T) {
+	dir := t.TempDir()
+	remote := filepath.Join(dir, "remote.log")
+	if err := os.WriteFile(remote, []byte("1000 v=1\n2000 v=2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An ssh stand-in whose first `wc -c` fails and whose later ones work.
+	fake := filepath.Join(dir, "ssh")
+	countFile := filepath.Join(dir, "probes")
+	script := "#!/bin/sh\n" +
+		"cmd=\"$#\"\n" +
+		"eval last=\\${$cmd}\n" +
+		"case \"$last\" in\n" +
+		"  *'wc -c'*)\n" +
+		"    n=$(cat " + countFile + " 2>/dev/null || echo 0)\n" +
+		"    echo $((n+1)) > " + countFile + "\n" +
+		"    if [ \"$n\" = \"0\" ]; then echo 'probe failed' >&2; exit 3; fi\n" +
+		"    wc -c < " + remote + "\n" +
+		"    exit 0;;\n" +
+		"  *tail*)\n" +
+		"    sleep 0.4; exit 0;;\n" +
+		"esac\n" +
+		"exit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	stateDir := filepath.Join(dir, "state")
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: stateDir, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = ing.FollowRemote(ctx, RemoteOptions{
+		Host: "h", Paths: []string{remote}, StartAt: "end",
+		SSHBinary: fake, ProbeInterval: 100 * time.Millisecond,
+		ReconnectBackoff: 50 * time.Millisecond,
+	})
+	_ = sink.Close(context.Background())
+
+	cps, err := NewCheckpointStore(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := cps.Load(StreamID("h:" + remote))
+	if !ok {
+		t.Fatal("expected a checkpoint once the probe succeeded")
+	}
+	size, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp.AckedOffset != size.Size() {
+		t.Fatalf("--start-at end was dropped after the first probe failed: checkpoint at %d, file is %d bytes", cp.AckedOffset, size.Size())
+	}
+}

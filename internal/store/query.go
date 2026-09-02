@@ -404,7 +404,6 @@ type seriesAcc struct {
 	labels map[string]string
 	field  resolvedField
 	points []render.Point
-	order  int
 }
 
 func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.QueryRequest, p *queryPlan, resp *wire.QueryResponse, maxSeries, maxPoints int) error {
@@ -440,7 +439,7 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 					gateErr = "too many series for one graph; add filters or reduce BY"
 					return false
 				}
-				a = &seriesAcc{name: seriesName(labels, q.By, f.label), labels: labels, field: f, order: len(acc)}
+				a = &seriesAcc{name: seriesName(labels, q.By, f.label), labels: labels, field: f}
 				acc[key] = a
 			}
 			a.points = append(a.points, render.Point{Value: fv, TSMs: ts})
@@ -1044,9 +1043,15 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 			"gap_ms": f.spec.GapMs, "clamp_else_raw": f.spec.ClampElseRaw,
 		})
 	}
+	// Clamped exactly as runTimeseries clamps it. Reporting a window the
+	// executor would never use makes Explain describe a plan that is not
+	// the plan, which is the one thing this endpoint may not do.
 	window := render.Window(req.ToMs-req.FromMs, req.MaxPoints, req.IntervalMs)
 	if q.EveryMs != nil {
 		window = *q.EveryMs
+	}
+	if window < 0 {
+		window = 0
 	}
 	return map[string]any{
 		"shards":            p.shards,

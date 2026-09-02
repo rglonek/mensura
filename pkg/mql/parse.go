@@ -9,9 +9,6 @@ import (
 type parser struct {
 	toks []token
 	i    int
-	// vars holds variable names encountered, so the caller can report
-	// which ones a query depends on without re-walking the AST.
-	vars map[string]struct{}
 }
 
 // Parse turns MQL text into the canonical AST.
@@ -20,7 +17,7 @@ func Parse(src string) (*Query, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks, vars: map[string]struct{}{}}
+	p := &parser{toks: toks}
 	q, err := p.parseQuery()
 	if err != nil {
 		return nil, err
@@ -70,9 +67,19 @@ func (p *parser) acceptPunct(s string) bool {
 
 // name accepts a bare identifier or a quoted string, which is how names
 // that collide with keywords are written.
+//
+// An empty quoted name is refused rather than accepted. `WHERE HAS ""`
+// parsed into Expr{Has: ""}, which Expr.Empty reports as carrying no
+// predicate at all: Print dropped the whole WHERE clause and the store's
+// lowering produced a nil expression, so a query that asked for one thing
+// silently widened to every row in the set. Nothing downstream can tell
+// that node from an absent one, so it has to be refused here.
 func (p *parser) name(what string) (string, error) {
 	t := p.cur()
 	if t.kind == tokIdent || t.kind == tokString {
+		if t.text == "" {
+			return "", p.errf("expected %s, found an empty name", what)
+		}
 		p.i++
 		return t.text, nil
 	}
@@ -370,8 +377,16 @@ func (p *parser) number() (float64, error) {
 	if t.kind != tokNumber {
 		return 0, p.errf("expected a number, found %s", p.describe(t))
 	}
+	// Positioned, and only advancing once the text really is a number.
+	// Returning strconv's bare error was the one syntax fault in this
+	// parser that came back without a position for the editor to
+	// underline, and the cursor had already moved past the token.
+	f, err := strconv.ParseFloat(t.text, 64)
+	if err != nil {
+		return 0, p.errf("expected a number, found %q", t.text)
+	}
 	p.i++
-	return strconv.ParseFloat(t.text, 64)
+	return f, nil
 }
 
 func (p *parser) integer() (int64, error) {
@@ -577,8 +592,10 @@ func (p *parser) valueOrVar() (string, error) {
 		p.i++
 		return t.text, nil
 	case tokVariable:
+		// The reference stays in the AST as "$name"; Variables(q) walks
+		// it back out. Accumulating a second copy here was dead weight:
+		// nothing ever read it, because Parse does not return it.
 		p.i++
-		p.vars[t.text] = struct{}{}
 		return "$" + t.text, nil
 	}
 	return "", p.errf("expected a value, found %s", p.describe(t))

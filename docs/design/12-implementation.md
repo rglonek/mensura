@@ -142,7 +142,7 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Query: planning, pushdown, grouping, render, safety gates, `Explain`, `timeseries`/`table`/`logs`/`heatmap`, `SETS`/`FIELDS`/`LABELS`/`LABEL KEYS` | implemented |
 | Render pipeline: all ten stages, null slots, SSE, window formula, `EVERY` | implemented |
 | MQL: lexer, parser, printer, validator, diagnostics, JSON AST | implemented |
-| Extraction: profiles, timestamp formats and caching, multiline, replace, routes, default values, bucket sets with cumulative/tail, aggregation, identity discovery, `check` | implemented |
+| Extraction: profiles, timestamp formats and caching, multiline, replace, routes, default values, bucket sets with cumulative/tail, aggregation, identity discovery, `check` including the unreachable-pattern and capture-resolution analyses (§6.39) | implemented |
 | Ingest: batch, follow with rotation and checkpoints, SSH follow, TCP/UDP/HTTP receive, progress reporting | implemented |
 | HTTP API: write, query, catalogue, labels, stats, parse/print, admin compact/retention/quiesce/drop-set, loopback debug plan, Prometheus metrics, bearer auth | implemented |
 | Plugin backend: `QueryData`, `CheckHealth`, `CallResource`, one frame per series, alert-mode `SSE OFF` | implemented |
@@ -696,6 +696,12 @@ and metrics listeners, so their `tls:` blocks were validated at startup and
 then ignored — two of four listeners served plaintext whatever the config
 said. Every listener now uses its own spec.
 
+It also needs an address of its own. `startListeners` can only mount one
+handler per address, so it skipped the query listener when its address
+equalled the write listener's and kept the full mux there — which inverts
+exactly what the operator asked for. `checkAuthPosture` refuses the pair
+at startup, before the data directory is opened.
+
 ### 6.34 `LABELS <key> WHERE …` is gated like a graph
 
 `Validate` returns early for `KindLabels`, so neither datasource ceiling was
@@ -753,7 +759,59 @@ in a list built once at load, so the cost no longer depends on cardinality.
   recognised by its length alone, and a small row legitimately stored
   there — one column, a three-character name, a one-byte value — encodes
   to exactly the same eight bytes. The untagged form written by an earlier
-  build is still read.
+  build is still read, and `Get` falls back to decoding the payload as a
+  row when the index key it names does not exist, which is what keeps the
+  legacy ambiguity harmless. A regression test pins that fallback.
+- The engine's set-id high-water mark is persisted rather than re-derived
+  from the sets that survive. `DropSet` removes the meta record, so
+  deriving it from `max(ID)+1` made it *regress* across a restart:
+  dropping the highest-numbered shard — which retention does on every
+  sweep — let the next set created afterwards take that id back, and set
+  ids are what the `D/` and `I/` key prefixes are built from.
+- The cardinality budget counts live dictionary values, not positions. A
+  lost record leaves a hole that `takeHole` exists to reuse, and counting
+  it against `MaxLabelCardinality` refused writes on a key that was under
+  its budget while charging for the same position twice.
+- `Sink.enforceBufferCap` takes its cut from the oldest end of every
+  buffered set in proportion to its size. Draining the sorted set list in
+  order meant that with sets `access` and `zzz` over the cap, the whole of
+  `access` was discarded before `zzz` lost one sample: one stream went
+  dark on the dashboard while another was untouched.
+- A flush that could only take part of the buffer now reports neither half
+  to the delivery observers. It announced no `BeginFlush` — correctly,
+  since the mark would cover samples the batch does not carry — but still
+  called `EndFlush`, which was safe only because `commitInflight` happens
+  to no-op when `inflight` has not moved. No observer contract stated
+  that, so the next implementation of one would have advanced its
+  checkpoint over undelivered data.
+- `follower.retire` clears the checkpoint fingerprint along with the
+  offsets. It described the file that had just been rotated away, so the
+  record on disk named offset zero in the *new* file beside a content hash
+  of the old one.
+- The remote follower honours `--start-at` where the flag is applied, not
+  where the loop reaches the bottom. Both cases lived inside the `else`
+  arm of the size probe, so one transient SSH failure on the first pass —
+  which the loop logs and carries on from — silently dropped the flag for
+  the life of the process.
+- A joined multiline record is bounded by `max_record_bytes` like a single
+  one, and the truncation is counted. The cap bounded each input line and
+  the buffer a join appends into was bounded by nothing, so a stream of
+  continuation lines grew one string for as long as the idle timeout
+  allowed — per rule, and on the receive path per peer.
+- `Store.Close` is idempotent. `runWithEngine` defers it while an error
+  path may already have taken it, and the second call re-ran
+  `saveCatalogue` against a closed engine and logged an error about a
+  shutdown that had already succeeded.
+- `Explain` clamps a negative `EVERY` the way `runTimeseries` does, so the
+  plan it reports is the plan that would run.
+- An empty quoted name is a parse error. `WHERE HAS ""` produced
+  `Expr{Has: ""}`, which `Expr.Empty` reports as carrying no predicate at
+  all: `Print` dropped the whole clause and the store's lowering produced
+  a nil expression, so a query that asked for one thing silently widened
+  to every row in the set.
+- A number that will not parse comes back as a positioned `ParseError`
+  like every other syntax fault, instead of a bare `strconv` error with
+  the cursor already moved past the token.
 - `Validate` normalises an absent `FORMAT` to `timeseries` before its
   format-dependent checks. An AST with no `format` key executes as a
   timeseries but skipped `W103`, the warning that says outages will be
@@ -820,6 +878,93 @@ in a list built once at load, so the cost no longer depends on cardinality.
   ten. A listener that matches no profile fails every record, and a line
   each was a log flood at line rate.
 
+### 6.39 `check` performs the analyses it advertises
+
+[03](03-extraction.md) §1 says `mensura-ingest check` "checks that captures
+resolve, detects unreachable patterns (a `search` literal shadowed by an
+earlier pattern)". It did neither: it compiled the spec and, given
+`--sample`, reported match rates. Everything else in this codebase refuses
+an unimplemented documented feature by name — `on_parse_error:
+drop-stream`, `framing record: json`, `store_stream_label`,
+`limits.write_rate_per_client` — and this was the one that silently did
+nothing, on the tool whose entire job is to predict what an import will do.
+
+`acMatcher.FirstIndex` returns the *lowest* pattern index whose literal
+occurs in the record, and `process()` uses that one pattern and no other.
+So a pattern whose `search` contains an earlier pattern's `search` is
+dead: its destination set is never written, and nothing at run time says
+so, because the record did match something. An empty `search` is the
+extreme case and shadows every pattern after it.
+
+`Spec.Lint` reports four codes, and `check` exits non-zero when any fire,
+so a spec with a dead pattern fails the pipeline that runs it instead of
+shipping:
+
+| Code | Meaning |
+| --- | --- |
+| `L001` | a pattern that can never be reached, naming the one that shadows it |
+| `L002` | a capture that is neither a declared label nor a `fields:` entry, so it lands as an untyped gauge |
+| `L003` | a `fields:` declaration no pattern captures, so its metadata reaches no column |
+| `L004` | a declared label no pattern captures and that is not a stream label |
+
+Three related wirings are decidable from the spec alone and are now
+compile errors rather than per-record failures: an `aggregate.on` key that
+no regex captures or that is not classified as a label (the accumulator
+reports "aggregation key is not a declared label" for every record and the
+pattern produces nothing); a `bucket_set` pattern with no `buckets` or
+`histogram` capture group (`process()` refuses each record); and
+`parse: json_object`, which `expand()` has no case for and which is listed
+in [03](03-extraction.md) §8 as if it worked.
+
+### 6.40 `HISTOGRAM()` is refused outside `FORMAT heatmap`
+
+Only one direction used to be checked. `FORMAT heatmap` without a
+`HISTOGRAM()` was `E008`; the mirror image validated with no diagnostic at
+all and then drew nothing, because the planner resolves no field for a
+bucket set, so `runTimeseries` iterates an empty list. The panel came back
+empty with no error and no warning — the failure the validator exists to
+prevent — and an AST with no `format` key at all took the same path.
+
+### 6.41 The retention sweep forgets the whole set
+
+A set whose every shard has aged out has its catalogue entry removed. The
+sweep removed only that, leaving the spec-supplied retention and shard
+width behind in `setRetention`/`setShard` — which is exactly what
+`ForgetSet` exists to prevent, and what its comment describes. The
+consequences were both halves of the same bug: until a restart, a set
+later created with the same name silently inherited the dead set's policy;
+and after a restart the persisted `retention_ms`/`shard_ms` were gone with
+the entry, while an ingester that is already running never repeats the
+declaration. Under the documented "`--retention 0` globally, per-set
+retention from the spec" deployment the set then came back with no
+retention, was routed to the unsharded shard the sweep skips, and was kept
+forever with nothing saying so. The sweep calls `ForgetSet`.
+
+### 6.42 An identity rule's `match_path` scopes its `regex`
+
+An `identity:` entry that declares both keys is one rule: `match_path`
+selects which files it applies to and `regex` says what to pull out of
+their heads. The two halves ran independently, so a path-scoped rule
+scanned the head of every file in the sweep and attached its labels to
+files its own `match_path` had just declined. Rules that want the two
+independent write them as two list entries, which is how
+[03](03-extraction.md) §2 shows them.
+
+### 6.43 A regex prints as it was written
+
+The printer escaped a regex by doubling every backslash, because
+`lexQuoted` collapses `\\` to `\`. That round-tripped, and it printed
+`/\\d+/` for the pattern `\d+` — so the canonical text of a query, which
+is what the builder shows and what Grafana reports as the executed query,
+read as a different regex from the one that was written. Only the
+sequences the lexer actually decodes are escaped now, and a backslash only
+where leaving it bare would be ambiguous: before the delimiter, before
+another backslash, or at the end of the pattern.
+
+Relatedly, `printFloat` emitted `'f'` unconditionally, so a `CLAMP` bound
+near `MaxFloat64` printed as a 310-digit literal. Past 24 characters it
+uses the exponent form, and the number lexer reads an exponent back.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
@@ -851,7 +996,8 @@ in a list built once at load, so the cost no longer depends on cardinality.
   context (§ shutdown), a rejected credential (§6.26) and now retry
   exhaustion (§6.31) all requeue rather than shed, so a long outage grows
   memory until the store comes back. `SinkConfig.MaxBufferedSamples`
-  (100 000) is where that ends: past it the oldest batch is dropped,
-  counted and logged with the reason, because an unbounded buffer turns a
-  store outage into an out-of-memory kill that loses everything rather
-  than the tail. Losing nothing at all still needs a spill-to-disk queue.
+  (100 000) is where that ends: past it the excess is dropped from the
+  oldest end of every buffered set in proportion to its size, counted and
+  logged with the reason, because an unbounded buffer turns a store outage
+  into an out-of-memory kill that loses everything rather than the tail.
+  Losing nothing at all still needs a spill-to-disk queue.

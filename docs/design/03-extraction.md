@@ -265,8 +265,9 @@ bucket_sets:
 
 Rules:
 
-- `parse` selects the bucket splitter (`paren_pairs`, `csv`, `json_object`,
-  `key_value`).
+- `parse` selects the bucket splitter: `paren_pairs`, `csv` or `key_value`.
+  `json_object` is **not implemented**, and the compiler refuses it by name
+  rather than accepting a mode that would then fail on every record.
 - `edges` gives each bucket a numeric lower bound so the plugin can render a
   real heatmap axis instead of an ordinal one. `pow2` means bucket *k* covers
   `[2^(k-2), 2^(k-1))` with the first three buckets mapping to 0/1/2, matching
@@ -274,7 +275,12 @@ Rules:
 - `cumulative: true` emits `<bucket>plus` fields (`03plus` = count of
   everything at or above bucket 03), computed at ingest so the query path stays
   a scan.
-- `tail` captures counts beyond the declared buckets.
+- `tail` captures counts beyond the declared buckets, in a field named
+  literally `tail`. A pattern feeding a `tail: true` bucket set may not also
+  capture a group by that name; the compiler refuses the clash rather than
+  letting one silently overwrite the other.
+- A pattern that names a `bucket_set` must capture the payload in a group
+  called `buckets` or `histogram`, and the compiler checks that it does.
 
 Bucket-set membership is recorded in the field catalogue, which is how
 `FORMAT heatmap` knows which fields form one histogram

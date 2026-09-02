@@ -176,6 +176,28 @@ func (l *lexer) lexNumber(start int) {
 		}
 		break
 	}
+	// An exponent, before the unit scan: "1e+06" is what
+	// strconv.FormatFloat produces for a large CLAMP bound, and a number
+	// lexer that could not read it back made Print -> Parse fail on text
+	// this package itself had printed. It is only taken when it is a
+	// complete exponent -- e/E, an optional sign, at least one digit --
+	// so a bare "1e" still lexes as the number 1 followed by the
+	// identifier e, and "30d" is still a duration.
+	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+		j := l.pos + 1
+		if j < len(l.src) && (l.src[j] == '+' || l.src[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(l.src) && l.src[k] >= '0' && l.src[k] <= '9' {
+			k++
+		}
+		if k > j {
+			l.pos = k
+			l.toks = append(l.toks, token{tokNumber, l.src[start:l.pos], start})
+			return
+		}
+	}
 	// A duration is a number immediately followed by a unit, with no space:
 	// 90s, not 1m30s.
 	us := l.pos

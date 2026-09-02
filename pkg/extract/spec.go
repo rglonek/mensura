@@ -162,8 +162,9 @@ type Multiline struct {
 	} `yaml:"join"`
 	IdleTimeout string `yaml:"idle_timeout"`
 
-	continueRe  *regexp.Regexp
-	idleTimeout time.Duration
+	continueRe     *regexp.Regexp
+	idleTimeout    time.Duration
+	maxRecordBytes int
 }
 
 // Pattern is one extraction rule.
@@ -481,6 +482,13 @@ func (p *Profile) compile(s *Spec) error {
 		} else {
 			m.idleTimeout = 30 * time.Second
 		}
+		// The joined record is bounded by the same cap as a single one.
+		// max_record_bytes bounded each *input* line, and the buffer a
+		// join appends into was bounded by nothing at all, so a source
+		// emitting continuation lines grew one string for as long as the
+		// idle timeout allowed -- per rule, and on the receive path per
+		// peer.
+		m.maxRecordBytes = p.Framing.MaxRecordBytes
 	}
 	p.buckets = map[string]*BucketSet{}
 	for _, bs := range p.BucketSets {
@@ -567,8 +575,31 @@ func (p *Profile) compile(s *Spec) error {
 			return fmt.Errorf("pattern for set %q sets store_stream_label, which is not implemented; remove it", pat.Set)
 		}
 		if pat.BucketSet != "" {
-			if _, ok := p.buckets[pat.BucketSet]; !ok {
+			bs, ok := p.buckets[pat.BucketSet]
+			if !ok {
 				return fmt.Errorf("pattern references unknown bucket set %q", pat.BucketSet)
+			}
+			// `tail: true` writes a field literally called "tail"
+			// (03-extraction.md section 8), so a pattern that also
+			// captures something by that name would have one silently
+			// overwrite the other -- expand() runs after the captures
+			// are collected, so the histogram tail always won. Naming
+			// the clash at compile time is the only way the spec author
+			// finds out.
+			if bs.Tail {
+				for _, name := range patternCaptureNames(pat) {
+					if name == tailField {
+						return fmt.Errorf("pattern for set %q captures %q, which is also the field bucket set %s writes for `tail: true`; rename one of them",
+							pat.Set, tailField, bs.Name)
+					}
+				}
+			}
+			// process() refuses a bucket-set pattern that captured no
+			// histogram payload, per record, for the life of the
+			// process. It is decidable from the regexes alone, so it is
+			// decided here instead.
+			if !capturesAny(pat, "buckets", "histogram") {
+				return fmt.Errorf("pattern for set %q declares bucket set %q but no extract or route regex captures a group named `buckets` or `histogram`", pat.Set, pat.BucketSet)
 			}
 		}
 		if pat.Aggregate != nil {
@@ -596,6 +627,21 @@ func (p *Profile) compile(s *Spec) error {
 			default:
 				return fmt.Errorf("aggregate mode %q: expected increment, sum, max or last", pat.Aggregate.Mode)
 			}
+			// Every `on` key has to be both captured and classified as a
+			// label, or the accumulator cannot key a window on it: the
+			// stream reports "aggregation key %q is not a declared
+			// label" for every record and the pattern never produces a
+			// sample. Both halves are decidable from the spec.
+			for _, on := range pat.Aggregate.On {
+				if !capturesAny(pat, on) {
+					return fmt.Errorf("pattern for set %q aggregates on %q, which no extract or route regex captures", pat.Set, on)
+				}
+				_, profileLabel := p.labelSet[on]
+				_, patternLabel := pat.labelSet[on]
+				if !profileLabel && !patternLabel {
+					return fmt.Errorf("pattern for set %q aggregates on %q, which is captured but not declared as a label; add it to the profile's `labels:` or the pattern's", pat.Set, on)
+				}
+			}
 		}
 		searches = append(searches, pat.Search)
 	}
@@ -603,12 +649,72 @@ func (p *Profile) compile(s *Spec) error {
 	return nil
 }
 
+// capturesAny reports whether a pattern extracts any of the given names
+// from a record.
+//
+// It asks about *extracted* names only, not patternCaptureNames: an
+// aggregation key has to come off the line itself, and a window keyed on
+// the field the accumulator synthesises would never be populated.
+func capturesAny(pat *Pattern, names ...string) bool {
+	have := patternExtractedNames(pat)
+	for _, want := range names {
+		for _, got := range have {
+			if got == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// patternExtractedNames lists the names a pattern takes off a record: its
+// named capture groups, from both extract and route, plus anything
+// default_values supplies.
+func patternExtractedNames(pat *Pattern) []string {
+	var out []string
+	for _, re := range pat.extract {
+		out = append(out, re.SubexpNames()...)
+	}
+	for i := range pat.Route {
+		out = append(out, pat.Route[i].re.SubexpNames()...)
+	}
+	for k := range pat.DefaultValues {
+		out = append(out, k)
+	}
+	return out
+}
+
+// patternCaptureNames lists every field or label name a pattern can put on
+// a row: everything it extracts, plus the field an aggregate synthesises,
+// which is a real column even though no regex names it. Declarations()
+// resolves field metadata against the same set.
+func patternCaptureNames(pat *Pattern) []string {
+	out := patternExtractedNames(pat)
+	if pat.Aggregate != nil && pat.Aggregate.Field != "" {
+		out = append(out, pat.Aggregate.Field)
+	}
+	return out
+}
+
 func (b *BucketSet) compile() error {
 	if b.Name == "" || len(b.Buckets) == 0 {
 		return fmt.Errorf("bucket set needs a name and buckets")
 	}
-	if b.Parse == "" {
+	switch b.Parse {
+	case "":
 		b.Parse = "paren_pairs"
+	case "paren_pairs", "csv", "key_value":
+	case "json_object":
+		// Listed in 03-extraction.md section 8 and in the Parse field's
+		// own comment, but expand() has no case for it. Left unchecked
+		// it compiled cleanly -- so `check --spec` reported the spec
+		// good -- and then failed on every single record at run time,
+		// losing the whole histogram. The same principle that refuses
+		// on_parse_error: drop-stream and framing record: json applies:
+		// an operator must not be able to believe a mode works.
+		return fmt.Errorf("bucket set %s: parse json_object is not implemented; use paren_pairs, csv or key_value", b.Name)
+	default:
+		return fmt.Errorf("bucket set %s: unknown parse %q (paren_pairs, csv or key_value)", b.Name, b.Parse)
 	}
 	b.edges = make([]float64, len(b.Buckets))
 	switch {
@@ -745,10 +851,20 @@ func (s *Spec) DiscoverIdentity(path string, head []byte) map[string]string {
 	out := map[string]string{}
 	for i := range s.Identity {
 		r := &s.Identity[i]
+		// A rule that declares both keys is one rule: match_path selects
+		// which files it applies to, and regex says what to pull out of
+		// their heads. Running the two halves independently meant a
+		// path-scoped rule scanned the head of every file in the sweep
+		// and attached its labels to files its own match_path had just
+		// declined. Rules that want the two to be independent write them
+		// as two list entries, which is how 03-extraction.md section 2
+		// shows them.
 		if r.matchPath != nil {
-			if m := r.matchPath.FindStringSubmatch(filepath.ToSlash(path)); m != nil {
-				collectNamed(r.matchPath, m, out)
+			m := r.matchPath.FindStringSubmatch(filepath.ToSlash(path))
+			if m == nil {
+				continue
 			}
+			collectNamed(r.matchPath, m, out)
 		}
 		if r.regex != nil {
 			lines := strings.SplitN(string(head), "\n", r.ScanLines+1)
