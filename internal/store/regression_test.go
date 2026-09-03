@@ -1215,3 +1215,124 @@ func TestExplainReportsTheClampedWindow(t *testing.T) {
 		t.Fatalf("expected the window Explain reports to be clamped like the executor's, got %d", got)
 	}
 }
+
+// A spec's sets: block reaching the store as SetMeta alone creates the
+// catalogue entry, so it has to move the catalogue version with it.
+// entryLocked created the set and nothing bumped catVer, so /v1/catalogue
+// answered 304 to every client still holding the old ETag and a datasource
+// that caches it never saw the set at all.
+func TestSetMetaOnlyWriteMovesTheCatalogueVersion(t *testing.T) {
+	s := openTestStore(t)
+	before := s.CatalogueVersion()
+	day := (24 * time.Hour).Milliseconds()
+	if _, err := s.Write(&wire.WriteRequest{SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &day}}}, "", "test"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	found := false
+	for _, si := range s.Catalogue().Sets {
+		if si.Name == "app" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the set-meta write did not add the set to the catalogue")
+	}
+	if s.CatalogueVersion() == before {
+		t.Fatalf("the catalogue gained a set while the version stayed at %d: a client holding that ETag is answered 304 forever", before)
+	}
+	// Repeating the identical declaration is not a change: an ingest that
+	// re-declares it on every start must not wake every watching client.
+	steady := s.CatalogueVersion()
+	if _, err := s.Write(&wire.WriteRequest{SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &day}}}, "", "test"); err != nil {
+		t.Fatalf("re-declare: %v", err)
+	}
+	if got := s.CatalogueVersion(); got != steady {
+		t.Fatalf("re-declaring identical set metadata moved the version from %d to %d", steady, got)
+	}
+}
+
+// The wire catalogue has to carry the stale flag, because that is the form
+// a proxy-mode plugin validates against. Computing it only in Schema.Field
+// meant the same query answered W203 "has not been seen recently" under
+// mode: plugin and nothing at all under mode: proxy.
+func TestCatalogueCarriesTheStaleFlag(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{{TSMs: base(), Fields: map[string]model.Value{"v": model.Int(1)}}})
+	s.mu.Lock()
+	s.catalogue["app"].Fields["v"].LastSeenMs = time.Now().Add(-30 * 24 * time.Hour).UnixMilli()
+	s.mu.Unlock()
+
+	if info, ok := s.Schema().Field("app", "v"); !ok || !info.Stale {
+		t.Fatalf("the embedded schema does not report the field as stale: %+v", info)
+	}
+	for _, si := range s.Catalogue().Sets {
+		if si.Name != "app" {
+			continue
+		}
+		if !si.Fields["v"].Stale {
+			t.Fatal("the catalogue sent over the wire dropped the stale flag, so a proxy-mode plugin never warns")
+		}
+		return
+	}
+	t.Fatal("set app is missing from the catalogue")
+}
+
+// A hole in a legacy packed dictionary is a free position, not a value.
+// Indexing it made lookup(key, "") answer with the hole's index, so a
+// query lowering label = "" produced an equality against a position
+// instead of the constant-false plus W201 an unknown value gets.
+func TestALegacyDictionaryHoleIsNotAValue(t *testing.T) {
+	s := openTestStore(t)
+	packed, err := json.Marshal(dictionary{Entries: []string{"web1", "", "web3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutDict(dictPackedPrefix+"host", packed); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	s.dict = map[string]*dictionary{}
+	if err := s.loadDictionaries(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if idx, ok := s.lookup("host", ""); ok {
+		t.Fatalf("the empty string resolved to dictionary index %d, which is a hole", idx)
+	}
+	if _, ok := s.lookup("host", "web3"); !ok {
+		t.Fatal("a real value was lost while skipping the hole")
+	}
+}
+
+// Request bodies are buffered before a write slot is taken, so nothing but
+// this budget bounds what the API holds in memory: peak footprint used to
+// be concurrent connections x max_request_bytes, with nothing capping the
+// connections.
+func TestRequestBodiesAreBoundedInAggregate(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20, MaxBufferedRequestBytes: 1 << 20})
+	body := `{"batches":[{"set":"app","samples":[]}]}`
+
+	// Nothing outstanding: the request is admitted.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/write", strings.NewReader(body))
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("an ordinary write was refused: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// With the budget already committed, the next body is shed rather
+	// than read: the client backs off instead of the store growing.
+	api.bodyBytes.Add(1 << 20)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/write", strings.NewReader(body))
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a body past the buffer budget got %d, want 503", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("a shed write must say when to come back")
+	}
+	api.bodyBytes.Add(-(1 << 20))
+	if got := api.bodyBytes.Load(); got != 0 {
+		t.Fatalf("the budget leaked: %d bytes still reserved after every request finished", got)
+	}
+}

@@ -25,7 +25,7 @@ mensura-ingest batch    --spec F --source S…   [--store URL]   one-shot import
 mensura-ingest follow   --spec F --path P…     [--store URL]   long-running tail
 mensura-ingest follow   --spec F --ssh user@h:/path/*.log      long-running remote tail
 mensura-ingest receive  --spec F --listen …    [--store URL]   long-running network receiver
-mensura-ingest check    --spec F [--sample FILE]                offline spec linting / dry run
+mensura-ingest check    --spec F [--sample FILE] [--label k=v]   offline spec linting / dry run
 mensura-ingest query    --store URL 'MQL…'                      debugging client
 ```
 
@@ -237,9 +237,19 @@ with a busybox/BSD fallback that re-execs `tail -c +N -f` and re-opens on
 stalling plus a periodic `stat` probe over the same session. Because remote
 rotation detection is weaker than local, remote follow:
 
-- always uses the content fingerprint (not inode) as `file_id`;
-- runs a length probe every `--ssh-probe-interval` (default 15 s), which is
-  what detects a file shorter than the bytes already read;
+- runs one probe every `--ssh-probe-interval` (default 15 s) that reads both
+  the length and the file's identity (`wc -c` plus `ls -Li`, both POSIX, no
+  remote install). A file shorter than the bytes already read was truncated;
+  a different inode under the same name was renamed away and re-created,
+  which the length alone cannot see — `tail -F` is already following the
+  replacement while the offsets keep climbing from the file it left, so by
+  the next probe the new file has usually grown past the acknowledged
+  offset and looks perfectly healthy;
+- records that identity in the checkpoint's `fingerprint`, so a rotation
+  that happens while the follower is down is seen on the next start rather
+  than resumed into at an offset that means nothing in the new file. A far
+  end whose `ls` cannot answer leaves it empty and the probe falls back to
+  the length test alone;
 - prefers `--rotated-glob` catch-up over trying to be clever about the race.
 
 Multiple remote files multiplex over one SSH connection where the server
@@ -284,6 +294,11 @@ datagram (no reassembly).
 who prefer an API. This is the *ingest-side* API and is deliberately distinct
 from the store's write API: it accepts un-extracted content and applies the
 spec, whereas the store's API accepts only fully-formed samples.
+
+Both answer a sender outside `allowed_sources` with `403`, and `/lines`
+answers `{"accepted": n, "refused": m, "reason": …}` — the denominator as
+well as the count, because a body whose every line the spec cannot read is
+otherwise indistinguishable from an empty one.
 
 ## 8. Extraction, aggregation and histograms
 

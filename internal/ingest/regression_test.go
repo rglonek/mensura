@@ -923,6 +923,10 @@ func TestABigBufferIsDeliveredInBoundedRequests(t *testing.T) {
 // A partial take must not let a checkpoint advance: the observers' own
 // high-water mark covers every byte handed to the sink, including the
 // samples still waiting in the buffer.
+//
+// One round, not a whole Flush: Flush keeps sending rounds until the
+// buffer is empty, and it is the round that leaves samples behind whose
+// silence is being asserted.
 func TestAPartialTakeDoesNotAcknowledgeWhatItLeftBehind(t *testing.T) {
 	rs := newRecordingStore()
 	defer rs.srv.Close()
@@ -942,10 +946,11 @@ func TestAPartialTakeDoesNotAcknowledgeWhatItLeftBehind(t *testing.T) {
 			t.Fatalf("add: %v", err)
 		}
 	}
-	if err := sink.Flush(ctx); err != nil {
+	partial, err := sink.flushRound(ctx, sink.snapshotObservers())
+	if err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	if sink.buffered() == 0 {
+	if !partial || sink.buffered() == 0 {
 		t.Fatal("the whole buffer went out in one request; the test is not exercising a partial take")
 	}
 	obs.mu.Lock()
@@ -1130,11 +1135,12 @@ func TestPartialFlushReportsNeitherHalfToObservers(t *testing.T) {
 			t.Fatalf("add: %v", err)
 		}
 	}
-	if err := s.Flush(ctx); err != nil {
+	partial, err := s.flushRound(ctx, s.snapshotObservers())
+	if err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	if s.buffered() == 0 {
-		t.Fatal("this test needs a flush that leaves samples behind")
+	if !partial || s.buffered() == 0 {
+		t.Fatal("this test needs a round that leaves samples behind")
 	}
 	mu.Lock()
 	b, e := began, ended
@@ -1143,11 +1149,12 @@ func TestPartialFlushReportsNeitherHalfToObservers(t *testing.T) {
 		t.Fatalf("a partial take must announce neither half, got began=%d ended=%d", b, e)
 	}
 
-	// Drain to empty; the flush that clears the buffer is a matched pair.
-	for s.buffered() > 0 {
-		if err := s.Flush(ctx); err != nil {
-			t.Fatalf("drain flush: %v", err)
-		}
+	// Drain to empty; the take that clears the buffer is a matched pair.
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("drain flush: %v", err)
+	}
+	if s.buffered() != 0 {
+		t.Fatalf("Flush left %d sample(s) buffered; it drains the backlog it split", s.buffered())
 	}
 	mu.Lock()
 	b, e = began, ended
@@ -1294,5 +1301,113 @@ func TestRemoteStartAtSurvivesAFailedFirstSizeProbe(t *testing.T) {
 	}
 	if cp.AckedOffset != size.Size() {
 		t.Fatalf("--start-at end was dropped after the first probe failed: checkpoint at %d, file is %d bytes", cp.AckedOffset, size.Size())
+	}
+}
+
+// Progress.Samples used to be written only by MergeStream, and only the
+// batch importer calls that -- so follow, SSH follow and receive reported
+// "0 samples" forever: on the console, in the progress document, and in
+// the samples field the _mensura_ingest set publishes for dashboards.
+func TestFollowCountsTheSamplesItDelivers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, filepath.Join(dir, "state"))
+
+	appendLines(t, path, 0, 12)
+	runFollowFor(t, ing, sink, path, func() {
+		if !waitFor(t, 5*time.Second, func() bool { return len(rs.counts()) >= 12 }) {
+			t.Fatalf("delivery incomplete: %d", len(rs.counts()))
+		}
+	})
+	snap := ing.Progress().Snapshot()
+	if snap.Samples < 12 {
+		t.Fatalf("a follow that delivered %d sample(s) reported %d", len(rs.counts()), snap.Samples)
+	}
+}
+
+// The HTTP lines endpoint answered 200 {"accepted": n} with no
+// denominator, so a sender that was entirely blocked by --allow-source,
+// or whose lines matched no pattern, could not tell that apart from an
+// empty post.
+func TestReceivedLinesReportWhatWasRefused(t *testing.T) {
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, "")
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = ing.Receive(ctx, ReceiveOptions{HTTPAddr: addr, Listener: "test", AllowedSources: []string{"10.0.0.1"}})
+	}()
+
+	url := "http://" + addr + "/ingest/v1/lines"
+	var resp *http.Response
+	if !waitFor(t, 5*time.Second, func() bool {
+		r, perr := http.Post(url, "text/plain", strings.NewReader("1756382400000 n=1\n"))
+		if perr != nil {
+			return false
+		}
+		resp = r
+		return true
+	}) {
+		t.Fatal("listener never came up")
+	}
+	defer resp.Body.Close()
+	// The sender is not in allowed_sources, which is the same verdict the
+	// samples endpoint gives it.
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("a disallowed sender got %d, want 403", resp.StatusCode)
+	}
+}
+
+// The same endpoint, from a permitted sender: lines the spec cannot use
+// are counted rather than dropped in silence.
+func TestReceivedLinesCountTheUnmatched(t *testing.T) {
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, "")
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ing.Receive(ctx, ReceiveOptions{HTTPAddr: addr, Listener: "test"}) }()
+
+	url := "http://" + addr + "/ingest/v1/lines"
+	var body map[string]any
+	if !waitFor(t, 5*time.Second, func() bool {
+		r, perr := http.Post(url, "text/plain", strings.NewReader("1756382400000 n=1\nnot a record at all\n"))
+		if perr != nil {
+			return false
+		}
+		defer r.Body.Close()
+		return json.NewDecoder(r.Body).Decode(&body) == nil
+	}) {
+		t.Fatal("listener never came up")
+	}
+	if got, _ := body["accepted"].(float64); got != 1 {
+		t.Errorf("accepted = %v, want 1 (%v)", body["accepted"], body)
+	}
+	if got, _ := body["refused"].(float64); got != 1 {
+		t.Fatalf("a line the spec could not use was counted nowhere: %v", body)
+	}
+	if _, ok := body["reason"]; !ok {
+		t.Error("the response says how many were refused but not why")
 	}
 }

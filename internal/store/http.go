@@ -54,6 +54,15 @@ type APIConfig struct {
 
 	MaxRequestBytes     int64
 	MaxConcurrentWrites int
+	// MaxBufferedRequestBytes bounds the request-body bytes the whole API
+	// holds in memory at once. Bodies are read before a write slot is
+	// taken -- deliberately, so slow clients cannot occupy the write pool
+	// without presenting a batch -- and nothing else caps how many
+	// connections the http.Server serves at a time, so peak footprint was
+	// connections x MaxRequestBytes. Defaults to four times
+	// MaxRequestBytes, and is raised to MaxRequestBytes if set below it,
+	// because a request the API accepts must always fit.
+	MaxBufferedRequestBytes int64
 
 	// Mode is reported by /v1/hello: server, plugin or proxy.
 	Mode string
@@ -65,11 +74,15 @@ type API struct {
 	cfg   APIConfig
 
 	writeSlots chan struct{}
-	writes     atomic.Int64
-	writeErrs  atomic.Int64
-	queries    atomic.Int64
-	queryErrs  atomic.Int64
-	rejected   atomic.Int64
+	// bodyBytes is what the admitted bodies reserved, not what they turned
+	// out to be: the size is not known until the body has been read, which
+	// is the very thing being bounded.
+	bodyBytes atomic.Int64
+	writes    atomic.Int64
+	writeErrs atomic.Int64
+	queries   atomic.Int64
+	queryErrs atomic.Int64
+	rejected  atomic.Int64
 }
 
 func NewAPI(s *Store, cfg APIConfig) *API {
@@ -81,6 +94,12 @@ func NewAPI(s *Store, cfg APIConfig) *API {
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "server"
+	}
+	if cfg.MaxBufferedRequestBytes <= 0 {
+		cfg.MaxBufferedRequestBytes = 4 * cfg.MaxRequestBytes
+	}
+	if cfg.MaxBufferedRequestBytes < cfg.MaxRequestBytes {
+		cfg.MaxBufferedRequestBytes = cfg.MaxRequestBytes
 	}
 	return &API{store: s, cfg: cfg, writeSlots: make(chan struct{}, cfg.MaxConcurrentWrites)}
 }
@@ -251,10 +270,13 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 	// The body is read before a write slot is taken. Holding a slot across
 	// the read would let MaxConcurrentWrites slow clients occupy the whole
 	// pool without ever presenting a batch.
-	body, err := readBody(r, a.cfg.MaxRequestBytes)
+	body, err := a.readBody(r)
 	if err != nil {
 		a.writeErrs.Add(1)
-		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+		if errors.Is(err, errBusy) {
+			w.Header().Set("Retry-After", "1")
+		}
+		writeErr(w, bodyErrStatus(err), err.Error())
 		return
 	}
 	var req wire.WriteRequest
@@ -303,9 +325,9 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusMethodNotAllowed, "use POST")
 		return
 	}
-	body, err := readBody(r, a.cfg.MaxRequestBytes)
+	body, err := a.readBody(r)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+		writeErr(w, bodyErrStatus(err), err.Error())
 		return
 	}
 	var req wire.QueryRequest
@@ -370,10 +392,12 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request, _ string) {
 
 func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 	// Every body-reading handler goes through readBody, so none of them
-	// can be used to make the store buffer an unbounded request.
-	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	// can be used to make the store buffer an unbounded request, and no
+	// number of them can make it buffer more than
+	// MaxBufferedRequestBytes at once.
+	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		writeErr(w, bodyErrStatus(rerr), rerr.Error())
 		return
 	}
 	var body struct {
@@ -402,9 +426,9 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
-	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		writeErr(w, bodyErrStatus(rerr), rerr.Error())
 		return
 	}
 	var q mql.Query
@@ -416,9 +440,9 @@ func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
-	raw, rerr := readBody(r, a.cfg.MaxRequestBytes)
+	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, rerr.Error())
+		writeErr(w, bodyErrStatus(rerr), rerr.Error())
 		return
 	}
 	var req wire.QueryRequest
@@ -526,6 +550,45 @@ func requirePost(w http.ResponseWriter, r *http.Request) bool {
 // readBody reads at most max bytes, before and after decompression. It
 // reports an oversized body as an error rather than silently handing back
 // a truncated prefix that would then fail to parse for the wrong reason.
+// errBusy is the admission refusal: the API is already holding as many
+// request-body bytes as it may.
+var errBusy = errors.New("the server is already buffering its limit of request bodies")
+
+// readBody reads a request body against the shared in-memory budget.
+//
+// Shedding rather than queueing is the same choice the write pool makes:
+// a client that is told to back off stops its readers, which stops its
+// sources, while a queue of blocked readers is memory nobody bounded.
+func (a *API) readBody(r *http.Request) ([]byte, error) {
+	// What the body may still turn into once it is decompressed, since
+	// that is what has to fit in memory. Content-Length only helps when
+	// the body arrives as it was sent.
+	reserve := a.cfg.MaxRequestBytes
+	if r.Header.Get("Content-Encoding") != "gzip" && r.ContentLength > 0 && r.ContentLength < reserve {
+		reserve = r.ContentLength
+	}
+	for {
+		cur := a.bodyBytes.Load()
+		if cur+reserve > a.cfg.MaxBufferedRequestBytes {
+			return nil, errBusy
+		}
+		if a.bodyBytes.CompareAndSwap(cur, cur+reserve) {
+			break
+		}
+	}
+	defer a.bodyBytes.Add(-reserve)
+	return readBody(r, a.cfg.MaxRequestBytes)
+}
+
+// bodyErrStatus maps a body failure to its status: a refused admission is
+// back-pressure, anything else is a body the client should not have sent.
+func bodyErrStatus(err error) int {
+	if errors.Is(err, errBusy) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusRequestEntityTooLarge
+}
+
 func readBody(r *http.Request, max int64) ([]byte, error) {
 	var reader io.Reader = http.MaxBytesReader(nil, r.Body, max)
 	if r.Header.Get("Content-Encoding") == "gzip" {

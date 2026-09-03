@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -167,7 +168,16 @@ func (v *Value) UnmarshalJSON(b []byte) error {
 		S *string  `json:"s"`
 		B *bool    `json:"b"`
 	}
-	if err := json.Unmarshal(b, &raw); err != nil {
+	// Strict, like the decoder the write API wraps this in. A custom
+	// unmarshaller replaces the outer decoder's settings, so
+	// DisallowUnknownFields stopped at the edge of a field value and
+	// {"i":1,"flaot":2} was accepted with the typo dropped -- on the one
+	// path whose stated contract is that a typo fails loudly. A Value is
+	// only ever written by MarshalJSON, which emits exactly one key, so
+	// nothing legitimate carries a second.
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
 		return err
 	}
 	set := 0

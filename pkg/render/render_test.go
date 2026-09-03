@@ -353,3 +353,31 @@ func TestNoTrailingBreakWhenTheCadenceIsHonoured(t *testing.T) {
 		}
 	}
 }
+
+// A series whose only sample is consumed by DELTA or RATE emitted nothing
+// and then drew a trailing connect-break anyway: lastPointTime is set
+// before those stages drop the sample, so the panel showed a break
+// starting just after a moment when data did arrive. The real reason is
+// that a rate needs two samples, and saying nothing says that better than
+// saying something false.
+func TestASingleSampleConsumedByRateDrawsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec Spec
+	}{
+		{"rate", Spec{PerSecond: true, GapMs: 1000, EndMs: 100000}},
+		{"delta", Spec{Delta: true, GapMs: 1000, EndMs: 100000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := Series([]Point{{Value: 5, TSMs: 1000}}, tc.spec, 0)
+			if len(out) != 0 {
+				t.Fatalf("a series that emitted no value produced %d point(s): %+v", len(out), out)
+			}
+		})
+	}
+	// A series that did emit still gets its trailing break.
+	out := Series([]Point{{Value: 5, TSMs: 1000}, {Value: 7, TSMs: 2000}}, Spec{PerSecond: true, GapMs: 1000, EndMs: 100000}, 0)
+	if len(out) == 0 || !out[len(out)-1].Null {
+		t.Fatalf("the trailing connect-break was lost for a series that did emit: %+v", out)
+	}
+}

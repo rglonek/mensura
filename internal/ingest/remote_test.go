@@ -168,3 +168,95 @@ func TestRemoteFollowConsumesAnUnterminatedOversizeRecord(t *testing.T) {
 		t.Error("the truncation was not counted")
 	}
 }
+
+// fakeSSHWithIdentity is fakeSSH plus the file identity the rotation probe
+// reads: the stand-in answers the size and the inode of whatever the path
+// names right now, which is what a rename-and-create rotation changes.
+func fakeSSHWithIdentity(t *testing.T, dir, file string) string {
+	t.Helper()
+	for _, tool := range []string{"sh", "dd", "sed", "wc", "ls"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not available, so the ssh stand-in cannot run", tool)
+		}
+	}
+	bin := filepath.Join(dir, "fake-ssh-ident")
+	script := fmt.Sprintf(`#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+  *"wc -c"*) wc -c < %q; ls -Li %q ;;
+  *) off=$(echo "$last" | sed -n 's/^tail -c +\([0-9][0-9]*\).*/\1/p')
+     [ -z "$off" ] && off=1
+     dd bs=1 skip=$((off-1)) if=%q 2>/dev/null ;;
+esac
+`, file, file, file)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ssh stand-in: %v", err)
+	}
+	return bin
+}
+
+// A rename-and-create rotation replaces the file under the tail while the
+// byte offsets keep climbing from the old one, so the acknowledged offset
+// ends up naming a position in a file that never held those bytes. Size
+// alone cannot see it: by the time the next probe runs the replacement is
+// usually already longer than the offset, so the "shorter than what we
+// read" test finds nothing wrong and the reconnect resumes past the head
+// of the new file -- a silent skip.
+func TestRemoteFollowDetectsARotationThatGrewPastTheOffset(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+	appendLines(t, logPath, 0, 30)
+	bin := fakeSSHWithIdentity(t, dir, logPath)
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, filepath.Join(dir, "state"))
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	opts := RemoteOptions{
+		Host: "h", Paths: []string{logPath}, StartAt: "beginning", SSHBinary: bin,
+		ProbeInterval: 50 * time.Millisecond, ReconnectBackoff: 50 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ing.FollowRemote(ctx, opts) }()
+
+	if !waitFor(t, 5*time.Second, func() bool { return len(rs.counts()) >= 30 }) {
+		cancel()
+		<-done
+		t.Fatalf("first pass incomplete: %d line(s)", len(rs.counts()))
+	}
+	// Rotate: the old file is renamed away and a longer one takes its
+	// name, so every offset the checkpoint holds is meaningless and the
+	// new file is *not* shorter than the bytes already read.
+	if err := os.Rename(logPath, logPath+".1"); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	appendLines(t, logPath, 100, 160)
+
+	ok := waitFor(t, 10*time.Second, func() bool {
+		counts := rs.counts()
+		for i := int64(100); i < 160; i++ {
+			if counts[i] == 0 {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("FollowRemote did not return after its context was cancelled")
+	}
+	if !ok {
+		counts := rs.counts()
+		var missing []int64
+		for i := int64(100); i < 160; i++ {
+			if counts[i] == 0 {
+				missing = append(missing, i)
+			}
+		}
+		t.Fatalf("%d line(s) of the replacement file were skipped, starting at %d", len(missing), missing[0])
+	}
+}

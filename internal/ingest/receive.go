@@ -305,6 +305,7 @@ func (r *receiver) emit(ctx context.Context, ps *peerStream, results []extract.R
 	labels := ps.labels
 	ps.mu.Unlock()
 	host := labels["host"]
+	r.ing.cfg.Progress.AddSamples(int64(len(results)))
 	for n, res := range results {
 		_ = r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(host, pos, n))
 	}
@@ -437,7 +438,17 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 		text string
 	}
 	queue := make(chan datagram, r.opts.UDPQueue)
+	// Waited for before serveUDP returns. Without the join the consumer
+	// outlived its listener: Receive went on to flushAll and Sink.Flush,
+	// and runReceive's deferred sink.Close ran, while up to UDPQueue
+	// datagrams were still being turned into samples behind them. Those
+	// samples were reported as "still buffered at shutdown" and lost --
+	// and unlike the follow paths there is no checkpoint to re-read them
+	// from.
+	var drained sync.WaitGroup
+	drained.Add(1)
 	go func() {
+		defer drained.Done()
 		for d := range queue {
 			if err := r.handleRecord(ctx, d.peer, d.text); err != nil {
 				r.warnRecord("udp "+d.peer, err)
@@ -449,8 +460,11 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			// The queue is closed on every exit, not only the clean one,
-			// or the consumer goroutine outlives the listener.
+			// and the consumer is joined before returning: the caller
+			// flushes as soon as this returns, so anything still in the
+			// queue has to reach the sink first.
 			close(queue)
+			drained.Wait()
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -475,22 +489,52 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/v1/lines", func(w http.ResponseWriter, req *http.Request) {
 		peer := hostOf(req.RemoteAddr)
+		// Answered before the body is read, and with the status the
+		// samples endpoint already uses. A sender excluded by
+		// --allow-source used to get 200 with "accepted": 0 and no
+		// reason, which is indistinguishable from an empty post.
+		if !r.permitted(peer) {
+			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		n := 0
+		n, refused := 0, 0
+		var reason string
 		for _, line := range strings.Split(string(body), "\n") {
 			line = strings.TrimRight(line, "\r")
 			if line == "" {
 				continue
 			}
-			if err := r.handleRecord(req.Context(), peer, line); err == nil {
+			unusable, err := r.handleRecordOutcome(req.Context(), peer, line)
+			switch {
+			case err != nil:
+				refused++
+				if reason == "" {
+					reason = err.Error()
+				}
+			case unusable:
+				// The spec read nothing out of it: no pattern matched, or
+				// no timestamp, or no join rule claimed it.
+				refused++
+				if reason == "" {
+					reason = "the spec extracted nothing from the record"
+				}
+			default:
 				n++
 			}
 		}
-		writeJSONOK(w, map[string]int{"accepted": n})
+		// The denominator, not just the successes: a spec that matches
+		// none of these lines used to answer 200 with a count and no way
+		// to tell it apart from a body that was empty.
+		out := map[string]any{"accepted": n, "refused": refused}
+		if reason != "" {
+			out["reason"] = reason
+		}
+		writeJSONOK(w, out)
 	})
 	mux.HandleFunc("/ingest/v1/samples", func(w http.ResponseWriter, req *http.Request) {
 		var body struct {
@@ -539,6 +583,7 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			r.ing.cfg.Progress.AddSamples(1)
 		}
 		writeJSONOK(w, map[string]int{"accepted": len(body.Samples)})
 	})
@@ -570,15 +615,28 @@ func writeJSONOK(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// handleRecord delivers one received record, and reports the fault a
+// sender could act on.
 func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
+	_, err := r.handleRecordOutcome(ctx, peer, text)
+	return err
+}
+
+// handleRecordOutcome is handleRecord with the extraction verdict as well:
+// unusable is set when the spec could not read the record at all -- no
+// pattern, no timestamp, no join. That is not an error the TCP and UDP
+// paths warn about, because it is counted on the progress document
+// instead, but a request/response listener has a caller waiting for an
+// answer and owes it the denominator.
+func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (unusable bool, err error) {
 	if !r.permitted(peer) {
-		return fmt.Errorf("sender %s is not in allowed_sources", peer)
+		return false, fmt.Errorf("sender %s is not in allowed_sources", peer)
 	}
 	r.ing.cfg.Progress.AddBytes(int64(len(text) + 1))
 	if r.opts.Mode == "metrics" {
 		set, sample, err := ParseLineProtocol(text, time.Now())
 		if err != nil {
-			return err
+			return false, err
 		}
 		if sample.Labels == nil {
 			sample.Labels = map[string]string{}
@@ -595,11 +653,12 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 		// store for carrying no hint -- a listener that could never
 		// write to the very sets the scheme exists for.
 		sample.KeyHint = keyHint(peer, r.arrivalPos(), 0)
-		return r.ing.cfg.Sink.AddSample(ctx, set, sample)
+		r.ing.cfg.Progress.AddSamples(1)
+		return false, r.ing.cfg.Sink.AddSample(ctx, set, sample)
 	}
 	ps, labels, err := r.stream(ctx, peer)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// extract.Stream is single-threaded state; two connections from one
 	// address must not be inside Process at the same time.
@@ -610,12 +669,13 @@ func (r *receiver) handleRecord(ctx context.Context, peer, text string) error {
 	// A received record has no byte offset, so the hint is the listener's
 	// own arrival sequence: still one distinct value per occurrence.
 	pos := r.arrivalPos()
+	r.ing.cfg.Progress.AddSamples(int64(len(results)))
 	for n, res := range results {
 		if err := r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(peer, pos, n)); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return perr != nil, nil
 }
 
 // arrivalPos is the hint position for a record that has no byte offset of

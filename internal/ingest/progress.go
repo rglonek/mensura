@@ -85,13 +85,31 @@ func (p *Progress) NoProfile(path string) {
 	}
 }
 
-// MergeStream folds a finished stream's counters in, including the sample
-// of unmatched lines, which is the single most useful spec-debugging
-// output there is.
+// AddSamples counts extraction results handed to the sink.
+//
+// Every acquisition path calls it. The counter used to be fed only by
+// MergeStream, and MergeStream is called from one place -- the batch
+// importer -- so follow, SSH follow and receive reported "0 samples"
+// forever: on the console, in the progress document, and in the samples
+// field the _mensura_ingest set publishes for dashboards to plot.
+func (p *Progress) AddSamples(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	p.c.Samples += n
+	p.mu.Unlock()
+}
+
+// MergeStream folds a finished stream's sample of unmatched lines in,
+// which is the single most useful spec-debugging output there is.
+//
+// The stream's own sample count is deliberately not merged: AddSamples
+// counts results as they are handed to the sink, on every path, and adding
+// both would double every batch-imported sample.
 func (p *Progress) MergeStream(s *extract.Stats) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.c.Samples += s.Samples
 	for _, l := range s.FirstUnmatched {
 		if len(p.c.FirstUnmatched) >= 10 {
 			break

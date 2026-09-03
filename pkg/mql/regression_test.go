@@ -372,3 +372,33 @@ func TestBadNumberIsAPositionedError(t *testing.T) {
 		t.Fatalf("expected a position pointing into the query, got %d", pe.Pos)
 	}
 }
+
+// An empty node inside and/or is refused rather than folded away. The
+// store lowers it to a constant true, so it executed fine, but Print
+// emitted "( AND host = \"x\")" for it -- text the parser cannot read --
+// and the AST and its canonical text are documented to round-trip
+// losslessly.
+func TestEmptyPredicateArmIsRefused(t *testing.T) {
+	eq := Expr{Eq: &Compare{Label: "host", Value: "x"}}
+	for _, tc := range []struct {
+		name string
+		q    Query
+	}{
+		{"and", Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "v"}}, Where: Expr{And: []Expr{{}, eq}}}},
+		{"or", Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "v"}}, Where: Expr{Or: []Expr{eq, {}}}}},
+		{"not", Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "v"}}, Where: Expr{Not: &Expr{}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := tc.q
+			if _, err := Validate(&q, nil, 0, 0); err == nil {
+				t.Fatalf("an empty %s arm validated, and prints as %q", tc.name, Print(&q))
+			}
+		})
+	}
+	// A predicate that is absent altogether is still fine: that means
+	// "no predicate", not "an arm that sets nothing".
+	q := Query{Kind: KindQuery, From: "http", Select: []FieldExpr{{Field: "v"}}, Where: Expr{}}
+	if _, err := Validate(&q, nil, 0, 0); err != nil {
+		t.Fatalf("an absent predicate was refused: %v", err)
+	}
+}

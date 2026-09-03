@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
@@ -121,7 +123,7 @@ func (o *Options) pebbleOptions() *pebble.Options {
 		MemTableStopWritesThreshold: o.MemTableStopWritesThreshold,
 		L0CompactionThreshold:       4,
 		DisableWAL:                  !o.EnableWAL,
-		Logger:                      pebbleLogger{o.Logger},
+		Logger:                      &pebbleLogger{l: o.Logger},
 	}
 	po.Experimental.MaxWriterConcurrency = 2
 	maxCompactions := o.MaxConcurrentCompactions
@@ -191,8 +193,47 @@ func compressionFor(profile string, level int) pebble.Compression {
 	return pebble.SnappyCompression
 }
 
-type pebbleLogger struct{ l *log.Logger }
+// fatalFlushTimeout bounds the last-chance flush below. Pebble may be
+// holding its own locks when it calls Fatalf, so a flush that cannot
+// complete must not stop the process from dying.
+const fatalFlushTimeout = 5 * time.Second
 
-func (p pebbleLogger) Infof(format string, args ...any)  { p.l.Printf(format, args...) }
-func (p pebbleLogger) Errorf(format string, args ...any) { p.l.Printf("ERROR "+format, args...) }
-func (p pebbleLogger) Fatalf(format string, args ...any) { p.l.Fatalf(format, args...) }
+type pebbleLogger struct {
+	l *log.Logger
+	// onFatal is installed by Open once the DB exists. It is read from
+	// whichever goroutine pebble reports the fault on, so it is atomic.
+	onFatal atomic.Pointer[func() error]
+}
+
+// setFatalHook records what to run before the process is torn down.
+func (p *pebbleLogger) setFatalHook(f func() error) { p.onFatal.Store(&f) }
+
+func (p *pebbleLogger) Infof(format string, args ...any)  { p.l.Printf(format, args...) }
+func (p *pebbleLogger) Errorf(format string, args ...any) { p.l.Printf("ERROR "+format, args...) }
+
+// Fatalf exits, as pebble requires, but flushes on the way out.
+//
+// It used to forward to log.Fatalf, so the process left through os.Exit
+// with every deferred Close skipped -- and Close is what performs the
+// explicit Flush that makes "a graceful stop is durable in every profile"
+// true. Under durability: batch there is no WAL behind it, so everything
+// still in a memtable was discarded on the one path where the process is
+// already dying because something went wrong.
+func (p *pebbleLogger) Fatalf(format string, args ...any) {
+	p.l.Printf("FATAL "+format, args...)
+	if h := p.onFatal.Load(); h != nil {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := (*h)(); err != nil {
+				p.l.Printf("ERROR flushing after a fatal engine error: %v", err)
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(fatalFlushTimeout):
+			p.l.Printf("ERROR flush after a fatal engine error did not finish within %s; exiting anyway", fatalFlushTimeout)
+		}
+	}
+	os.Exit(1)
+}

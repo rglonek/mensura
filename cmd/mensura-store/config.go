@@ -39,12 +39,16 @@ type fileConfig struct {
 	} `yaml:"auth"`
 
 	Limits struct {
-		MaxRequestBytes       int64 `yaml:"max_request_bytes"`
-		MaxConcurrentWrites   int   `yaml:"max_concurrent_writes"`
-		MaxConcurrentJobs     int   `yaml:"max_concurrent_jobs"`
-		MaxSeriesPerGraph     int   `yaml:"max_series_per_graph"`
-		MaxDatapointsReceived int   `yaml:"max_datapoints_received"`
-		MaxLabelCardinality   int   `yaml:"max_label_cardinality"`
+		MaxRequestBytes int64 `yaml:"max_request_bytes"`
+		// MaxBufferedRequestBytes caps the request bodies the API holds
+		// in memory at once, across every connection. Defaults to four
+		// times max_request_bytes.
+		MaxBufferedRequestBytes int64 `yaml:"max_buffered_request_bytes"`
+		MaxConcurrentWrites     int   `yaml:"max_concurrent_writes"`
+		MaxConcurrentJobs       int   `yaml:"max_concurrent_jobs"`
+		MaxSeriesPerGraph       int   `yaml:"max_series_per_graph"`
+		MaxDatapointsReceived   int   `yaml:"max_datapoints_received"`
+		MaxLabelCardinality     int   `yaml:"max_label_cardinality"`
 
 		// Accepted by the decoder only so they can be refused by name.
 		// Neither is implemented, and KnownFields(true) reported them as
@@ -242,10 +246,11 @@ func expandDays(s string) string {
 
 func (c *fileConfig) toAPIConfig(mode string) store.APIConfig {
 	api := store.APIConfig{
-		AuthMode:            c.Auth.Mode,
-		MaxRequestBytes:     c.Limits.MaxRequestBytes,
-		MaxConcurrentWrites: c.Limits.MaxConcurrentWrites,
-		Mode:                mode,
+		AuthMode:                c.Auth.Mode,
+		MaxRequestBytes:         c.Limits.MaxRequestBytes,
+		MaxBufferedRequestBytes: c.Limits.MaxBufferedRequestBytes,
+		MaxConcurrentWrites:     c.Limits.MaxConcurrentWrites,
+		Mode:                    mode,
 	}
 	for _, cl := range c.Auth.Clients {
 		scopes := make([]store.Scope, 0, len(cl.Scopes))

@@ -451,6 +451,7 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		f.ing.cfg.Progress.AddBytes(int64(rec.Consumed))
 		results, perr := t.ex.Process(string(rec.Line))
 		f.ing.recordOutcome(perr)
+		f.ing.cfg.Progress.AddSamples(int64(len(results)))
 		for n, res := range results {
 			if aerr := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); aerr != nil {
 				// The read offset stays *before* this record. It used to
@@ -584,6 +585,7 @@ func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 	}
 	t.flushSeq++
 	pos := flushPos(t.flushSeq)
+	f.ing.cfg.Progress.AddSamples(int64(len(results)))
 	for n, r := range results {
 		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
 	}
@@ -704,6 +706,7 @@ func (f *follower) flushIdle(ctx context.Context) {
 		}
 		t.flushSeq++
 		pos := flushPos(t.flushSeq)
+		f.ing.cfg.Progress.AddSamples(int64(len(results)))
 		for n, r := range results {
 			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
 		}

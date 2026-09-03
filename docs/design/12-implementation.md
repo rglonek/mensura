@@ -965,6 +965,169 @@ Relatedly, `printFloat` emitted `'f'` unconditionally, so a `CLAMP` bound
 near `MaxFloat64` printed as a 310-digit literal. Past 24 characters it
 uses the exponent form, and the number lexer reads an exponent back.
 
+### 6.44 A drop and a write to the same set cannot interleave
+
+`DropSet` took the set out of the maps, released the lock and only then
+applied the batch that ends with `Delete(metaKey("set", name))`. A
+`PutBatch` for the same name landing in that window re-created the set
+under a fresh id — so its rows went outside the range deletes and
+survived — persisted its meta record, and then had that record deleted by
+name. After the next restart the shard was absent from `Sets()`: invisible
+to every query, to the catalogue, to `shardsFor` and to the retention
+sweep, while its rows still occupied disk with no way to reclaim them,
+because dropping needs the name to be in `d.sets`. Reachable from the
+hourly sweep and from `DELETE /v1/admin/sets/`, either of which can
+coincide with a backfilled write.
+
+The mirror case is a write that resolved its set id before the drop and
+applied its rows after the range deletes went in. Neither half of a write
+happens under `mu` end to end, so the exclusion is a second lock:
+`dropMu`, held shared by `PutBatch` and `RegisterSet` for their whole
+duration and exclusively by `DropSet`.
+
+### 6.45 Set metadata moves the catalogue version
+
+`SetRetentionFor` calls `entryLocked`, which *creates* the catalogue
+entry, and nothing bumped `catVer` — so a write carrying only `SetMeta`
+added a set to `/v1/catalogue` while the version stood still, and
+`handleCatalogue` answered `304` to every client still holding the old
+ETag. A datasource that caches it never saw the set. Only a real change
+moves the version, which is the rule `applyFieldMeta` already follows: an
+ingester that re-declares the same retention on every start must not wake
+every client watching `catalogue_version`.
+
+### 6.46 Every acquisition path counts its samples
+
+`Progress.Samples` was written by `MergeStream` alone, and `MergeStream`
+is called from one place: `processFile`. Follow, SSH follow and receive
+never called it, so they reported `0 samples` forever — on the console,
+in the progress document, and in the `samples` field the `_mensura_ingest`
+set publishes for dashboards ([02](02-ingest.md) §5). Results are counted
+where they are handed to the sink now, on every path; `MergeStream` keeps
+only the sample of unmatched lines, and `processFile` defers it so a read
+error part-way through a file no longer discards that file's
+`FirstUnmatched` — the one output that explains why the import failed.
+
+### 6.47 The UDP consumer is joined before the final flush
+
+`serveUDP` closed its queue and returned, and nothing waited for the
+goroutine draining it. `Receive` went on to `flushAll` and `Sink.Flush`,
+and `runReceive`'s deferred `sink.Close` ran, while up to `UDPQueue` (4096)
+datagrams were still becoming samples behind them: reported as "still
+buffered at shutdown" and lost, with no checkpoint to re-read them from.
+The consumer is a `WaitGroup` of one, joined before the listener returns.
+
+### 6.48 A listener that cannot bind fails startup
+
+`start()` ran `ListenAndServe` inside the serving goroutine and logged
+whatever came back. An address already in use — the exact two-owners
+mistake this binary's package doc is about — still printed `api listener
+on …` and `mensura-store … listening on …`, and the process then sat on
+`<-ctx.Done()` serving nothing. Every address is bound before any of them
+is served, whatever did bind is closed again, and the error names the
+listener that failed.
+
+### 6.49 Request bodies are bounded in aggregate
+
+A body is read before a write slot is taken, deliberately: holding a slot
+across the read would let `MaxConcurrentWrites` slow clients occupy the
+pool without ever presenting a batch. The consequence was that peak
+write-path memory was concurrent connections × `max_request_bytes`
+(32 MiB), with nothing capping the connections. `max_buffered_request_bytes`
+(default 4× `max_request_bytes`) is the ceiling on what every handler
+holds at once; past it a body is shed with `503` and `Retry-After`, which
+is the same honest signal the write pool gives.
+
+### 6.50 The wire catalogue carries the stale flag
+
+`Schema.Field` computed `Stale` from `LastSeenMs`; `Store.Catalogue()`,
+which is the form that travels over the wire, did not. So the same query
+against the same data answered `W203 field … has not been seen recently`
+under `mode: plugin` and nothing at all under `mode: proxy`, because a
+proxy validates against the catalogue it fetched.
+
+### 6.51 `check` selects on the operator labels
+
+`checkSample` passed `nil` labels to `SelectProfile` while
+`processFile` passes `i.cfg.Labels`, and `check` registered no `--label`
+flag — so a profile chosen by `select.label_equals` could never match and
+the tool whose job is to predict the import answered `no profile matched`.
+Same flag, same validation as the acquisition modes.
+
+### 6.52 Aggregation windows expire from a heap
+
+`process()` calls `closeExpiredAggregators` on every matching record, and
+that walked the whole `aggs` map. With a high-cardinality `aggregate.on`
+key the map holds an entry per key per window, so the per-record cost grew
+with cardinality, on the hot path, per stream. The windows sit in a
+min-heap ordered by end time (then by key, so windows ending together
+close in a stable order), and expiry touches only what has expired.
+
+### 6.53 Remote follow sees a rotation it grew past
+
+The size probe detects a file *shorter* than the bytes already read. That
+is a truncate; a rename-and-create rotation is not. `tail -F` follows the
+replacement while `consumed` keeps climbing from the file it left, and by
+the next probe — 15 s later by default — the new file has usually grown
+past the acknowledged offset, so the length test finds nothing wrong and
+the reconnect resumes at a byte position that means nothing in it. That is
+a silent skip, not a replay. The probe reads `ls -Li` alongside `wc -c`
+(both POSIX, still no remote install) and the identity is kept in the
+checkpoint's `fingerprint`, so a rotation is seen both mid-connection and
+across a restart. A far end whose `ls` cannot answer falls back to the
+length test alone.
+
+### 6.54 A backlog is drained within one flush
+
+A take bounded by `BatchBytes` reports `partial`, and a partial take
+deliberately tells the observers nothing: their high-water mark covers
+samples this batch does not carry. That rule is right per request, but it
+meant no checkpoint advanced for the *whole duration* of a backlog, so a
+crash while recovering from a store outage replayed all of it. `Flush`
+sends rounds until the buffer is empty and announces only the take that
+empties it — the acknowledgement still covers exactly what the store
+holds, but it happens when the backlog drains rather than when a later
+flush happens to find the buffer small. A cap of 64 rounds keeps one call
+from running forever against a source that outruns the store, and says so
+when it stops.
+
+### 6.55 Smaller corrections
+
+- A series whose only sample is consumed by `DELTA` or `RATE` renders as
+  nothing. `lastPointTime` is set before those stages drop the sample, so
+  the trailing-gap rule fired on a series that had emitted no value: a
+  connect-break drawn just after a moment when data did arrive, whose real
+  cause is that a rate needs two samples.
+- A row with no indexed column is refused rather than stored under `D/`.
+  Every scan of an indexed set is bounded to the index prefix, so such a
+  row was write-only. `Get` still reads the ones an earlier build wrote.
+- An empty node inside `and`/`or`/`not` is `E001`. It executed fine — the
+  store lowers it to a constant true — but printed as `( AND host = "x")`,
+  which does not parse, and the AST and its canonical text round-trip
+  losslessly by contract. An absent predicate still means "no predicate".
+- A hole in a legacy packed label dictionary is not indexed as the empty
+  string, so `label = ""` lowers to the constant-false plus `W201` an
+  unknown value gets rather than to an equality against a free position.
+- `pebbleLogger.Fatalf` flushes before it exits. It forwarded to
+  `log.Fatalf`, so `os.Exit` skipped every deferred `Close` — and `Close`
+  is what performs the explicit `Flush` that makes "a graceful stop is
+  durable in every profile" true. Under `durability: batch` there is no
+  WAL behind it. The flush is time-bounded, because pebble may be holding
+  its own locks on the way out.
+- `POST /ingest/v1/lines` answers `403` to a sender outside
+  `allowed_sources` and reports `refused` alongside `accepted`. It used to
+  answer `200 {"accepted": 0}`, which is indistinguishable from an empty
+  body.
+- `FollowOptions.IdleFlush`/`MaxRecordBytes` and
+  `ReceiveOptions.MaxConnections`/`PeerIdle` are reachable:
+  `--idle-flush`, `--max-record-bytes` (shared by every path),
+  `--max-connections`, `--peer-idle`. A real knob an operator cannot reach
+  is the mirror image of the config keys this codebase refuses by name.
+- `Value.UnmarshalJSON` decodes strictly. A custom unmarshaller replaces
+  the outer decoder's settings, so `handleWrite`'s `DisallowUnknownFields`
+  stopped at the edge of a field value and `{"i":1,"flaot":2}` was
+  accepted with the typo dropped.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

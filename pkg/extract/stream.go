@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"container/heap"
 	"fmt"
 	"sort"
 	"strconv"
@@ -54,6 +55,12 @@ type Stream struct {
 
 	multiline map[string]*mlBuffer
 	aggs      map[string]*aggregator
+	// aggQ orders the open windows by the time they end, so expiry costs
+	// only the windows that have expired. It used to be a scan of the
+	// whole map on every matching record, and with a high-cardinality
+	// aggregate.on key that map holds an entry per key per window: the
+	// per-record cost grew with cardinality, on the hot path, per stream.
+	aggQ aggQueue
 
 	Stats Stats
 
@@ -223,12 +230,34 @@ func (st *Stream) Flush() []Result {
 	// Only these are counted here. process() already counted everything
 	// it returned, so adding len(out) on top double-counted every
 	// flushed multiline record.
-	for k, a := range st.aggs {
+	for _, k := range st.aggKeysInEndOrder() {
+		a := st.aggs[k]
 		delete(st.aggs, k)
 		out = append(out, a.emit())
 		st.Stats.Samples++
 	}
+	st.aggQ = nil
 	return out
+}
+
+// aggKeysInEndOrder lists the open windows oldest end first, which is the
+// order closeExpiredAggregators would have released them in. Ranging the
+// map instead made a flush emit in whatever order Go felt like.
+func (st *Stream) aggKeysInEndOrder() []string {
+	keys := make([]string, 0, len(st.aggs))
+	for _, e := range st.aggQ {
+		if a, ok := st.aggs[e.key]; ok && a == e.a {
+			keys = append(keys, e.key)
+		}
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		ai, aj := st.aggs[keys[i]], st.aggs[keys[j]]
+		if ai.end.Equal(aj.end) {
+			return keys[i] < keys[j]
+		}
+		return ai.end.Before(aj.end)
+	})
+	return keys
 }
 
 // FlushIdle emits anything that has been waiting longer than the profile's
@@ -416,6 +445,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			set: set, line: line, field: ag.Field, mode: ag.Mode,
 		}
 		st.aggs[key] = a
+		heap.Push(&st.aggQ, aggEntry{key: key, end: a.end, a: a})
 		switch ag.Mode {
 		case "increment":
 			// One occurrence, counted. Seeding with the captured value
@@ -443,23 +473,64 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	return nil
 }
 
+// closeExpiredAggregators emits and removes every window that has ended by
+// now, oldest end first.
+//
+// The queue is what keeps this proportional to the number of expired
+// windows rather than to the number of open ones: it is called on every
+// matching record, and walking the whole map there made the per-record
+// cost grow with the aggregation key's cardinality.
 func (st *Stream) closeExpiredAggregators(now time.Time) []Result {
 	if now.IsZero() {
 		return nil
 	}
 	var out []Result
-	var expired []string
-	for k, a := range st.aggs {
-		if !now.Before(a.end) {
-			expired = append(expired, k)
+	for len(st.aggQ) > 0 {
+		e := st.aggQ[0]
+		if now.Before(e.end) {
+			break
 		}
-	}
-	sort.Strings(expired)
-	for _, k := range expired {
-		out = append(out, st.aggs[k].emit())
-		delete(st.aggs, k)
+		heap.Pop(&st.aggQ)
+		// The map and the queue are updated together, so an entry whose
+		// window is gone can only be one a future change forgot to
+		// remove from both. Skipping it beats emitting it twice.
+		a, ok := st.aggs[e.key]
+		if !ok || a != e.a {
+			continue
+		}
+		out = append(out, a.emit())
+		delete(st.aggs, e.key)
 	}
 	return out
+}
+
+// aggEntry is one open window in the expiry queue. end is copied from the
+// aggregator, which never moves it after the window opens.
+type aggEntry struct {
+	key string
+	end time.Time
+	a   *aggregator
+}
+
+// aggQueue is a min-heap of open windows ordered by end time, then by key
+// so that windows ending together close in a stable order.
+type aggQueue []aggEntry
+
+func (q aggQueue) Len() int { return len(q) }
+func (q aggQueue) Less(i, j int) bool {
+	if q[i].end.Equal(q[j].end) {
+		return q[i].key < q[j].key
+	}
+	return q[i].end.Before(q[j].end)
+}
+func (q aggQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
+func (q *aggQueue) Push(x any)   { *q = append(*q, x.(aggEntry)) }
+func (q *aggQueue) Pop() any {
+	old := *q
+	n := len(old)
+	e := old[n-1]
+	*q = old[:n-1]
+	return e
 }
 
 func (a *aggregator) emit() Result {

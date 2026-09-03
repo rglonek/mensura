@@ -43,6 +43,7 @@ auth:
 
 limits:
   max_request_bytes: 33554432
+  max_buffered_request_bytes: 0   # 0 = 4x max_request_bytes; total body bytes held at once
   max_concurrent_writes: 8        # write slots; past them the store sheds with 503
   max_concurrent_jobs: 8          # concurrent queries
   max_series_per_graph: 1000

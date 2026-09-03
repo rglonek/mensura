@@ -399,15 +399,50 @@ func (s *Sink) DeclareSets(spec *extract.Spec) {
 	}
 }
 
+// maxFlushRounds bounds how many requests one Flush may send while
+// draining a backlog. At the default BatchBytes that is a quarter of a
+// gigabyte in one call; past it the flush returns and the next one
+// continues, so a source producing faster than the store accepts cannot
+// keep a single Flush running forever.
+const maxFlushRounds = 64
+
 // Flush ships everything buffered.
 //
 // Delivery is serialised: the buffer swap and the write happen under one
 // lock, so two concurrent flushes cannot deliver out of order and let a
 // later batch acknowledge bytes an earlier one has not written yet.
+//
+// A buffer larger than BatchBytes goes out as several requests within one
+// call. Only the take that empties the buffer is announced to the delivery
+// observers, so the acknowledgement still covers exactly the bytes the
+// store now holds -- but the announcement happens as soon as the backlog
+// has drained, rather than waiting for a later flush to find the buffer
+// small enough to take in one piece. While it did wait, no checkpoint
+// moved for the whole length of the backlog, so a crash during recovery
+// from a store outage replayed all of it.
 func (s *Sink) Flush(ctx context.Context) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	obs := s.snapshotObservers()
+	for round := 1; ; round++ {
+		partial, err := s.flushRound(ctx, obs)
+		if err != nil || !partial {
+			return err
+		}
+		if round >= maxFlushRounds {
+			// Said out loud: the buffer is still short of empty, so no
+			// checkpoint has advanced, and a cap nobody can see reads
+			// like a flush that finished.
+			s.log.Printf("WARNING stopped flushing after %d requests with %d sample(s) still buffered; checkpoints resume once the backlog drains",
+				round, s.buffered())
+			return nil
+		}
+	}
+}
+
+// flushRound sends at most one request, and reports whether it left
+// samples behind.
+func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, error) {
 	if s.holding() {
 		// Delivery is known to be failing for a reason a retry cannot
 		// fix. The buffer keeps what it has; nothing is dropped and no
@@ -415,7 +450,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		// unless the wait has taken the buffer past its cap, which is the
 		// one thing holding cannot survive.
 		s.enforceBufferCap(obs)
-		return nil
+		return false, nil
 	}
 	s.mu.Lock()
 	if s.pending == 0 {
@@ -423,7 +458,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		// Metadata still has to reach the store even when no samples are
 		// waiting, or a spec's declarations would sit in the queue until
 		// the first sample happens to arrive.
-		return s.flushMetaOnly(ctx)
+		return false, s.flushMetaOnly(ctx)
 	}
 	batches, count, partial := s.takeLocked()
 	if !partial {
@@ -435,8 +470,8 @@ func (s *Sink) Flush(ctx context.Context) error {
 		// high-water mark covers every byte handed to the sink, and some
 		// of those samples are still in the buffer, so announcing this
 		// batch would let a commit acknowledge bytes it does not carry.
-		// The checkpoint simply waits for a flush that empties the
-		// buffer.
+		// The checkpoint waits for the take that empties the buffer,
+		// which the caller keeps sending rounds until it reaches.
 		s.beginFlush(obs)
 	}
 	s.mu.Unlock()
@@ -466,9 +501,12 @@ func (s *Sink) Flush(ctx context.Context) error {
 			s.reportLost(obs, partial)
 			s.discardMeta(meta, sets, fatal)
 			if s.cfg.MaxFatalDrops > 0 && drops >= int64(s.cfg.MaxFatalDrops) {
-				return err
+				return false, err
 			}
-			return nil
+			// No further rounds: the loss has been announced, so the
+			// observers are frozen until a later flush thaws them, and
+			// there is nothing a second request in this call can add.
+			return false, nil
 		}
 		// A cancelled context is not a delivery failure: the caller is
 		// shutting down and will flush again on a live context, so the
@@ -479,7 +517,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.requeueBatches(batches, count)
 			s.requeueMeta(meta, sets)
-			return err
+			return false, err
 		}
 		// Nor is a rejected credential. The batch is well formed and the
 		// store is reachable; an operator has to fix a token. Dropping
@@ -492,7 +530,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 			s.requeueMeta(meta, sets)
 			s.holdDelivery(deliveryHold)
 			s.log.Printf("ERROR %v; holding %d buffered sample(s) and retrying in %s", authErr, count, deliveryHold)
-			return err
+			return false, err
 		}
 		// Running out of retries is back-pressure, not a verdict on the
 		// batch. A store that sheds load answers 503 with Retry-After --
@@ -511,7 +549,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 			s.Stats.Retried++
 			s.Stats.mu.Unlock()
 			s.log.Printf("WARNING %v; holding %d buffered sample(s) and retrying in %s", err, count, hold)
-			return err
+			return false, err
 		}
 		// The buffer is full: the store has been refusing writes for long
 		// enough that holding more would cost the whole process. Only now
@@ -525,7 +563,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		s.reportLost(obs, partial)
 		s.requeueMeta(meta, sets)
 		s.holdDelivery(s.retryHoldFor(err))
-		return err
+		return false, err
 	}
 	s.holdMu.Lock()
 	s.holdUntil = time.Time{}
@@ -551,7 +589,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 	if !partial {
 		s.endFlush(obs, resp.Accepted, false)
 	}
-	return nil
+	return partial, nil
 }
 
 // takeLocked moves buffered samples into batches, bounded by BatchBytes,
