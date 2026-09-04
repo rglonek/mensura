@@ -1336,3 +1336,160 @@ func TestRequestBodiesAreBoundedInAggregate(t *testing.T) {
 		t.Fatalf("the budget leaked: %d bytes still reserved after every request finished", got)
 	}
 }
+
+// With auth off the store cannot tell its callers apart, and answering
+// "anonymous" for all of them then *overwrote* whatever client label the
+// ingester sent. Every ingester on a loopback store -- the documented
+// posture, and what the quick start runs -- reported under one name, so
+// --client-name did nothing and two ingesters drew as one series whose
+// counters interleave.
+func TestIngestClientLabelSurvivesWithAuthDisabled(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{}) // auth.mode unset, i.e. none
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	post := func(client string) {
+		t.Helper()
+		body, err := json.Marshal(wire.WriteRequest{Batches: []model.Batch{{
+			Set: model.IngestSet,
+			Samples: []model.Sample{{
+				TSMs:   base(),
+				Labels: map[string]string{"client": client},
+				Fields: map[string]model.Value{"records": model.Int(1)},
+			}},
+		}}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		resp, err := http.Post(srv.URL+"/v1/write", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("write returned %d", resp.StatusCode)
+		}
+	}
+	post("web1")
+	post("web2")
+
+	got := map[string]bool{}
+	for _, v := range s.LabelValues("client") {
+		got[v] = true
+	}
+	for _, want := range []string{"web1", "web2"} {
+		if !got[want] {
+			t.Fatalf("client %q was not recorded; the store stamped its own name over it (saw %v)", want, s.LabelValues("client"))
+		}
+	}
+	if got["anonymous"] {
+		t.Fatal("the store stamped \"anonymous\" onto the ingest set even though nothing authenticated the caller")
+	}
+}
+
+// With bearer auth the store really does know who is writing, so the
+// authenticated name is the authority and still wins.
+func TestIngestClientLabelIsStampedWhenAuthenticated(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{
+		AuthMode: "bearer",
+		Clients:  []ClientAuth{{Name: "collector", Hash: HashSecret("s3cret"), Scopes: []Scope{ScopeWrite}}},
+	})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	body, err := json.Marshal(wire.WriteRequest{Batches: []model.Batch{{
+		Set: model.IngestSet,
+		Samples: []model.Sample{{
+			TSMs:   base(),
+			Labels: map[string]string{"client": "spoofed"},
+			Fields: map[string]model.Value{"records": model.Int(1)},
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/write", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write returned %d", resp.StatusCode)
+	}
+	for _, v := range s.LabelValues("client") {
+		if v == "spoofed" {
+			t.Fatal("a client's own claim outranked the credential the store verified")
+		}
+	}
+}
+
+// Retention persists the catalogue as soon as it forgets a set, the way
+// the admin drop does. Waiting for the 30-second tick meant a crash in
+// that window brought the entry back, advertising fields and a time range
+// whose shards had just been range-deleted.
+func TestRetentionPersistsTheForgottenSet(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	cfg.Retention = time.Hour
+	cfg.Shard = time.Hour
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	old := time.Now().Add(-72 * time.Hour).UnixMilli()
+	writeSamples(t, s, "app", []model.Sample{{
+		TSMs:   old,
+		Labels: map[string]string{"host": "a"},
+		Fields: map[string]model.Value{"v": model.Int(1)},
+	}})
+	// The periodic save the HTTP layer runs on a timer has fired, so the
+	// entry is on disk. That is the state retention has to clean up
+	// rather than leave for the next tick.
+	if err := s.SaveCatalogue(); err != nil {
+		t.Fatalf("save catalogue: %v", err)
+	}
+	if n, err := s.RunRetention(time.Now()); err != nil || n == 0 {
+		t.Fatalf("retention dropped %d shard(s): %v", n, err)
+	}
+	if len(s.Sets()) != 0 {
+		t.Fatalf("catalogue still holds %v after every shard aged out", s.Sets())
+	}
+	// Reopened without a clean Close, which is what a crash looks like.
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+	again, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer again.Close()
+	if sets := again.Sets(); len(sets) != 0 {
+		t.Fatalf("set %v came back after a crash; retention forgot it in memory only", sets)
+	}
+}
+
+// The legend renders every BY slot, including one the row did not carry.
+// Dropping those collapsed two distinct series onto one name, so the panel
+// drew two lines that could not be told apart.
+func TestSeriesNameKeepsAbsentLabelSlotsDistinct(t *testing.T) {
+	by := []string{"host", "pool"}
+	a := seriesName(map[string]string{"host": "a"}, by, "")
+	b := seriesName(map[string]string{"pool": "a"}, by, "")
+	if a == b {
+		t.Fatalf("two different series both render as %q", a)
+	}
+	// The ordinary case is untouched.
+	if got := seriesName(map[string]string{"host": "a", "pool": "b"}, by, "req/s"); got != "a : b : req/s" {
+		t.Fatalf("legend is %q, want %q", got, "a : b : req/s")
+	}
+}

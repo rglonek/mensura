@@ -291,6 +291,7 @@ func (d *DB) RegisterSet(name string, cols []ColumnSpec) error {
 
 func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 	sm, ok := d.sets[name]
+	created := !ok
 	if !ok {
 		sm = &setMeta{ID: d.nextID, Name: name, Columns: map[string]ColumnSpec{}}
 		d.nextID++
@@ -309,12 +310,32 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 			continue
 		}
 		if !had {
-			sm.Columns[c.Name] = c
-			changed = true
 			if c.Indexed && sm.Indexed == "" {
+				// A set that already holds rows may not gain its first
+				// indexed column. Every scan of an indexed set is bounded
+				// to the I/ prefix, so the rows already written under D/
+				// would become unreachable the moment the promotion
+				// landed: unqueryable, and invisible to the retention
+				// sweep, which is the same silent orphaning PutBatch
+				// refuses a timestamp-less row to avoid.
+				//
+				// A set created in this very call, or one registered and
+				// never filled, has nothing to orphan, so the common
+				// "declare then write" shape is untouched.
+				if !created {
+					has, err := d.hasDataRows(sm.ID)
+					if err != nil {
+						return nil, err
+					}
+					if has {
+						return nil, fmt.Errorf("engine: set %q already holds unindexed rows, so it cannot gain the indexed column %q; those rows would no longer be reachable by any scan", name, c.Name)
+					}
+				}
 				sm.Indexed = c.Name
 				sm.IndexCol = indexedColumnID
 			}
+			sm.Columns[c.Name] = c
+			changed = true
 			continue
 		}
 		// A widening type change is recorded; a narrowing one is ignored so
@@ -331,6 +352,23 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 		}
 	}
 	return sm, nil
+}
+
+// hasDataRows reports whether anything is stored under a set's D/
+// prefix. It is one seek, and it is asked only where a set is about to
+// gain its first indexed column -- at most once in a set's lifetime.
+func (d *DB) hasDataRows(setID uint32) (bool, error) {
+	p := dataPrefix(setID)
+	it, err := d.pdb.NewIter(&pebble.IterOptions{LowerBound: p, UpperBound: prefixEnd(p)})
+	if err != nil {
+		return false, err
+	}
+	found := it.First()
+	err = it.Error()
+	if cerr := it.Close(); err == nil {
+		err = cerr
+	}
+	return found, err
 }
 
 // Sets lists every registered set name, sorted.
@@ -390,14 +428,24 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 	// it serialised every writer in the process behind it, and every
 	// query's setRef along with them.
 	cols := make([]ColumnSpec, 0, 8)
-	seen := map[string]struct{}{}
+	at := map[string]int{}
 	for i := range recs {
 		for name, v := range recs[i].Row {
-			if _, ok := seen[name]; ok {
+			j, ok := at[name]
+			if !ok {
+				at[name] = len(cols)
+				cols = append(cols, ColumnSpec{Name: name, Type: v.T, Indexed: name == model.TimestampField})
 				continue
 			}
-			seen[name] = struct{}{}
-			cols = append(cols, ColumnSpec{Name: name, Type: v.T, Indexed: name == model.TimestampField})
+			// The widest type in the batch wins, not whichever row
+			// happened to be walked first. A column arriving as an int in
+			// one row and a float in the next was registered as int64, so
+			// the schema disagreed with the payloads already written under
+			// it -- and setLocked's own int-to-float widening never fired,
+			// because it only ever saw the one narrow spec.
+			if cols[j].Type == model.TypeInt && v.T == model.TypeFloat {
+				cols[j].Type = model.TypeFloat
+			}
 		}
 	}
 	d.mu.Lock()

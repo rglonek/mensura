@@ -842,12 +842,22 @@ func writeKeyPart(b *strings.Builder, s string) {
 
 // seriesName is the legend: the BY values in declared order, then the
 // field's display name.
+//
+// Every BY slot is rendered, including one whose label the row did not
+// carry. Dropping those collapsed the legend onto fewer slots than the
+// grouping key has, so {host: "a", pool: ""} and {host: "", pool: "a"}
+// are two series by seriesKey and drew as two lines both labelled "a" --
+// indistinguishable in the panel, and in Grafana's own legend picker. An
+// absent slot renders as "<label>=", which names the label that is
+// missing and keeps the remaining values in their declared positions.
 func seriesName(labels map[string]string, by []string, field string) string {
 	parts := make([]string, 0, len(by)+1)
 	for _, l := range by {
 		if v := labels[l]; v != "" {
 			parts = append(parts, v)
+			continue
 		}
+		parts = append(parts, l+"=")
 	}
 	if field != "" {
 		parts = append(parts, field)

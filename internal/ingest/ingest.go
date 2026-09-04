@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,13 @@ func New(cfg Config) (*Ingest, error) {
 	}
 	if cfg.Progress == nil {
 		cfg.Progress = NewProgress()
+	}
+	// Defaulted like every other optional field. It was the one that was
+	// not, and the acquisition paths call cfg.Log.Printf unconditionally,
+	// so a caller that filled in everything else got a nil-interface panic
+	// on the first skipped file rather than a missing log line.
+	if cfg.Log == nil {
+		cfg.Log = log.New(os.Stderr, "mensura-ingest ", log.LstdFlags)
 	}
 	if cfg.ClientName == "" {
 		if h, err := os.Hostname(); err == nil {
@@ -441,7 +449,13 @@ func peek(path string, n int) ([]byte, time.Time, error) {
 	case strings.HasSuffix(strings.ToLower(path), ".gz"):
 		zr, err := gzip.NewReader(f)
 		if err != nil {
-			return nil, info.ModTime(), nil
+			// Reported, not swallowed. Answering "no head, no error" sent
+			// the caller on to select a profile and discover identity
+			// against an empty head -- decisions made on nothing -- before
+			// openRecords failed on the same file for the same reason a
+			// moment later. The failure is the same either way; saying so
+			// here is what keeps those decisions from being made at all.
+			return nil, info.ModTime(), fmt.Errorf("ingest: %s: %w", path, err)
 		}
 		defer zr.Close()
 		r = zr

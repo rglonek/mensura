@@ -225,6 +225,10 @@ type BucketSet struct {
 	edges []float64
 }
 
+// defaultScanLines is how many lines of a file head an identity rule
+// reads when it does not say.
+const defaultScanLines = 500
+
 // maxPow2Buckets bounds a pow2 bucket set. Beyond this the doubling edge
 // exceeds what a float64 can represent exactly, so the labels would stop
 // meaning anything.
@@ -338,8 +342,17 @@ func (s *Spec) Compile() error {
 				return fmt.Errorf("extract: identity regex: %w", err)
 			}
 		}
+		// Zero means "unset, use the default"; a negative value is a
+		// typo, and it used to survive compilation and then panic in
+		// DiscoverIdentity -- SplitN with a non-positive n returns
+		// nothing to slice, and the reslice below it ran with a negative
+		// bound. That panic takes the whole ingester down, on the batch
+		// worker goroutines and on the follow poll goroutine alike.
+		if r.ScanLines < 0 {
+			return fmt.Errorf("extract: identity scan_lines %d must not be negative", r.ScanLines)
+		}
 		if r.ScanLines == 0 {
-			r.ScanLines = 500
+			r.ScanLines = defaultScanLines
 		}
 	}
 	// The `sets:` block is compiled here so a bad duration or key scheme
@@ -867,9 +880,17 @@ func (s *Spec) DiscoverIdentity(path string, head []byte) map[string]string {
 			collectNamed(r.matchPath, m, out)
 		}
 		if r.regex != nil {
-			lines := strings.SplitN(string(head), "\n", r.ScanLines+1)
-			if len(lines) > r.ScanLines {
-				lines = lines[:r.ScanLines]
+			// Compile refuses a negative scan_lines and defaults a zero
+			// one, but the bound is resolved here too: this is a slice
+			// bound, and it is reached by any caller that built a Spec
+			// without going through Compile.
+			scan := r.ScanLines
+			if scan <= 0 {
+				scan = defaultScanLines
+			}
+			lines := strings.SplitN(string(head), "\n", scan+1)
+			if len(lines) > scan {
+				lines = lines[:scan]
 			}
 			for _, ln := range lines {
 				if m := r.regex.FindStringSubmatch(ln); m != nil {

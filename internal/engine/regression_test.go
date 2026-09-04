@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"strings"
 	"sync"
 	"testing"
 
@@ -322,5 +323,112 @@ func TestDropDoesNotOrphanAConcurrentWrite(t *testing.T) {
 	}
 	if orphans > 0 {
 		t.Fatalf("%d row(s) belong to a set id no meta record names: they are invisible to every query, drop and retention sweep", orphans)
+	}
+}
+
+// A set that already holds rows may not gain its first indexed column.
+// Every scan of an indexed set is bounded to the I/ prefix, so promoting
+// one made the rows already written under D/ unreachable by any query,
+// and invisible to retention -- the same silent orphaning PutBatch
+// refuses a timestamp-less row to avoid.
+func TestSetCannotGainAnIndexOnceItHoldsRows(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.RegisterSet("logs", []ColumnSpec{{Name: "msg", Type: model.TypeString}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	var pk [16]byte
+	pk[0] = 1
+	if err := db.PutBatch("logs", []Record{{Key: pk, Row: Row{"msg": model.String("hello")}}}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	// The row is readable now.
+	if _, ok, err := db.Get("logs", pk); err != nil || !ok {
+		t.Fatalf("row is not readable before the promotion: ok=%v err=%v", ok, err)
+	}
+
+	err := db.RegisterSet("logs", []ColumnSpec{{Name: model.TimestampField, Type: model.TypeInt, Indexed: true}})
+	if err == nil {
+		t.Fatal("promoting a set that already holds unindexed rows was accepted; those rows are now unreachable")
+	}
+	if !strings.Contains(err.Error(), "unindexed rows") {
+		t.Fatalf("error does not name the problem: %v", err)
+	}
+	// The set is untouched, so the rows stay readable rather than being
+	// half-promoted into invisibility.
+	if _, ok, err := db.Get("logs", pk); err != nil || !ok {
+		t.Fatalf("row became unreadable after the refusal: ok=%v err=%v", ok, err)
+	}
+	if _, indexed, _ := db.Schema("logs"); indexed != "" {
+		t.Fatalf("set was promoted to indexed on %q despite the refusal", indexed)
+	}
+}
+
+// A set with no rows yet may still gain an index: "declare the set, then
+// write to it" is the ordinary shape and has nothing to orphan.
+func TestEmptySetMayStillGainAnIndex(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.RegisterSet("metrics", []ColumnSpec{{Name: "msg", Type: model.TypeString}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := db.RegisterSet("metrics", []ColumnSpec{{Name: model.TimestampField, Type: model.TypeInt, Indexed: true}}); err != nil {
+		t.Fatalf("an empty set was refused an index: %v", err)
+	}
+	if _, indexed, _ := db.Schema("metrics"); indexed != model.TimestampField {
+		t.Fatalf("indexed column is %q, want %q", indexed, model.TimestampField)
+	}
+}
+
+// The widest type in a batch decides the column, not whichever row the
+// map walk reached first. A column arriving as an int in one row and a
+// float in the next was registered as int64, so the schema disagreed with
+// the payloads stored under it.
+func TestPutBatchWidensColumnTypeAcrossTheBatch(t *testing.T) {
+	db := openTestDB(t)
+	recs := make([]Record, 0, 2)
+	for i, v := range []model.Value{model.Int(1), model.Float(1.5)} {
+		var pk [16]byte
+		pk[0] = byte(i + 1)
+		recs = append(recs, Record{Key: pk, Row: Row{
+			model.TimestampField: model.Int(int64(1000 + i)),
+			"latency":            v,
+		}})
+	}
+	if err := db.PutBatch("app", recs); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	cols, _, ok := db.Schema("app")
+	if !ok {
+		t.Fatal("set was not registered")
+	}
+	for _, c := range cols {
+		if c.Name != "latency" {
+			continue
+		}
+		if c.Type != model.TypeFloat {
+			t.Fatalf("latency is %s, want float64: the batch carried a float the schema does not admit", c.Type)
+		}
+		return
+	}
+	t.Fatal("latency column is missing from the schema")
+}
+
+// False is the identity of OR. An empty disjunction returning true widened
+// the query instead of narrowing it, which is the one failure mode a
+// predicate must never have.
+func TestEmptyOrMatchesNothing(t *testing.T) {
+	db := openTestDB(t)
+	var pk [16]byte
+	pk[0] = 1
+	if err := db.PutBatch("app", []Record{{Key: pk, Row: Row{
+		model.TimestampField: model.Int(1000), "v": model.Int(7),
+	}}}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	it, err := db.Query("app").Where(Or()).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if rows := collect(t, it); len(rows) != 0 {
+		t.Fatalf("an empty OR matched %d row(s); it must match none", len(rows))
 	}
 }

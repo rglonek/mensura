@@ -86,6 +86,16 @@ type commonFlags struct {
 	printEvery time.Duration
 	compress   bool
 	maxRecord  int
+
+	// Delivery tuning. Every one of these decides how much of a store
+	// outage the ingester survives, or how large a body it presents, and
+	// none of them was reachable: setup() passed DefaultSinkConfig
+	// verbatim, so the documented trade-offs were the library's to make.
+	batchSize     int
+	batchBytes    int
+	flushEvery    time.Duration
+	maxBuffered   int
+	maxFatalDrops int
 }
 
 func (c *commonFlags) register(fs *flag.FlagSet) {
@@ -103,6 +113,37 @@ func (c *commonFlags) register(fs *flag.FlagSet) {
 	// until now: the library bounded a record and the operator had no way
 	// to say where.
 	fs.IntVar(&c.maxRecord, "max-record-bytes", 0, "largest record read on any path before it is truncated and counted; 0 uses the built-in 1 MiB")
+	fs.IntVar(&c.batchSize, "batch-size", 0, "samples buffered before a write is sent; 0 uses the built-in 1024")
+	fs.IntVar(&c.batchBytes, "batch-bytes", 0, "largest write body, which must stay under the store's max_request_bytes; 0 uses the built-in 4 MiB")
+	fs.DurationVar(&c.flushEvery, "flush-interval", 0, "how often a partly-filled batch is sent anyway; 0 uses the built-in 50ms")
+	fs.IntVar(&c.maxBuffered, "max-buffered-samples", 0, "samples held while the store refuses writes, past which the oldest are dropped and counted; 0 uses the built-in 100000")
+	fs.IntVar(&c.maxFatalDrops, "max-fatal-drops", 0, "unretryable batches dropped before the process gives up, so a supervisor notices a spec the store rejects; 0 uses the built-in 100, negative never gives up")
+}
+
+// sinkConfig applies the delivery flags on top of the defaults. Zero means
+// "leave the built-in", which is the same contract --max-record-bytes has
+// and the same one NewSink applies to each field.
+func (c *commonFlags) sinkConfig() ingest.SinkConfig {
+	cfg := ingest.DefaultSinkConfig()
+	if c.batchSize > 0 {
+		cfg.BatchSize = c.batchSize
+	}
+	if c.batchBytes > 0 {
+		cfg.BatchBytes = c.batchBytes
+	}
+	if c.flushEvery > 0 {
+		cfg.FlushEvery = c.flushEvery
+	}
+	if c.maxBuffered > 0 {
+		cfg.MaxBufferedSamples = c.maxBuffered
+	}
+	// Negative is meaningful here and zero is not: NewSink reads zero as
+	// "use the default", and MaxFatalDrops <= 0 is how "never give up" is
+	// expressed to the sink.
+	if c.maxFatalDrops != 0 {
+		cfg.MaxFatalDrops = c.maxFatalDrops
+	}
+	return cfg
 }
 
 type labelFlag map[string]string
@@ -144,7 +185,7 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	client.Compress = c.compress
 
 	logger := log.New(os.Stderr, "mensura-ingest ", log.LstdFlags)
-	sink := ingest.NewSink(client, ingest.DefaultSinkConfig(), logger)
+	sink := ingest.NewSink(client, c.sinkConfig(), logger)
 
 	from, err := parseTimeFlag(c.from)
 	if err != nil {
@@ -448,9 +489,26 @@ func runCheck(argv []string) error {
 	// destination set was therefore never written -- passed `check` with
 	// nothing said.
 	lints := spec.Lint()
-	if len(lints) > 0 {
-		fmt.Printf("\n%d spec problem(s):\n", len(lints))
-		for _, l := range lints {
+	// Errors and warnings are printed apart, because only one of them
+	// stops the pipeline and an operator has to be able to tell at a
+	// glance which they are looking at.
+	var errs, warns []extract.Lint
+	for _, l := range lints {
+		if l.Fatal() {
+			errs = append(errs, l)
+			continue
+		}
+		warns = append(warns, l)
+	}
+	if len(errs) > 0 {
+		fmt.Printf("\n%d spec error(s):\n", len(errs))
+		for _, l := range errs {
+			fmt.Printf("  %s\n", l)
+		}
+	}
+	if len(warns) > 0 {
+		fmt.Printf("\n%d spec warning(s):\n", len(warns))
+		for _, l := range warns {
 			fmt.Printf("  %s\n", l)
 		}
 	}
@@ -459,10 +517,16 @@ func runCheck(argv []string) error {
 			return err
 		}
 	}
-	if len(lints) > 0 {
+	if len(errs) > 0 {
 		// A non-zero exit, so a spec with a dead pattern fails the
 		// pipeline that runs `check` instead of shipping.
-		return fmt.Errorf("%d spec problem(s) reported above", len(lints))
+		//
+		// Only the errors count. Failing on the advisory findings too
+		// meant a spec that works exactly as written could not pass:
+		// declaring an operator label in `defaults.labels` -- which is
+		// where the documentation puts it -- raises L004, whose own text
+		// says the label needs no declaration, and `check` then exited 1.
+		return fmt.Errorf("%d spec error(s) reported above", len(errs))
 	}
 	return nil
 }

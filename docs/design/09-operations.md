@@ -163,7 +163,7 @@ per flush, not percentages.
 | Query API | Same; `query` scope only |
 | Debug API | Loopback listener only, never proxied, read-only, capped limits and per-request timeouts |
 | Metrics | Separate listener, typically loopback or a private interface |
-| Ingest ↔ SSH | Public-key auth only, host-key verification on by default (`--ssh-strict-host-key=yes`), no interactive prompts |
+| Ingest ↔ SSH | Public-key auth only, host-key verification on by default (`--ssh-strict-host-key=yes`), no interactive prompts; `=false` really does turn it off, rather than falling back to a client default that `BatchMode=yes` still refuses |
 | Sensitive values | Environment or referenced path only; never logged; auth failures log the client *name* and source address, never the credential |
 | Spec files | Treated as configuration, not untrusted input, but regexes compile under a size limit and `check` reports catastrophic-backtracking risk from nested quantifiers |
 | Receive listeners | Optional TLS and mTLS; per-connection and per-source rate limits; UDP source allow-list |
