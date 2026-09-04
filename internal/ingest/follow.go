@@ -40,7 +40,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 		opts.PollInterval = 250 * time.Millisecond
 	}
 	if opts.IdleFlush <= 0 {
-		opts.IdleFlush = 30 * time.Second
+		opts.IdleFlush = defaultIdleFlush
 	}
 	if opts.MaxRecordBytes <= 0 {
 		opts.MaxRecordBytes = defaultMaxRecordBytes
@@ -87,6 +87,12 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 // noProfileRetry is how long a path that matched no profile is left alone
 // before it is looked at again.
 const noProfileRetry = time.Minute
+
+// defaultIdleFlush bounds how long a partial multiline record or a
+// half-filled aggregation window waits on any followed stream. It is
+// shared by the local and the remote follower so one --idle-flush means
+// one thing.
+const defaultIdleFlush = 30 * time.Second
 
 type follower struct {
 	ing  *Ingest
@@ -406,7 +412,17 @@ func (f *follower) ensure(path string) (*tailer, error) {
 	case had && f.opts.StartAt != "beginning" && fingerprintMatches(fh, cp):
 		// Same file as last time: resume where the store last acknowledged.
 		start = cp.AckedOffset
-	case f.opts.StartAt == "end":
+	case f.opts.StartAt == "end" && !had:
+		// "end" means "only what arrives from now on", and it is honoured
+		// once: on the first sight of a stream, when there is no
+		// checkpoint at all. It used to be honoured whenever the
+		// fingerprint failed to match, which is exactly what a rotation
+		// produces -- retire() rewinds the record to offset zero and
+		// clears the fingerprint -- so every rename-and-create skipped
+		// whatever the replacement already held between the rotation and
+		// the next poll, silently. 02-ingest.md section 6.1 says a
+		// rotation starts the new file at offset 0, and the remote
+		// follower already gates the same flag on `!hadCheckpoint`.
 		start = info.Size()
 	default:
 		start = 0

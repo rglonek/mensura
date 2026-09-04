@@ -1,11 +1,19 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/rglonek/mensura/internal/engine"
 	"github.com/rglonek/mensura/pkg/model"
+	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
 )
 
@@ -148,5 +156,164 @@ func TestLabelIndicesMatching(t *testing.T) {
 	// An unknown key is empty rather than an error.
 	if vals, total := s.labelIndicesMatching("nosuch", func(string) bool { return true }); vals != nil || total != 0 {
 		t.Fatalf("unknown key: %v %d", vals, total)
+	}
+}
+
+// A string-typed field carrying the text "NaN" -- or "Inf", or
+// "+Infinity", all of which strconv.ParseFloat accepts -- used to coerce
+// to a non-finite float, land in wire.Series.Values, and make
+// encoding/json fail on the response *after* the 200 header had gone out:
+// the panel received a truncated body with no status and no diagnostic.
+// A value that cannot be plotted now reads as an absent one.
+func TestANonFiniteStringFieldDoesNotPoisonTheResponse(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{
+		{TSMs: 1000, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.String("NaN")}},
+		{TSMs: 2000, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.String("Inf")}},
+		{TSMs: 3000, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.String("7")}},
+	})
+	q, err := mql.Parse(`FROM app SELECT v BY host`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	resp, err := s.Query(context.Background(), &wire.QueryRequest{
+		AST: q, FromMs: 0, ToMs: 10_000, MaxPoints: 100,
+	})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if _, err := json.Marshal(resp); err != nil {
+		t.Fatalf("the response cannot be encoded, so the panel gets a 200 with a truncated body: %v", err)
+	}
+	if len(resp.Series) != 1 {
+		t.Fatalf("want 1 series, got %d", len(resp.Series))
+	}
+	for i, v := range resp.Series[0].Values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Fatalf("point %d is %v; a non-plottable value must read as absent", i, v)
+		}
+	}
+}
+
+// A non-finite float already on disk. The write path refuses one, so
+// only a data directory written before that check can hold it -- and the
+// read path has to survive it, because runTabular used to discard
+// AsFloat's verdict and append whatever it returned, so one such row made
+// the whole table response unencodable.
+func TestANonFiniteStoredFloatLeavesAnEmptyTableCell(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{
+		{TSMs: 1000, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Float(1)}},
+	})
+	// Straight through the engine, the way an older build's row sits on
+	// disk: rowFor builds the row, Validate is what would have refused it.
+	sm := model.Sample{
+		TSMs:   2000,
+		Labels: map[string]string{"host": "a"},
+		Fields: map[string]model.Value{"v": model.Float(math.NaN())},
+	}
+	row, err := s.rowFor("app", &sm)
+	if err != nil {
+		t.Fatalf("rowFor: %v", err)
+	}
+	if err := s.db.PutBatch(s.shardName("app", sm.TSMs), []engine.Record{
+		{Key: model.PrimaryKey("app", &sm, model.KeyContent), Row: row},
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	for _, text := range []string{
+		`FROM app SELECT v BY host FORMAT table`,
+		`FROM app SELECT v BY host`,
+	} {
+		q, perr := mql.Parse(text)
+		if perr != nil {
+			t.Fatalf("parse %q: %v", text, perr)
+		}
+		resp, qerr := s.Query(context.Background(), &wire.QueryRequest{
+			AST: q, FromMs: 0, ToMs: 10_000, MaxPoints: 100,
+		})
+		if qerr != nil {
+			t.Fatalf("query %q: %v", text, qerr)
+		}
+		if _, merr := json.Marshal(resp); merr != nil {
+			t.Fatalf("%q: the response cannot be encoded: %v", text, merr)
+		}
+	}
+}
+
+// The catalogue's Stale flag is a function of wall-clock time, so the
+// body changes while CatalogueVersion stands still. A client caching on
+// the ETag was therefore answered 304 for the rest of the process's life
+// and never saw a field go quiet.
+func TestTheCatalogueETagMovesWhenAFieldGoesStale(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{
+		{TSMs: 1000, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(1)}},
+	})
+	before := s.CatalogueETag()
+	version := s.CatalogueVersion()
+
+	// Age the field past the staleness horizon without touching the
+	// schema, which is exactly what a source going quiet does.
+	s.mu.Lock()
+	s.catalogue["app"].Fields["v"].LastSeenMs = time.Now().Add(-2 * staleAfter).UnixMilli()
+	s.mu.Unlock()
+
+	if s.CatalogueVersion() != version {
+		t.Fatal("the test moved the schema version; it must not")
+	}
+	if got := s.CatalogueETag(); got == before {
+		t.Fatalf("the ETag is still %s after the field went stale, so a caching client is answered 304 forever", got)
+	}
+	cat := s.Catalogue()
+	if !cat.Sets[0].Fields["v"].Stale {
+		t.Fatal("the rendered catalogue does not report the field as stale")
+	}
+	if got := catalogueETag(cat.Version, staleFieldsIn(cat)); got != s.CatalogueETag() {
+		t.Fatalf("the served ETag %s disagrees with the validator %s", got, s.CatalogueETag())
+	}
+}
+
+// A body that could not be decompressed is malformed, not large. Every
+// body failure used to come back 413, which wire.Client classifies as
+// fatal -- so the sink dropped the batch, reported it to the delivery
+// observers as a hole, and froze every followed file's checkpoint.
+func TestAMalformedBodyIsABadRequestRatherThanTooLarge(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/write", strings.NewReader("this is not gzip"))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d for a corrupt gzip body, want 400: 413 makes the client drop the batch as unretryable", resp.StatusCode)
+	}
+}
+
+// A body that really is too large still says so, so back-pressure and
+// "fix your batch size" stay distinguishable.
+func TestAnOversizedBodyIsStillTooLarge(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 64})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/write", "application/json", strings.NewReader(strings.Repeat("x", 4096)))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d for an oversized body, want 413", resp.StatusCode)
 	}
 }

@@ -373,17 +373,33 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleCatalogue(w http.ResponseWriter, r *http.Request, _ string) {
-	// The version is read before the body is rendered: rendering it walks
-	// every shard, so answering 304 after building it saved the bandwidth
-	// and none of the work.
-	etag := fmt.Sprintf(`"v%d"`, a.store.CatalogueVersion())
-	if r.Header.Get("If-None-Match") == etag {
+	// The validator is computed before the body is rendered: rendering it
+	// walks every shard, so answering 304 after building it saved the
+	// bandwidth and none of the work.
+	if tag := r.Header.Get("If-None-Match"); tag != "" && tag == a.store.CatalogueETag() {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	cat := a.store.Catalogue()
-	w.Header().Set("ETag", fmt.Sprintf(`"v%d"`, cat.Version))
+	// Derived from the body that is actually being sent, not from the
+	// value compared above: a write landing between the two moves the
+	// version, and a tag naming the older one would cost the client a
+	// redundant fetch of a body it already holds.
+	w.Header().Set("ETag", catalogueETag(cat.Version, staleFieldsIn(cat)))
 	writeJSON(w, http.StatusOK, cat)
+}
+
+// staleFieldsIn counts the stale fields of a rendered catalogue.
+func staleFieldsIn(cat wire.Catalogue) int {
+	n := 0
+	for _, s := range cat.Sets {
+		for _, f := range s.Fields {
+			if f.Stale {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 func (a *API) handleLabels(w http.ResponseWriter, r *http.Request, _ string) {
@@ -568,6 +584,16 @@ func requirePost(w http.ResponseWriter, r *http.Request) bool {
 // request-body bytes as it may.
 var errBusy = errors.New("the server is already buffering its limit of request bodies")
 
+// errTooLarge marks the one body failure that really is "too large".
+//
+// Every other one -- a truncated gzip stream, a connection that died
+// mid-body -- used to be reported as 413 as well, which is both untrue
+// and expensive: wire.Client classifies 413 as fatal, so the sink drops
+// the batch outright, reports it to the delivery observers as a hole, and
+// freezes every followed file's checkpoint. A malformed body deserves the
+// 400 that says so.
+var errTooLarge = errors.New("request body is larger than the configured limit")
+
 // readBody reads a request body against the shared in-memory budget.
 //
 // Shedding rather than queueing is the same choice the write pool makes:
@@ -595,12 +621,17 @@ func (a *API) readBody(r *http.Request) ([]byte, error) {
 }
 
 // bodyErrStatus maps a body failure to its status: a refused admission is
-// back-pressure, anything else is a body the client should not have sent.
+// back-pressure, an oversized body is 413, and a body that could not be
+// read or decompressed is a 400 -- it is malformed, not large.
 func bodyErrStatus(err error) int {
-	if errors.Is(err, errBusy) {
+	switch {
+	case errors.Is(err, errBusy):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, errTooLarge):
+		return http.StatusRequestEntityTooLarge
+	default:
+		return http.StatusBadRequest
 	}
-	return http.StatusRequestEntityTooLarge
 }
 
 func readBody(r *http.Request, max int64) ([]byte, error) {
@@ -608,7 +639,7 @@ func readBody(r *http.Request, max int64) ([]byte, error) {
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		zr, err := gzip.NewReader(reader)
 		if err != nil {
-			return nil, err
+			return nil, oversizeOr(err, max)
 		}
 		defer zr.Close()
 		// One byte past the limit, so a body that fills it exactly is
@@ -617,12 +648,22 @@ func readBody(r *http.Request, max int64) ([]byte, error) {
 	}
 	b, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, err
+		return nil, oversizeOr(err, max)
 	}
 	if int64(len(b)) > max {
-		return nil, fmt.Errorf("request body exceeds the %d byte limit", max)
+		return nil, fmt.Errorf("%w of %d bytes", errTooLarge, max)
 	}
 	return b, nil
+}
+
+// oversizeOr recognises MaxBytesReader's own refusal, which arrives as a
+// read error rather than as a length this function can measure.
+func oversizeOr(err error, max int64) error {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return fmt.Errorf("%w of %d bytes", errTooLarge, max)
+	}
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -330,4 +331,65 @@ func TestReceiveTCPKeepsAnUnterminatedFinalLine(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// /ingest/v1/samples reports the denominator, the way /ingest/v1/lines
+// does. It used to answer "accepted": <everything in the body> without
+// looking at any of it, so a sender whose samples the store would refuse
+// -- one carrying no fields, one with a timestamp in the wrong unit --
+// was told they had all landed and the loss surfaced only in the store's
+// own log, on the far side of the sink.
+func TestReceiveHTTPSamplesReportsRefusals(t *testing.T) {
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, t.TempDir())
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ing.Receive(ctx, ReceiveOptions{HTTPAddr: addr, Listener: "default"})
+	}()
+	defer func() { cancel(); <-done }()
+
+	// One good sample, one carrying no fields at all.
+	body := `{"set":"lines","samples":[
+		{"ts_ms":1700000000000,"fields":{"n":{"i":1}}},
+		{"ts_ms":1700000000001,"fields":{}}
+	]}`
+	var resp *http.Response
+	waitFor(t, 5*time.Second, func() bool {
+		r, perr := http.Post("http://"+addr+"/ingest/v1/samples", "application/json", strings.NewReader(body))
+		if perr != nil {
+			return false
+		}
+		resp = r
+		return true
+	})
+	if resp == nil {
+		t.Fatal("the listener never came up")
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Accepted int    `json:"accepted"`
+		Refused  int    `json:"refused"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Accepted != 1 {
+		t.Fatalf("accepted %d, want 1: the sample with no fields was counted as delivered", out.Accepted)
+	}
+	if out.Refused != 1 || out.Reason == "" {
+		t.Fatalf("refused %d with reason %q, want 1 and a reason", out.Refused, out.Reason)
+	}
 }

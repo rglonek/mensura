@@ -204,6 +204,12 @@ contract is stated explicitly.
 | **compressed archive** (`.log.1.gz`) | A new file matching the archive glob appears | Only read if `--catch-up-rotated` is set (default on for `follow` started cold, off for a resumed follow that already has an acked offset covering the rotated content) |
 | **path glob expansion** | A new file matches the glob | Treated as a new stream; starts at offset 0 or at tail depending on `--start-at` |
 
+`--start-at` answers "where does a stream begin when there is nothing to
+resume from". It is therefore consulted once per stream, on first sight,
+and never again: a rotation is not a new stream, so the replacement always
+starts at offset 0 whatever the flag says. Both followers apply the same
+rule.
+
 ### 6.2 The drain rule
 
 On rename/delete, the old handle is drained to EOF *before* the new file is

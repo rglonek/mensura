@@ -1670,3 +1670,161 @@ func TestNewDefaultsTheLogger(t *testing.T) {
 		t.Fatalf("processFile: %v", err)
 	}
 }
+
+// A remote tail owes a rewind between the moment a hole clears and the
+// moment the reconnect actually starts reading from the frozen offset.
+// The local follower freezes its published offset for that window; this
+// one did not, so a flush landing in it snapshotted the read head the
+// tail was about to abandon and committed it -- and the reconnect, which
+// starts at the acknowledged offset, then skipped the very records the
+// freeze exists to re-read.
+func TestARemoteRewindOwedFreezesThePublishedOffset(t *testing.T) {
+	p := newRemoteProgress()
+	p.set(100)
+
+	// A dropped batch freezes it, a later success thaws it and asks for a
+	// reconnect from 100.
+	p.advance(400)
+	p.markInflight()
+	if at, first := p.markHoled(); !first || at != 100 {
+		t.Fatalf("markHoled returned (%d, %v), want (100, true)", at, first)
+	}
+	at, thawed := p.clearHole()
+	if !thawed || at != 100 {
+		t.Fatalf("clearHole returned (%d, %v), want (100, true)", at, thawed)
+	}
+
+	// The read loop is still streaming from past the hole and publishes
+	// what it has read.
+	p.advance(400)
+	if got := p.pendingOffset(); got != 100 {
+		t.Fatalf("pending advanced to %d while a rewind was owed", got)
+	}
+	// A flush lands in the window.
+	p.markInflight()
+	if acked, moved := p.commitInflight(); moved {
+		t.Fatalf("a checkpoint was committed to %d past the frozen offset while the rewind was still owed", acked)
+	}
+	if got := p.ackedOffset(); got != 100 {
+		t.Fatalf("acked moved to %d, past the hole", got)
+	}
+
+	// The reconnect starts at the frozen offset and discharges the
+	// rewind, along with the signal that would otherwise have killed it.
+	if got := p.startFrom(); got != 100 {
+		t.Fatalf("startFrom() = %d, want 100", got)
+	}
+	if p.rewindOwedForTest() {
+		t.Fatal("the rewind was still owed after the tail restarted from the frozen offset")
+	}
+	select {
+	case <-p.rewind:
+		t.Fatal("a stale rewind signal survived into the new connection and would kill it immediately")
+	default:
+	}
+	p.advance(250)
+	p.markInflight()
+	if acked, moved := p.commitInflight(); !moved || acked != 250 {
+		t.Fatalf("after the rewind the checkpoint is (%d, %v), want (250, true)", acked, moved)
+	}
+}
+
+// `--start-at end` means "only what arrives from now on", and it is
+// answered once: on the first sight of a stream. It used to be re-applied
+// whenever the stored fingerprint failed to match, which is exactly what
+// a rotation produces -- retire() rewinds the record to zero and clears
+// the fingerprint -- so every rename-and-create skipped whatever the
+// replacement already held. 02-ingest.md section 6.1 says the new file
+// starts at offset 0.
+func TestStartAtEndStillReadsARotatedFileFromTheStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+	if err := os.WriteFile(path, []byte("1700000000000 n=1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f := newTestFollower(t, dir, FollowOptions{
+		Paths: []string{filepath.Join(dir, "*.log")}, StartAt: "end",
+	})
+	if err := f.poll(context.Background()); err != nil {
+		t.Fatalf("first poll: %v", err)
+	}
+	// The first record predates the follow, so "end" skips it.
+	if got := f.ing.cfg.Progress.Snapshot().Records; got != 0 {
+		t.Fatalf("--start-at end read %d record(s) that predate the follow", got)
+	}
+
+	// A rename-and-create rotation, with the replacement already holding
+	// a record by the time the next sweep runs.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("1700000000001 n=2\n1700000000002 n=3\n"), 0o644); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	// One sweep retires the old handle, the next picks the new file up.
+	for i := 0; i < 3; i++ {
+		if err := f.poll(context.Background()); err != nil {
+			t.Fatalf("poll %d after the rotation: %v", i, err)
+		}
+	}
+	if got := f.ing.cfg.Progress.Snapshot().Records; got < 2 {
+		t.Fatalf("the rotated-in file contributed %d record(s), want both of them: --start-at end skipped its head", got)
+	}
+}
+
+// A remote tail has no end of file to flush at, so a stream that goes
+// quiet held its last partial record and its half-filled aggregation
+// window -- and, because the published offset is pulled back to the
+// oldest byte the extractor is holding, the checkpoint with them -- until
+// the connection dropped. --idle-flush governs exactly that and reached
+// only the local follower.
+func TestRemoteStreamIdleFlushReleasesHeldBytes(t *testing.T) {
+	spec, err := extract.Parse([]byte(holdSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	ex, err := spec.NewStream(spec.Profiles[0], extract.StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	rs := &remoteStream{}
+	rs.open(ex, 0)
+
+	// One record opens a multiline block and produces nothing, so the
+	// extractor is holding the bytes it came from.
+	var delivered int
+	perr, aerr := rs.process(0, "1700000000000 BEGIN n=1", func(res []extract.Result) error {
+		delivered += len(res)
+		return nil
+	}, 40)
+	if perr != nil || aerr != nil {
+		t.Fatalf("process: %v / %v", perr, aerr)
+	}
+	if got := rs.held(); got != 0 {
+		t.Fatalf("held() = %d, want 0: the open multiline record starts at 0", got)
+	}
+
+	// Past the profile's idle timeout the record is emitted and the bytes
+	// it was holding are released.
+	results, pos, at := rs.flushIdle(time.Now().Add(time.Hour))
+	if len(results) == 0 {
+		t.Fatal("the idle flush emitted nothing, so a quiet remote stream never releases its last record")
+	}
+	if pos == "" {
+		t.Fatal("the idle flush reserved no key-hint position")
+	}
+	if at != 40 {
+		t.Fatalf("the released offset is %d, want the read head 40", at)
+	}
+}
+
+// The tick is bounded below, so a very short --idle-flush cannot turn the
+// watcher into a busy loop.
+func TestRemoteIdleTickIsBounded(t *testing.T) {
+	if got := remoteIdleTick(time.Millisecond); got < time.Second {
+		t.Fatalf("remoteIdleTick(1ms) = %s, want at least 1s", got)
+	}
+	if got := remoteIdleTick(30 * time.Second); got != 15*time.Second {
+		t.Fatalf("remoteIdleTick(30s) = %s, want 15s", got)
+	}
+}

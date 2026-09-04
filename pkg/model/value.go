@@ -5,6 +5,7 @@ package model
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -50,15 +51,26 @@ func (v Value) Valid() bool { return v.T != TypeInvalid }
 // AsFloat coerces to float64 for the render path. Numeric strings are
 // accepted because extraction may legitimately leave a value as a string
 // when it could not be coerced earlier; anything else reports false.
+//
+// A non-finite result reports false, whichever type it came from.
+// ValidateFieldValue refuses NaN and infinity on the write path, but
+// strconv.ParseFloat accepts the literal text "NaN", "Inf" and
+// "+Infinity" -- so a *string*-typed field carrying one of those tokens
+// coerced to a non-finite float here, landed in wire.Series.Values, and
+// made encoding/json fail on the response *after* the 200 header had
+// been written: the panel received a truncated body with no status and no
+// diagnostic to explain it. A value that cannot be plotted reads as an
+// absent one instead, which is the same answer the render path already
+// gives a column a row does not carry.
 func (v Value) AsFloat() (float64, bool) {
 	switch v.T {
 	case TypeInt:
 		return float64(v.I), true
 	case TypeFloat:
-		return v.F, true
+		return v.F, isFinite(v.F)
 	case TypeString:
 		f, err := strconv.ParseFloat(v.S, 64)
-		return f, err == nil
+		return f, err == nil && isFinite(f)
 	case TypeBool:
 		if v.B {
 			return 1, true
@@ -68,12 +80,25 @@ func (v Value) AsFloat() (float64, bool) {
 	return 0, false
 }
 
+// isFinite reports whether a float is a real number, as opposed to a NaN
+// or an infinity.
+func isFinite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
+
 // AsInt coerces to int64 where that is lossless-enough for indexing.
+//
+// A non-finite float reports false rather than being converted: the
+// result of int64(NaN) is implementation-defined, and this is the
+// function the engine reads a row's indexed timestamp through, so a
+// garbage answer would place the row at a fabricated time that no range
+// scan can find.
 func (v Value) AsInt() (int64, bool) {
 	switch v.T {
 	case TypeInt:
 		return v.I, true
 	case TypeFloat:
+		if !isFinite(v.F) {
+			return 0, false
+		}
 		return int64(v.F), true
 	case TypeString:
 		i, err := strconv.ParseInt(v.S, 10, 64)

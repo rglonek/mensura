@@ -42,6 +42,14 @@ type RemoteOptions struct {
 	MaxRecordBytes int
 	// ReconnectBackoff bounds the wait between reconnect attempts.
 	ReconnectBackoff time.Duration
+	// IdleFlush bounds how long a partial multiline record or a
+	// half-filled aggregation window may wait, exactly as it does on a
+	// local follow. A remote tail has no end of file to flush at and a
+	// connection can stay up for days, so without a clock of its own a
+	// quiet stream held its last record -- and, because the checkpoint
+	// is pulled back to the oldest byte the extractor is still holding,
+	// its resume offset with it -- until the connection dropped.
+	IdleFlush time.Duration
 	// SSHBinary overrides the client binary, for tests.
 	SSHBinary string
 }
@@ -61,6 +69,9 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 	}
 	if opts.MaxRecordBytes <= 0 {
 		opts.MaxRecordBytes = defaultMaxRecordBytes
+	}
+	if opts.IdleFlush <= 0 {
+		opts.IdleFlush = defaultIdleFlush
 	}
 	cps, err := NewCheckpointStore(i.cfg.StateDir)
 	if err != nil {
@@ -159,7 +170,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	// from -- silently dropped it again, for the life of the process.
 	// It is cleared where the flag is actually applied.
 	startAtPending := opts.StartAt == "beginning" || (opts.StartAt == "end" && !hadCheckpoint)
-	flushSeq := 0
+	rs := &remoteStream{}
 	for ctx.Err() == nil {
 		// "beginning" needs no size, so it is honoured even when the
 		// remote host cannot be reached to measure the file.
@@ -209,10 +220,8 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		read, err := i.runRemoteTail(ctx, opts, path, target, ex, labels, progress, box.identity())
-		if flushed := ex.Flush(); len(flushed) > 0 {
-			flushSeq++
-			pos := flushPos(flushSeq)
+		read, err := i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity())
+		if flushed, pos := rs.flushAll(); len(flushed) > 0 {
 			i.cfg.Progress.AddSamples(int64(len(flushed)))
 			for n, r := range flushed {
 				_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
@@ -239,6 +248,107 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		}
 	}
 	return nil
+}
+
+// remoteStream is one remote path's extraction state.
+//
+// extract.Stream is single-threaded and the idle flusher runs on its own
+// goroutine while the reader is blocked on a quiet tail, so both reach it
+// through this lock. consumed travels with it because the idle flush is
+// what releases a checkpoint the extractor was holding back, and the
+// offset it releases is the reader's, not the flusher's.
+type remoteStream struct {
+	mu       sync.Mutex
+	ex       *extract.Stream
+	consumed int64
+	// flushSeq numbers the flushes of buffered state over the whole life
+	// of the path rather than of one connection: it is half of the key
+	// hint, so restarting it per connection would hand two different
+	// flushes the same one and collapse their rows under `key: offset`.
+	flushSeq int
+}
+
+// open binds a fresh connection's extractor and its starting read
+// position.
+func (rs *remoteStream) open(ex *extract.Stream, at int64) {
+	rs.mu.Lock()
+	rs.ex, rs.consumed = ex, at
+	rs.mu.Unlock()
+}
+
+// nextFlushPosLocked reserves the hint position for one flush of buffered
+// state. It must be called with the lock held.
+func (rs *remoteStream) nextFlushPosLocked() string {
+	rs.flushSeq++
+	return flushPos(rs.flushSeq)
+}
+
+// process runs one framed record through the extractor and hands what it
+// produced to deliver. The whole record -- the mark, the extraction and
+// the delivery -- happens under one lock, so an idle flush can never land
+// in the middle of one; and the read position only moves once every
+// sample from these bytes has been queued, which is what stops a
+// checkpoint acknowledging a byte whose sample is still unsent.
+//
+// extractErr is why the record produced nothing, which is a counter
+// rather than a failure. deliverErr is the sink refusing it, which is.
+func (rs *remoteStream) process(recStart int64, line string, deliver func([]extract.Result) error, consumed int64) (extractErr, deliverErr error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.ex == nil {
+		return nil, nil
+	}
+	rs.ex.Mark(recStart)
+	results, perr := rs.ex.Process(line)
+	if err := deliver(results); err != nil {
+		return perr, err
+	}
+	rs.consumed = consumed
+	return perr, nil
+}
+
+// held is the offset a checkpoint may cover: the read position, pulled
+// back to the start of the oldest record the extractor is still holding.
+func (rs *remoteStream) held() int64 {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.heldLocked()
+}
+
+func (rs *remoteStream) heldLocked() int64 {
+	if rs.ex == nil {
+		return rs.consumed
+	}
+	return heldOffset(rs.ex, rs.consumed)
+}
+
+// flushIdle emits whatever has been waiting longer than the profile's own
+// idle timeout, and reports the offset that releases.
+func (rs *remoteStream) flushIdle(now time.Time) ([]extract.Result, string, int64) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.ex == nil {
+		return nil, "", rs.consumed
+	}
+	results := rs.ex.FlushIdle(now)
+	if len(results) == 0 {
+		return nil, "", rs.heldLocked()
+	}
+	return results, rs.nextFlushPosLocked(), rs.heldLocked()
+}
+
+// flushAll drains the extractor at the end of a connection.
+func (rs *remoteStream) flushAll() ([]extract.Result, string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.ex == nil {
+		return nil, ""
+	}
+	results := rs.ex.Flush()
+	if len(results) == 0 {
+		return nil, ""
+	}
+	return results, rs.nextFlushPosLocked()
 }
 
 // checkpointBox owns one remote path's Checkpoint. Every read hands back
@@ -302,6 +412,17 @@ type remoteProgress struct {
 	// The freeze is the right policy; needing a process restart to leave
 	// it was not.
 	holed bool
+	// rewindOwed says the tail is still streaming bytes from past the
+	// frozen offset, so nothing it publishes may be acknowledged. The
+	// local follower keeps the same flag on its tailer and for the same
+	// reason: clearing the hole only asks the reader to restart, and the
+	// reader is very likely mid-record when it is asked. Without this,
+	// advance() published the read head it was about to abandon, a flush
+	// landing in that window snapshotted and committed it, and the
+	// checkpoint moved past the very records the freeze exists to
+	// re-read -- which the reconnect then skipped, because it starts at
+	// the acknowledged offset.
+	rewindOwed bool
 	// rewind is signalled when a hole clears. It is buffered and never
 	// blocks, so the flush goroutine cannot be held up by a tail loop
 	// that is between reconnects.
@@ -324,6 +445,7 @@ func (p *remoteProgress) clearHole() (int64, bool) {
 	}
 	p.holed = false
 	p.pending, p.inflight = p.acked, p.acked
+	p.rewindOwed = true
 	at := p.acked
 	ch := p.rewind
 	p.mu.Unlock()
@@ -340,20 +462,59 @@ func (p *remoteProgress) set(n int64) {
 	p.mu.Lock()
 	p.pending, p.inflight, p.acked = n, n, n
 	// A rotation replaces the bytes the hole was in, so there is nothing
-	// left to protect by staying frozen.
-	p.holed = false
+	// left to protect by staying frozen, and no rewind left to owe.
+	p.holed, p.rewindOwed = false, false
 	p.mu.Unlock()
 }
 
+// startFrom is the offset a fresh tail connection must begin at, and it
+// discharges a pending rewind: from here on the reader really is reading
+// from the acknowledged offset, so what it publishes is publishable
+// again.
+//
+// The stale rewind signal is drained with it. It is buffered, so a hole
+// that cleared while the tail loop was between reconnects left a token
+// behind that the *next* connection's watcher read immediately and
+// killed a tail that was already starting from the right place.
+func (p *remoteProgress) startFrom() int64 {
+	p.mu.Lock()
+	if p.rewindOwed {
+		p.rewindOwed = false
+		p.pending, p.inflight = p.acked, p.acked
+	}
+	at := p.acked
+	ch := p.rewind
+	p.mu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+		}
+	}
+	return at
+}
+
+// advance publishes how far the reader has handed bytes to the sink. It
+// does nothing while a rewind is owed: those bytes are about to be read
+// again, so there is nothing there worth publishing.
 func (p *remoteProgress) advance(n int64) {
 	p.mu.Lock()
-	p.pending = n
+	if !p.rewindOwed {
+		p.pending = n
+	}
 	p.mu.Unlock()
 }
 
+// markInflight snapshots what the batch the sink has just taken is
+// entitled to acknowledge. A tail that owes a rewind snapshots nothing,
+// for the reason advance publishes nothing: clearHole has already pulled
+// inflight back to acked, and leaving it there is what makes the commit
+// a no-op until the re-read has actually happened.
 func (p *remoteProgress) markInflight() {
 	p.mu.Lock()
-	p.inflight = p.pending
+	if !p.rewindOwed {
+		p.inflight = p.pending
+	}
 	p.mu.Unlock()
 }
 
@@ -379,6 +540,13 @@ func (p *remoteProgress) markHoled() (int64, bool) {
 	}
 	p.holed = true
 	return p.acked, true
+}
+
+// rewindOwedForTest reports whether a rewind is still pending.
+func (p *remoteProgress) rewindOwedForTest() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rewindOwed
 }
 
 func (p *remoteProgress) pendingOffset() int64 {
@@ -506,10 +674,11 @@ func (i *Ingest) remoteStat(ctx context.Context, opts RemoteOptions, path string
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) (int64, error) {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, rs *remoteStream, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) (int64, error) {
 	args := sshArgs(opts)
 	dest := sshDest(opts)
-	start := progress.ackedOffset()
+	start := progress.startFrom()
+	rs.open(ex, start)
 	// One tail invocation, not a shell "|| fallback": a fallback that
 	// fires after the first tail has already streamed bytes would replay
 	// them from the original offset. Support for -F is remembered
@@ -544,10 +713,20 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		defer watchDone.Done()
 		t := time.NewTicker(opts.ProbeInterval)
 		defer t.Stop()
+		// A clock for the extractor, which a tail does not supply: a
+		// connection can stay up for days, so a stream that goes quiet
+		// would otherwise hold its last partial record and its
+		// half-filled window -- and the checkpoint they pin -- until it
+		// dropped. The cadence is the question, not the answer: the
+		// profile's own idle_timeout decides what is actually due.
+		idle := time.NewTicker(remoteIdleTick(opts.IdleFlush))
+		defer idle.Stop()
 		for {
 			select {
 			case <-watchStop:
 				return
+			case now := <-idle.C:
+				i.remoteFlushIdle(ctx, rs, target, labels, progress, now)
 			case <-progress.rewind:
 				// A hole cleared: the tail is streaming bytes from past
 				// the frozen offset, so it has to be restarted from it.
@@ -604,21 +783,27 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 			// Where this record began, so a line that only opens a
 			// multiline block or feeds an aggregation window holds the
 			// checkpoint back to its own offset rather than letting it
-			// run past data that exists only in the extractor.
-			ex.Mark(recStart)
-			results, perr := ex.Process(string(rec.Line))
-			i.recordOutcome(perr)
-			i.cfg.Progress.AddSamples(int64(len(results)))
-			for n, res := range results {
-				if aerr := i.cfg.Sink.Add(ctx, res, labels, keyHint(target, offsetPos(recStart), n)); aerr != nil {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					return consumed, aerr
+			// run past data that exists only in the extractor. The whole
+			// record goes through the stream lock, so the idle flusher
+			// cannot land between extraction and delivery.
+			perr, aerr := rs.process(recStart, string(rec.Line), func(results []extract.Result) error {
+				i.cfg.Progress.AddSamples(int64(len(results)))
+				for n, res := range results {
+					if err := i.cfg.Sink.Add(ctx, res, labels, keyHint(target, offsetPos(recStart), n)); err != nil {
+						return err
+					}
 				}
+				return nil
+			}, consumed)
+			i.recordOutcome(perr)
+			if aerr != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				return consumed, aerr
 			}
 			// Only complete records advance the offset, so a connection
 			// that dies mid-line resumes at the start of that line.
-			progress.advance(heldOffset(ex, consumed))
+			progress.advance(rs.held())
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -642,6 +827,34 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		}
 	}
 	return consumed, waitErr
+}
+
+// remoteIdleTick is how often the idle question is asked. It is bounded
+// below so a very short --idle-flush cannot turn into a busy loop, and
+// asking more than once per timeout is what makes a record wait at most
+// its timeout rather than twice it.
+func remoteIdleTick(idle time.Duration) time.Duration {
+	tick := idle / 2
+	if tick < time.Second {
+		tick = time.Second
+	}
+	return tick
+}
+
+// remoteFlushIdle emits whatever the extractor has held past the
+// profile's idle timeout and republishes the offset that releases.
+func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target string, labels map[string]string, progress *remoteProgress, now time.Time) {
+	results, pos, at := rs.flushIdle(now)
+	if len(results) > 0 {
+		i.cfg.Progress.AddSamples(int64(len(results)))
+		for n, r := range results {
+			_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
+		}
+	}
+	// Published even when the flush emitted nothing: the extractor may
+	// have been holding the offset for a window that has since closed on
+	// its own, and this is the only clock a quiet tail has.
+	progress.advance(at)
 }
 
 // heldOffset pulls a read offset back to the start of the oldest record
