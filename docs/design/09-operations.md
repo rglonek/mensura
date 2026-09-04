@@ -91,6 +91,9 @@ inputs:
   - type: follow
     ssh: {host: db1.internal, user: mensura, credential_path: /etc/mensura/ssh-cred}
     path: ['/var/log/service/*.log']
+    idle_flush: 30s              # bounds a partial multiline record or a
+                                 # half-filled aggregation window on the
+                                 # remote path as well as the local one
   - type: receive
     listen: {tcp: "0.0.0.0:9640", udp: "0.0.0.0:9640"}
     mode: logs                   # logs | metrics

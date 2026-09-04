@@ -356,6 +356,42 @@ func (s *Store) DB() *engine.DB        { return s.db }
 func (s *Store) Config() Config        { return s.cfg }
 func (s *Store) Uptime() time.Duration { return time.Since(s.started) }
 
+// CatalogueETag is the cache validator for GET /v1/catalogue, and it is
+// deliberately not CatalogueVersion alone.
+//
+// The rendered catalogue carries a Stale flag per field, and staleness is
+// a function of wall-clock time rather than of anything a write moves. So
+// the body changed while the version stood still, and a client caching on
+// the ETag was answered 304 for the rest of the process's life: it never
+// saw a field go quiet, and the W203 warning that says so never reached
+// it. Folding the count of stale fields into the validator makes a field
+// crossing the threshold change the tag, which is the one event that
+// changes the body without changing the version.
+func (s *Store) CatalogueETag() string {
+	return catalogueETag(s.catVer.Load(), s.staleFieldCount())
+}
+
+// staleFieldCount counts the fields the catalogue would report as stale
+// right now. It is one pass over the catalogue's own maps, which is a
+// small fraction of what rendering the catalogue costs.
+func (s *Store) staleFieldCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, e := range s.catalogue {
+		for _, f := range e.Fields {
+			if f.stale() {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func catalogueETag(version int64, stale int) string {
+	return fmt.Sprintf(`"v%d-s%d"`, version, stale)
+}
+
 // CatalogueVersion is the version of the catalogue *schema*: which sets
 // exist and what fields, labels and bucket sets they carry.
 //

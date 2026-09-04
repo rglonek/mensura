@@ -697,13 +697,24 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 				vals = append(vals, nil)
 				continue
 			}
-			carries = true
 			if v.T == model.TypeString {
+				carries = true
 				vals = append(vals, v.S)
-			} else {
-				fv, _ := v.AsFloat()
-				vals = append(vals, fv)
+				continue
 			}
+			// The verdict is honoured, not discarded. A value AsFloat
+			// cannot represent -- a non-finite one -- used to be appended
+			// anyway, and a NaN in a table cell makes encoding/json fail
+			// on the whole response after the 200 header has gone out.
+			// An empty cell is the honest rendering, and it is the one
+			// the absent-column branch above already uses.
+			fv, ok := v.AsFloat()
+			if !ok {
+				vals = append(vals, nil)
+				continue
+			}
+			carries = true
+			vals = append(vals, fv)
 		}
 		if !carries {
 			return true

@@ -380,6 +380,12 @@ func runFollow(argv []string) error {
 			Host: *sshHost, User: *sshUser, Port: *sshPort,
 			CredentialPath: *sshCred, InsecureHostKey: !*strictHost, Paths: list,
 			StartAt: *startAt, ProbeInterval: *probe, MaxRecordBytes: common.maxRecord,
+			// The same knob the local follow takes. It used to reach only
+			// the local one, so an SSH follow of a stream with multiline
+			// or aggregation held its last record -- and the checkpoint
+			// pinned to it -- until the connection dropped, with the flag
+			// that governs exactly that accepted and ignored.
+			IdleFlush: *idleFlush,
 		})
 	}
 	if isFlagSet(fs, "ssh-probe-interval") {

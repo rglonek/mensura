@@ -287,3 +287,10 @@ as a panel-level notice and still draws the frames.
 
 `/v1/debug/*` binds to the loopback listener only: the debug surface is never
 reachable from whatever proxies the public path.
+
+The catalogue's `ETag` is not `catalogue_version` alone. That number is the
+version of the *schema* and deliberately does not move when a write lands,
+but the rendered catalogue also carries a `stale` flag per field, which is
+a function of wall-clock time. So the validator folds in the number of
+stale fields: a field going quiet changes the body, and it is the one
+event that changes the body without changing the version.

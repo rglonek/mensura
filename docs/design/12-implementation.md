@@ -1372,6 +1372,98 @@ against the same cap, and counts oversize records like the rest.
   so a caller that filled in everything else got a nil-interface panic on
   the first skipped file.
 
+### 6.67 A value that cannot be plotted reads as an absent one
+
+`Value.AsFloat` coerces a numeric string, because extraction may
+legitimately leave a value as a string. `strconv.ParseFloat` accepts the
+literal text `NaN`, `Inf` and `+Infinity`, so a *string*-typed field
+carrying one of those tokens coerced to a non-finite float, landed in
+`wire.Series.Values` — a `[]float64` — and made `encoding/json` fail on
+the response *after* `writeJSON` had already sent the `200`. The panel
+received a truncated body with no status and no diagnostic to explain it.
+`ValidateFieldValue` refuses such a value on the write path; nothing
+refused it on the read path.
+
+`AsFloat` now reports `false` for a non-finite result whichever type it
+came from, so the query paths treat it exactly as they treat a column the
+row does not carry. `AsInt` does the same, because `int64(NaN)` is
+implementation-defined and that function is how the engine reads a row's
+indexed timestamp. The tabular path honours the verdict rather than
+appending whatever `AsFloat` returned, which is where a non-finite float
+already on disk — written before the validation existed — used to poison
+a table response.
+
+### 6.68 A remote rewind freezes the offset the checkpoint may reach
+
+6.63 gave the local follower a rewind guard: between the moment a hole
+clears and the moment the reader actually seeks back, the read head is
+stale, so publishing it let a flush landing in that window commit a
+checkpoint past the very records the freeze exists to re-read. The remote
+follower had the same hole and none of the guard. `clearHole` only signals
+a reconnect, and the reader is very likely mid-record when it is asked, so
+`advance` published a position the tail was about to abandon, `BeginFlush`
+snapshotted it and the commit acknowledged it — and the reconnect, which
+starts at the acknowledged offset, then skipped those records for good.
+
+`remoteProgress` now carries `rewindOwed`. `advance` and `markInflight`
+are no-ops while it is set, and `startFrom` — which is what a fresh tail
+connection asks for its starting offset — discharges it. It also drains
+the buffered rewind signal, which otherwise survived a hole that cleared
+while the loop was between reconnects and killed the *next* connection
+immediately, one that was already starting from the right place.
+
+### 6.69 `--start-at end` is answered once
+
+`end` means "only what arrives from now on". The local follower applied it
+whenever the stored fingerprint failed to match, and a rotation is exactly
+that: `retire` rewinds the checkpoint to zero and clears the fingerprint,
+so every rename-and-create started the replacement at its *current size*
+and silently skipped whatever it had accumulated between the rotation and
+the next poll. 02-ingest.md section 6.1 says the new file starts at offset
+0, and the remote follower already gated the same flag on "there is no
+checkpoint". The local one now does too.
+
+### 6.70 A remote tail has a clock of its own
+
+A local follow flushes idle multiline records and half-filled aggregation
+windows on `--idle-flush`; a receiving listener does the same on its own
+ticker. A remote follow did neither. It has no end of file to flush at and
+a connection can stay up for days, so a stream that went quiet held its
+last partial record until the connection dropped — and, because 6.57 pulls
+the published offset back to the oldest byte the extractor is still
+holding, its checkpoint with it. `--idle-flush` was accepted on the
+command line and reached only the local path.
+
+`RemoteOptions.IdleFlush` now carries it, and the connection watcher
+drives the flush alongside the size probe. `extract.Stream` is
+single-threaded state and the watcher runs on its own goroutine, so the
+reader and the flusher both go through `remoteStream`, which holds the
+extractor, the read position the flush releases, and the flush sequence
+that is half of a flushed record's key hint — kept across connections,
+because restarting it per connection would hand two different flushes the
+same hint.
+
+### 6.71 Smaller corrections
+
+- The catalogue `ETag` folds in the number of stale fields. `Stale` is a
+  function of wall-clock time, so the body changed while
+  `CatalogueVersion` — which is the *schema* version, deliberately — stood
+  still, and a client caching on the validator was answered `304` for the
+  rest of the process's life: it never saw a field go quiet, and the W203
+  that says so never reached it.
+- A request body that could not be read or decompressed is a `400`, not a
+  `413`. Every body failure used to come back "too large", which is both
+  untrue and expensive: `wire.Client` classifies `413` as fatal, so the
+  sink drops the batch, reports it to the delivery observers as a hole,
+  and freezes every followed file's checkpoint. A body that really is
+  oversized still says so.
+- `POST /ingest/v1/samples` reports the denominator the way
+  `/ingest/v1/lines` does. It answered `"accepted": <everything in the
+  body>` without looking at any of it, so a sender whose samples the store
+  would refuse — one carrying no fields, one with a timestamp in the wrong
+  unit — was told they had all landed, and the only trace of the loss was
+  the store's own log on the far side of the sink.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

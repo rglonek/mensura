@@ -652,6 +652,21 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, fmt.Sprintf("set %q uses the reserved prefix", body.Set), http.StatusBadRequest)
 			return
 		}
+		// The denominator, exactly as /ingest/v1/lines reports it. This
+		// endpoint used to answer "accepted": <everything in the body>
+		// without looking at any of it, so a sender whose samples the
+		// store would refuse -- no fields, a timestamp in the wrong unit
+		// -- was told they had all landed, and the only place the loss
+		// appeared was the store's own log on the other side of the
+		// sink.
+		accepted, refused := 0, 0
+		var reason string
+		refuse := func(err error) {
+			refused++
+			if reason == "" {
+				reason = err.Error()
+			}
+		}
 		for i := range body.Samples {
 			s := body.Samples[i]
 			if s.Labels == nil {
@@ -673,13 +688,25 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			if s.KeyHint == "" {
 				s.KeyHint = keyHint(peer, r.arrivalPos(), i)
 			}
+			// Checked here rather than left to the store: the sender is
+			// waiting for an answer, and the store's rejection reaches it
+			// through nothing.
+			if err := s.Validate(); err != nil {
+				refuse(err)
+				continue
+			}
 			if err := r.ing.cfg.Sink.AddSample(req.Context(), body.Set, s); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			accepted++
 			r.ing.cfg.Progress.AddSamples(1)
 		}
-		writeJSONOK(w, map[string]int{"accepted": len(body.Samples)})
+		out := map[string]any{"accepted": accepted, "refused": refused}
+		if reason != "" {
+			out["reason"] = reason
+		}
+		writeJSONOK(w, out)
 	})
 	srv := &http.Server{
 		Addr:              r.opts.HTTPAddr,

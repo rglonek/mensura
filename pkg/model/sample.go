@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 )
 
@@ -110,7 +109,7 @@ func (s *Sample) Validate() error {
 // checkpoint for the life of the process. Naming the sample is the only
 // outcome that keeps the rest of the batch moving.
 func ValidateFieldValue(v Value) error {
-	if v.T == TypeFloat && (math.IsNaN(v.F) || math.IsInf(v.F, 0)) {
+	if v.T == TypeFloat && !isFinite(v.F) {
 		return fmt.Errorf("value %s is not a finite number; NaN and infinity have no meaning on a plot and cannot be encoded", v.String())
 	}
 	return nil
