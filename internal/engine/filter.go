@@ -63,7 +63,13 @@ func (e *orExpr) eval(r *lazyRow) bool {
 			return true
 		}
 	}
-	return len(e.sub) == 0
+	// False is the identity of OR. Returning true for an empty
+	// disjunction *widened* the query rather than narrowing it, which is
+	// the one failure mode a predicate must never have -- the same reason
+	// Run demotes an unseekable range to a per-row filter instead of
+	// dropping it. The query planner cannot build an empty Or today, but
+	// Or is exported and the next caller should not have to know this.
+	return false
 }
 func (e *orExpr) columns(into map[string]struct{}) {
 	for _, s := range e.sub {

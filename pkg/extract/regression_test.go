@@ -2,6 +2,7 @@ package extract
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -675,5 +676,134 @@ profiles:
 	}
 	if msg, ok := codes["L003"]; !ok || !strings.Contains(msg, "declared_but_never_captured") {
 		t.Fatalf("expected the orphaned field declaration to be reported, got %v", codes)
+	}
+}
+
+// A negative scan_lines is a typo, and it used to survive compilation and
+// then panic inside DiscoverIdentity: SplitN with a non-positive n returns
+// nothing to slice and the reslice ran with a negative bound. That panic
+// is unrecovered on the batch worker goroutines and on the follow poll
+// goroutine, so one bad key took the whole ingester down.
+func TestNegativeScanLinesIsRefused(t *testing.T) {
+	msg := specError(t, `
+version: 1
+identity:
+  - regex: '(?P<host>\w+)'
+    scan_lines: -1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    patterns:
+      - set: s
+        search: 'x'
+        extract: ['x=(?P<v>\d+)']
+`)
+	if !strings.Contains(msg, "scan_lines") {
+		t.Fatalf("error does not name the key: %s", msg)
+	}
+}
+
+// The bound is resolved at use as well as at compile time: it is a slice
+// bound, and Spec values built by hand never went through Compile.
+func TestDiscoverIdentitySurvivesAnUncompiledScanLines(t *testing.T) {
+	s := &Spec{Version: 1, Identity: []IdentityRule{{ScanLines: -1, Regex: `(?P<host>\w+)`}}}
+	if err := s.Compile(); err == nil {
+		t.Fatal("Compile accepted a negative scan_lines")
+	}
+	// Compile refused it, so the rule is still uncompiled -- force the
+	// regex in the way a hand-built Spec would and confirm the walk is
+	// bounded rather than panicking.
+	s.Identity[0].regex = regexp.MustCompile(`(?P<host>\w+)`)
+	got := s.DiscoverIdentity("/var/log/a.log", []byte("web1 hello\n"))
+	if got["host"] != "web1" {
+		t.Fatalf("identity discovery returned %v, want host=web1", got)
+	}
+}
+
+// Only a pattern the matcher can never select is fatal. The advisory
+// findings describe a spec that works and declares more than it uses --
+// which is exactly what `identity:` and --label produce -- and failing on
+// them meant a correct spec could not pass `check`.
+func TestOnlyUnreachablePatternsAreFatal(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+defaults:
+  labels: [dc]
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    fields:
+      v: {kind: gauge}
+    patterns:
+      - set: s
+        search: 'x='
+        extract: ['x=(?P<v>\d+)']
+`)
+	lints := s.Lint()
+	if len(lints) == 0 {
+		t.Fatal("expected the undeclared operator label to be reported at all")
+	}
+	for _, l := range lints {
+		if l.Fatal() {
+			t.Fatalf("advisory finding %s is fatal, so a working spec fails `check`: %s", l.Code, l.Msg)
+		}
+	}
+	if Fatal(lints) {
+		t.Fatal("Fatal reported a fatal finding where there is none")
+	}
+}
+
+// A shadowed pattern is a broken spec: its destination set is never
+// written and nothing at run time says so.
+func TestUnreachablePatternIsFatal(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    fields:
+      v: {kind: gauge}
+      w: {kind: gauge}
+    patterns:
+      - set: a
+        search: 'x'
+        extract: ['x=(?P<v>\d+)']
+      - set: b
+        search: 'xy'
+        extract: ['xy=(?P<w>\d+)']
+`)
+	if !Fatal(s.Lint()) {
+		t.Fatal("a pattern the matcher can never select was not reported as fatal")
+	}
+}
+
+// A label the identity rules produce arrives on the stream, so declaring
+// it is not declaring something unused. The two hard-coded names that
+// used to stand in for this missed every other capture an identity regex
+// can make.
+func TestIdentityLabelsAreNotReportedUnused(t *testing.T) {
+	s := mustSpec(t, `
+version: 1
+identity:
+  - match_path: '(?P<cluster>[^/]+)/[^/]+\.log$'
+profiles:
+  - name: p
+    labels: [cluster]
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    fields:
+      v: {kind: gauge}
+    patterns:
+      - set: s
+        search: 'x='
+        extract: ['x=(?P<v>\d+)']
+`)
+	for _, l := range s.Lint() {
+		if l.Code == "L004" {
+			t.Fatalf("a label `identity:` supplies was reported unused: %s", l.Msg)
+		}
 	}
 }

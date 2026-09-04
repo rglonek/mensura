@@ -898,7 +898,7 @@ func (s *Store) retentionLoop() {
 // horizon. Dropping a whole shard is one range delete, not millions of
 // point tombstones.
 func (s *Store) RunRetention(now time.Time) (int, error) {
-	dropped := 0
+	dropped, forgotten := 0, 0
 	emptied := map[string]struct{}{}
 	for _, name := range s.db.Sets() {
 		i := strings.LastIndex(name, "@")
@@ -952,6 +952,18 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		// retention, was routed to the unsharded shard that the sweep
 		// skips, and was then kept forever with nothing saying so.
 		s.ForgetSet(logical)
+		forgotten++
+	}
+	// Persisted now rather than on the next 30-second tick, which is what
+	// the admin drop already does and for the same reason: a crash in
+	// that window brings the entry back, advertising fields and a time
+	// range whose shards have just been range-deleted. Logged rather than
+	// returned, so a failure to persist does not read as a failed sweep --
+	// the shards really are gone.
+	if forgotten > 0 {
+		if err := s.saveCatalogue(); err != nil {
+			s.cfg.Logger.Printf("ERROR saving catalogue after retention forgot %d set(s): %v", forgotten, err)
+		}
 	}
 	return dropped, nil
 }

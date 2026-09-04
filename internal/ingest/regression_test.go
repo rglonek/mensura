@@ -1411,3 +1411,262 @@ func TestReceivedLinesCountTheUnmatched(t *testing.T) {
 		t.Error("the response says how many were refused but not why")
 	}
 }
+
+// acceptingStore is a store that accepts everything, for tests that care
+// about the follower's bookkeeping rather than about delivery.
+func acceptingStore(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(wire.WriteResponse{})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newTestFollower(t *testing.T, dir string, opts FollowOptions) *follower {
+	t.Helper()
+	srv := acceptingStore(t)
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(srv.URL, "")
+	client.Compress = false
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	t.Cleanup(func() { _ = sink.Close(context.Background()) })
+	ing, err := New(Config{Spec: spec, Sink: sink, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("checkpoints: %v", err)
+	}
+	if opts.MaxRecordBytes == 0 {
+		opts.MaxRecordBytes = defaultMaxRecordBytes
+	}
+	return &follower{ing: ing, opts: opts, cps: cps,
+		tailers: map[string]*tailer{}, noProfile: map[string]time.Time{}}
+}
+
+// A followed file that is deleted has to be drained, closed and forgotten.
+// checkRotation has an unlink branch, but it is only reached for a path
+// still in the sweep -- and a deleted file is not, because Glob lists a
+// directory. So an ordinary deletion left the tailer in the map forever,
+// holding a descriptor on the unlinked inode, which keeps its blocks
+// allocated for the life of the process.
+func TestFollowRetiresATailerWhosePathIsGone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+	if err := os.WriteFile(path, []byte("1700000000000 n=1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f := newTestFollower(t, dir, FollowOptions{Paths: []string{filepath.Join(dir, "*.log")}})
+	if err := f.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(f.tailers) != 1 {
+		t.Fatalf("want 1 tailer after the first sweep, got %d", len(f.tailers))
+	}
+	tl := f.tailers[path]
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := f.poll(context.Background()); err != nil {
+		t.Fatalf("poll after deletion: %v", err)
+	}
+	if n := len(f.tailers); n != 0 {
+		t.Fatalf("%d tailer(s) still tracked after the file was deleted; its descriptor keeps the unlinked inode allocated", n)
+	}
+	if tl.file != nil {
+		t.Fatal("the deleted file's handle was never closed")
+	}
+}
+
+// The tail of a file that is unlinked while it is being followed still
+// belongs to the store: the bytes were written before the file went away,
+// and the open handle can still read them.
+func TestFollowDrainsADeletedFileBeforeRetiringIt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+	if err := os.WriteFile(path, []byte("1700000000000 n=1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f := newTestFollower(t, dir, FollowOptions{Paths: []string{filepath.Join(dir, "*.log")}})
+	if err := f.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	// Appended and then unlinked without another sweep in between, so the
+	// second record exists only behind the open handle.
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := fh.WriteString("1700000000001 n=2\n"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	_ = fh.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	before := f.ing.cfg.Progress.Snapshot().Records
+	if err := f.poll(context.Background()); err != nil {
+		t.Fatalf("poll after deletion: %v", err)
+	}
+	if got := f.ing.cfg.Progress.Snapshot().Records; got <= before {
+		t.Fatalf("the deleted file's tail was discarded: records went %d -> %d", before, got)
+	}
+}
+
+// While a rewind is owed the read head is stale: it is about to be seeked
+// back. Publishing it let a flush landing in that window snapshot and
+// commit an offset past the hole the rewind exists to re-read, so a crash
+// straight afterwards resumed past records that were never delivered.
+func TestARewindOwedFreezesThePublishedOffset(t *testing.T) {
+	tl := &tailer{cp: &Checkpoint{Stream: "s", Path: "p"}}
+	tl.reset(100)
+
+	// A dropped batch freezes it, then a later success thaws it and asks
+	// for a re-read from 100.
+	tl.inflight = 400
+	if !tl.markHoled() {
+		t.Fatal("a tailer with bytes in flight was not frozen by a dropped batch")
+	}
+	at, thawed := tl.clearHole()
+	if !thawed || at != 100 {
+		t.Fatalf("clearHole returned (%d, %v), want (100, true)", at, thawed)
+	}
+
+	// The read loop is mid-record and finishes it before it notices.
+	tl.setPending(400)
+	if got := tl.pendingOffsetForTest(); got != 100 {
+		t.Fatalf("pending advanced to %d while a rewind was owed", got)
+	}
+	// A flush lands in the window.
+	tl.markInflight()
+	if _, ok := tl.commitInflight(1); ok {
+		t.Fatal("a checkpoint was committed past the frozen offset while the rewind was still owed")
+	}
+	if got := tl.ackedOffset(); got != 100 {
+		t.Fatalf("acked moved to %d, past the hole", got)
+	}
+
+	// Once the seek has happened the tailer resumes normally.
+	if got, ok := tl.takeRewind(); !ok || got != 100 {
+		t.Fatalf("takeRewind returned (%d, %v), want (100, true)", got, ok)
+	}
+	tl.setPending(250)
+	tl.markInflight()
+	cp, ok := tl.commitInflight(2)
+	if !ok || cp.AckedOffset != 250 {
+		t.Fatalf("after the rewind the checkpoint is (%d, %v), want (250, true)", cp.AckedOffset, ok)
+	}
+}
+
+// The HTTP listener frames its body the way every other acquisition path
+// does. Splitting on "\n" made it the one path that ignored the record
+// cap, counted no truncation, and handed a newline-free body to the
+// profile's regexes whole.
+func TestHTTPLinesHonoursTheRecordCap(t *testing.T) {
+	srv := acceptingStore(t)
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(srv.URL, "")
+	client.Compress = false
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	// A cap small enough that the padded record below overruns it.
+	ing, err := New(Config{Spec: spec, Sink: sink, Log: testLogger{t}, ReadBufferBytes: 64})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	r := &receiver{ing: ing, opts: ReceiveOptions{Mode: "logs", Listener: "http"},
+		streams: map[string]*peerStream{}, allowed: map[string]struct{}{}, conns: make(chan struct{}, 1)}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.serveHTTP(ctx, ln) }()
+	defer func() { cancel(); <-done }()
+
+	body := "1700000000000 n=1 " + strings.Repeat("p", 4096) + "\n"
+	resp, err := http.Post("http://"+ln.Addr().String()+"/ingest/v1/lines", "text/plain", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post returned %d", resp.StatusCode)
+	}
+	if n := ing.Progress().Snapshot().OversizeRecords; n == 0 {
+		t.Fatal("a record past the cap was accepted whole: --max-record-bytes does not reach this listener and the truncation is uncounted")
+	}
+}
+
+// A .gz that will not open is reported, not answered with "no head, no
+// error" -- which sent the caller on to select a profile and discover
+// identity against an empty head before failing on the same file a moment
+// later for the same reason.
+func TestPeekReportsAGzipThatWillNotOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log.gz")
+	if err := os.WriteFile(path, []byte("this is not gzip at all"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, _, err := peek(path, 4096); err == nil {
+		t.Fatal("peek reported success for a .gz it could not decompress")
+	}
+	if _, _, err := SniffSource(path, 4096); err == nil {
+		t.Fatal("SniffSource reported success, so `check` predicts an import that cannot happen")
+	}
+}
+
+// The flag is named for turning host-key verification off, so it has to
+// turn it off. Merely omitting the strict setting fell back to the ssh
+// client's own default, which under the BatchMode=yes alongside it still
+// refuses an unknown host.
+func TestInsecureHostKeyReallyDisablesChecking(t *testing.T) {
+	strict := strings.Join(sshArgs(RemoteOptions{}), " ")
+	if !strings.Contains(strict, "StrictHostKeyChecking=yes") {
+		t.Fatalf("the default posture does not verify host keys: %s", strict)
+	}
+	loose := strings.Join(sshArgs(RemoteOptions{InsecureHostKey: true}), " ")
+	if !strings.Contains(loose, "StrictHostKeyChecking=no") {
+		t.Fatalf("--ssh-strict-host-key=false does not disable verification: %s", loose)
+	}
+}
+
+// Log is defaulted like every other optional field. It was the one that
+// was not, and the acquisition paths call it unconditionally.
+func TestNewDefaultsTheLogger(t *testing.T) {
+	srv := acceptingStore(t)
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	sink := NewSink(wire.NewClient(srv.URL, ""), DefaultSinkConfig(), testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if ing.cfg.Log == nil {
+		t.Fatal("Log was left nil, so the first skipped file panics")
+	}
+	// The path a nil logger used to panic on: an archive is skipped with
+	// a warning.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bundle.tar")
+	if err := os.WriteFile(path, []byte("not really a tar"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := ing.processFile(context.Background(), path); err != nil {
+		t.Fatalf("processFile: %v", err)
+	}
+}

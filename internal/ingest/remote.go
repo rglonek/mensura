@@ -425,7 +425,16 @@ func (o *remoteObserver) EndFlush(_ int, dropped bool) {
 // sshArgs builds the client arguments shared by every remote invocation.
 func sshArgs(opts RemoteOptions) []string {
 	args := []string{"-o", "BatchMode=yes"}
-	if !opts.InsecureHostKey {
+	if opts.InsecureHostKey {
+		// Turned off explicitly, not merely left unsaid. Omitting the
+		// strict setting fell back to the client's own default, which
+		// under the BatchMode=yes above still refuses an unknown host --
+		// so the flag named "insecure host key" disabled nothing, and the
+		// follow failed exactly where it was asked not to. The known-hosts
+		// file goes with it, or a host whose key has changed is still
+		// refused by a conflicting entry.
+		args = append(args, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null")
+	} else {
 		args = append(args, "-o", "StrictHostKeyChecking=yes")
 	}
 	if opts.Port > 0 {

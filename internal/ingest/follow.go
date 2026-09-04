@@ -142,9 +142,20 @@ type tailer struct {
 	rewind bool
 }
 
+// setPending publishes how far the reader has handed bytes to the sink.
+//
+// It does nothing while a rewind is owed. The read loop only tests
+// rewindOwed at the top of an iteration, so a hole that cleared mid-record
+// left it free to finish that record and publish a position past the
+// frozen offset -- and a flush landing in that window snapshotted the
+// advanced value and committed it, writing a checkpoint past the very
+// bytes the rewind exists to re-read. Those bytes are about to be read
+// again, so there is nothing here worth publishing.
 func (t *tailer) setPending(n int64) {
 	t.mu.Lock()
-	t.pending = n
+	if !t.rewind {
+		t.pending = n
+	}
 	t.mu.Unlock()
 }
 
@@ -156,9 +167,16 @@ func (t *tailer) setPending(n int64) {
 // live read offset after the write instead acknowledged bytes whose
 // samples were still buffered for the *next* batch, so a crash in that
 // window lost them.
+//
+// A tailer that owes a rewind snapshots nothing, for the reason setPending
+// publishes nothing: clearHole has already pulled inflight back to acked,
+// and leaving it there is what makes the commit below a no-op until the
+// re-read has actually happened.
 func (t *tailer) markInflight() {
 	t.mu.Lock()
-	t.inflight = t.pending
+	if !t.rewind {
+		t.inflight = t.pending
+	}
 	t.mu.Unlock()
 }
 
@@ -310,7 +328,45 @@ func (f *follower) poll(ctx context.Context) error {
 			continue
 		}
 	}
+	f.retireUnmatched(ctx, paths)
 	return firstErr
+}
+
+// retireUnmatched drains and closes the tailers of paths the glob no
+// longer returns.
+//
+// checkRotation has an unlink branch, but it is only reached for a path
+// that is still in the sweep -- and a deleted file is not, because Glob
+// lists a directory. So that branch only ever fired on the race between
+// the glob and the stat, and an ordinary deletion left the tailer in the
+// map forever: its descriptor stayed open, which keeps the unlinked
+// inode's blocks allocated for the life of the process, and its extractor
+// and buffers leaked with it. On a glob whose members come and go -- a
+// file per day, a file per instance -- that is a slow march to a full
+// disk and an exhausted descriptor table.
+//
+// The open handle is drained first, exactly as the unlink branch does: an
+// unlinked file still holds whatever was written before it went away.
+func (f *follower) retireUnmatched(ctx context.Context, matched map[string]struct{}) {
+	f.mu.Lock()
+	var stale []*tailer
+	for path, t := range f.tailers {
+		if _, ok := matched[path]; ok || t == nil {
+			continue
+		}
+		stale = append(stale, t)
+	}
+	f.mu.Unlock()
+	// Retired in a stable order so a sweep that retires several is
+	// readable in the log.
+	sort.Slice(stale, func(i, j int) bool { return stale[i].path < stale[j].path })
+	for _, t := range stale {
+		f.ing.cfg.Log.Printf("INFO %s no longer matches any followed pattern; draining and closing it", t.path)
+		if err := f.read(ctx, t); err != nil {
+			f.ing.cfg.Log.Printf("WARNING draining %s before retiring it: %v", t.path, err)
+		}
+		f.retire(ctx, t)
+	}
 }
 
 func (f *follower) ensure(path string) (*tailer, error) {

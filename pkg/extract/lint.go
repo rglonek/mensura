@@ -2,6 +2,7 @@ package extract
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -29,6 +30,30 @@ func (l Lint) String() string {
 	return fmt.Sprintf("%s: profile %s: %s", l.Code, l.Profile, l.Msg)
 }
 
+// Fatal reports whether a finding describes a spec that cannot do what it
+// says, as opposed to one that works but declares more than it uses.
+//
+// The distinction is the difference between a pipeline that stops and one
+// that ships. L001 is a pattern the matcher can never select, so a whole
+// destination set is never written: that is a broken spec. The rest are
+// advisory -- a capture with no `fields:` entry still lands, as an untyped
+// gauge, and a declared label that no pattern captures is exactly what
+// `identity:` and --label produce. `check` used to exit non-zero on all
+// four alike, so declaring the operator label the README's own example
+// passes (`--label dc=eu-west-1`) in `defaults.labels` failed the build --
+// with a message that itself said the label needs no declaration.
+func (l Lint) Fatal() bool { return l.Code == "L001" }
+
+// Fatal reports whether any finding in a set is fatal.
+func Fatal(lints []Lint) bool {
+	for _, l := range lints {
+		if l.Fatal() {
+			return true
+		}
+	}
+	return false
+}
+
 // Lint reports the spec problems that Compile deliberately does not
 // refuse: a pattern that can never be reached, and a capture or a field
 // declaration that does not resolve to anything.
@@ -40,10 +65,36 @@ func (l Lint) String() string {
 //
 // The spec must already have been compiled; Load and Parse both do that.
 func (s *Spec) Lint() []Lint {
+	// The names `identity:` attaches are resolved once for the whole
+	// document: they arrive on the stream rather than off a record, so a
+	// profile declaring one is not declaring something unused. Deriving
+	// them from the rules beats the two hard-coded names that used to
+	// stand in for the whole idea.
+	stream := s.identityLabels()
 	var out []Lint
 	for _, p := range s.Profiles {
 		out = append(out, p.lintUnreachablePatterns()...)
-		out = append(out, p.lintCaptures()...)
+		out = append(out, p.lintCaptures(stream)...)
+	}
+	return out
+}
+
+// identityLabels lists the label names the `identity:` rules can produce,
+// plus the two the acquisition layer always attaches.
+func (s *Spec) identityLabels() map[string]struct{} {
+	out := map[string]struct{}{"host": {}, "source": {}}
+	for i := range s.Identity {
+		r := &s.Identity[i]
+		for _, re := range []*regexp.Regexp{r.matchPath, r.regex} {
+			if re == nil {
+				continue
+			}
+			for _, name := range re.SubexpNames() {
+				if name != "" {
+					out[name] = struct{}{}
+				}
+			}
+		}
 	}
 	return out
 }
@@ -92,7 +143,7 @@ func (p *Profile) lintUnreachablePatterns() []Lint {
 // lintCaptures reports captures and field declarations that do not
 // resolve: a capture that is neither a declared label nor a declared
 // field, and a declared field that no pattern ever captures.
-func (p *Profile) lintCaptures() []Lint {
+func (p *Profile) lintCaptures(streamLabels map[string]struct{}) []Lint {
 	var out []Lint
 	captured := map[string]struct{}{}
 	for _, pat := range p.Patterns {
@@ -172,7 +223,7 @@ func (p *Profile) lintCaptures() []Lint {
 		// A stream label supplied by identity discovery or by --label is
 		// attached by the sink and never captured here, so this is only
 		// reported when the name is not one of those either.
-		if isStreamLabel(name) {
+		if _, ok := streamLabels[name]; ok {
 			continue
 		}
 		out = append(out, Lint{
@@ -192,10 +243,4 @@ func removeName(names []string, drop string) []string {
 		}
 	}
 	return out
-}
-
-// isStreamLabel reports whether a name is one the acquisition layer
-// attaches to every sample regardless of the patterns.
-func isStreamLabel(name string) bool {
-	return name == "host" || name == "source"
 }

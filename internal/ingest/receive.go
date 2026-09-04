@@ -493,6 +493,11 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 // one per byte count.
 var errRecordCutShort = errors.New("the connection ended mid-record; the fragment was discarded rather than extracted from half a line")
 
+// maxHTTPBodyBytes bounds one request body on the HTTP listener. The
+// records inside it are bounded separately, by the same record cap every
+// other acquisition path applies.
+const maxHTTPBodyBytes = 32 << 20
+
 // connIdleTimeout is how long a TCP sender may go silent before its
 // connection is closed. A live log stream is nowhere near this quiet.
 const connIdleTimeout = 15 * time.Minute
@@ -568,34 +573,47 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		// Framed through readRecord, like every other acquisition path.
+		// Splitting the body on "\n" made this the one listener that did
+		// not share the framing: --max-record-bytes was silently ignored
+		// here, nothing counted a truncation, and a newline-free body
+		// became a single record of up to maxHTTPBodyBytes handed whole
+		// to the profile's regexes.
+		br := bufio.NewReaderSize(io.LimitReader(req.Body, maxHTTPBodyBytes), 64<<10)
 		n, refused := 0, 0
 		var reason string
-		for _, line := range strings.Split(string(body), "\n") {
-			line = strings.TrimRight(line, "\r")
-			if line == "" {
-				continue
+		for {
+			rec, rerr := readRecord(br, r.ing.cfg.ReadBufferBytes)
+			if rec.Oversize {
+				r.ing.cfg.Progress.OversizeRecord()
 			}
-			unusable, err := r.handleRecordOutcome(req.Context(), peer, line)
-			switch {
-			case err != nil:
-				refused++
-				if reason == "" {
-					reason = err.Error()
+			// A trailing record with no newline is still a record: the
+			// body ended, so nothing more is coming for it.
+			if len(rec.Line) > 0 {
+				unusable, err := r.handleRecordOutcome(req.Context(), peer, string(rec.Line))
+				switch {
+				case err != nil:
+					refused++
+					if reason == "" {
+						reason = err.Error()
+					}
+				case unusable:
+					// The spec read nothing out of it: no pattern matched, or
+					// no timestamp, or no join rule claimed it.
+					refused++
+					if reason == "" {
+						reason = "the spec extracted nothing from the record"
+					}
+				default:
+					n++
 				}
-			case unusable:
-				// The spec read nothing out of it: no pattern matched, or
-				// no timestamp, or no join rule claimed it.
-				refused++
-				if reason == "" {
-					reason = "the spec extracted nothing from the record"
+			}
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					http.Error(w, rerr.Error(), http.StatusBadRequest)
+					return
 				}
-			default:
-				n++
+				break
 			}
 		}
 		// The denominator, not just the successes: a spec that matches
@@ -622,7 +640,7 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
-		if err := json.NewDecoder(io.LimitReader(req.Body, 32<<20)).Decode(&body); err != nil {
+		if err := json.NewDecoder(io.LimitReader(req.Body, maxHTTPBodyBytes)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

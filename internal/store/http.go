@@ -298,7 +298,21 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 		writeErr(w, http.StatusServiceUnavailable, "write queue is full")
 		return
 	}
-	resp, err := a.store.Write(&req, r.Header.Get("Idempotency-Key"), client)
+	// A client name is only an identity when something actually checked
+	// it. With auth.mode: none -- the documented loopback posture, and
+	// what the quick start runs -- authorise answers "anonymous" for
+	// every caller, and Write stamps that onto the ingest-progress set in
+	// place of whatever the ingester sent. So every ingester against a
+	// loopback store reported under one name, --client-name did nothing,
+	// and two of them collapsed into a single series whose counters
+	// interleave and read as a counter reset on every scrape. Passing an
+	// empty name here leaves the sample's own client label alone, which
+	// is the only honest source when the store cannot tell callers apart.
+	identified := client
+	if a.cfg.AuthMode != "bearer" {
+		identified = ""
+	}
+	resp, err := a.store.Write(&req, r.Header.Get("Idempotency-Key"), identified)
 	if err != nil {
 		a.writeErrs.Add(1)
 		// A fault in what the client sent is a 400, not a 500. The client

@@ -903,16 +903,27 @@ dead: its destination set is never written, and nothing at run time says
 so, because the record did match something. An empty `search` is the
 extreme case and shadows every pattern after it.
 
-`Spec.Lint` reports four codes, and `check` exits non-zero when any fire,
-so a spec with a dead pattern fails the pipeline that runs it instead of
-shipping:
+`Spec.Lint` reports four codes, split by `Lint.Fatal()` into the one that
+describes a broken spec and the three that describe a working one that
+declares more than it uses. `check` prints both, under separate headings,
+and exits non-zero only on the fatal one — so a spec with a dead pattern
+fails the pipeline that runs it instead of shipping, while a spec that
+merely names its operator labels does not:
 
-| Code | Meaning |
-| --- | --- |
-| `L001` | a pattern that can never be reached, naming the one that shadows it |
-| `L002` | a capture that is neither a declared label nor a `fields:` entry, so it lands as an untyped gauge |
-| `L003` | a `fields:` declaration no pattern captures, so its metadata reaches no column |
-| `L004` | a declared label no pattern captures and that is not a stream label |
+| Code | Fatal | Meaning |
+| --- | --- | --- |
+| `L001` | yes | a pattern that can never be reached, naming the one that shadows it |
+| `L002` | no | a capture that is neither a declared label nor a `fields:` entry, so it lands as an untyped gauge |
+| `L003` | no | a `fields:` declaration no pattern captures, so its metadata reaches no column |
+| `L004` | no | a declared label no pattern captures and that is not a stream label |
+
+Failing on all four alike was wrong in a way the L004 text said out loud:
+its own message ends "if it comes from `identity:` or --label it is
+attached by the stream and needs no declaration here", and declaring such
+a label in `defaults.labels` — which is where the documentation puts it —
+then failed the build. The stream labels L004 exempts are also derived
+from the `identity:` rules' own capture names rather than being the two
+hard-coded `host` and `source`.
 
 Three related wirings are decidable from the spec alone and are now
 compile errors rather than per-record failures: an `aggregate.on` key that
@@ -1130,6 +1141,14 @@ when it stops.
   `--idle-flush`, `--max-record-bytes` (shared by every path),
   `--max-connections`, `--peer-idle`. A real knob an operator cannot reach
   is the mirror image of the config keys this codebase refuses by name.
+- `SinkConfig` is reachable for the same reason: `--batch-size`,
+  `--batch-bytes`, `--flush-interval`, `--max-buffered-samples` and
+  `--max-fatal-drops`. These decide how large a body the ingester
+  presents and how much of a store outage it survives before it starts
+  dropping, and `setup()` used to pass `DefaultSinkConfig()` verbatim, so
+  every documented trade-off was the library's to make and not the
+  operator's. Zero leaves the built-in, as it does for
+  `--max-record-bytes`; a negative `--max-fatal-drops` never gives up.
 - `Value.UnmarshalJSON` decodes strictly. A custom unmarshaller replaces
   the outer decoder's settings, so `handleWrite`'s `DisallowUnknownFields`
   stopped at the edge of a field value and `{"i":1,"flaot":2}` was
@@ -1259,6 +1278,99 @@ codebase had already been moved away from:
   `SIGTERM` reached nothing in proxy mode.
 - `Progress.AddBytes` was the only thing that incremented the record
   counter, which its name did not say. It is `AddRecord`.
+
+### 6.62 A deleted followed file is retired
+
+`poll` builds its work list from `filepath.Glob` and visits only the paths
+that match now, and `retire` — which closes the handle and forgets the
+tailer — was reachable only from `checkRotation`, which only runs for a
+path in that list. A deleted file is not in it, because `Glob` lists a
+directory. So `checkRotation`'s `os.IsNotExist` branch, and the "drain to
+EOF, close, wait for the path to reappear" row in [02](02-ingest.md) §9,
+only ever fired on the race between the glob and the stat.
+
+An ordinary deletion instead left the tailer in the map for the life of
+the process: its descriptor kept the unlinked inode's blocks allocated —
+the `df` full / `du` empty incident — and its extractor and buffers leaked
+with it. On a glob whose members come and go (a file per day, a file per
+instance) that accumulates. `poll` now retires every tailer whose path the
+sweep no longer matched, draining the open handle first, because an
+unlinked file still holds whatever was written before it went away.
+
+### 6.63 A rewind freezes the offset the checkpoint may reach
+
+`clearHole` runs on whichever goroutine flushed — the sink's own flush
+loop as well as the poll goroutine — and pulls `pending`/`inflight` back
+to `acked`, but the seek itself waits for the poll goroutine's next
+`applyRewind`. `read` tests `rewindOwed` only at the top of an iteration,
+so a hole that cleared mid-record left it free to finish that record and
+publish a position past the frozen offset; a flush landing in that window
+snapshotted the advanced value and committed it, writing a checkpoint past
+the very bytes the freeze exists to re-read. It self-heals in memory —
+`applyRewind` resets the offsets and the re-read re-advances them — so the
+exposure was a crash in the window, which is the likeliest moment for one,
+since the hole was caused by the store being unavailable in the first
+place. `setPending` and `markInflight` now do nothing while a rewind is
+owed.
+
+### 6.64 The store stamps a client name only when it verified one
+
+`Write` overwrites the ingester's own `client` label on `_mensura_ingest`
+with the HTTP layer's client name. With `auth.mode: none` — the documented
+loopback posture, and what the quick start runs — `authorise` answers
+`"anonymous"` for every caller, so every ingester reported under one name,
+`--client-name` did nothing, and two ingesters against one store collapsed
+into a single series whose counters interleave and read as a counter reset
+on every scrape. The name is passed through only under `auth.mode: bearer`,
+where something actually checked it; otherwise the sample's own label
+stands, which is what [05](05-storage.md) §7 describes.
+
+### 6.65 The HTTP `lines` listener frames like every other path
+
+`POST /ingest/v1/lines` split its body on `"\n"` instead of going through
+`readRecord`, so it was the one acquisition path that ignored the record
+cap: `--max-record-bytes` did not reach it, no counter moved for a
+truncation, and a newline-free body became a single record of up to 32 MiB
+handed whole to the profile's regexes. It reads through `readRecord` now,
+against the same cap, and counts oversize records like the rest.
+
+### 6.66 Smaller corrections
+
+- A set that already holds rows cannot gain its first indexed column.
+  Every scan of an indexed set is bounded to the `I/` prefix, so promoting
+  one made the rows already under `D/` unreachable by any query and
+  invisible to retention — the same silent orphaning `PutBatch` refuses a
+  timestamp-less row to avoid. A set with nothing in it may still be
+  promoted, so "declare, then write" is untouched.
+- `PutBatch` derives a column's type from the widest value in the batch,
+  not from whichever row the map walk reached first. A column arriving as
+  an int in one row and a float in the next was registered as `int64`, so
+  the schema disagreed with the payloads stored under it and `setLocked`'s
+  own int-to-float widening never fired.
+- An empty `OR` evaluates to false. False is the identity of the operator;
+  returning true *widened* the query rather than narrowing it, which is
+  the one failure mode a predicate must never have.
+- `RunRetention` persists the catalogue as soon as it forgets a set, as
+  the admin drop already did. Waiting for the 30-second tick meant a crash
+  in that window brought the entry back, advertising fields and a time
+  range whose shards had just been range-deleted.
+- `seriesName` renders every `BY` slot, including one whose label the row
+  did not carry. Dropping those collapsed the legend onto fewer slots than
+  the grouping key has, so `{host: "a"}` and `{pool: "a"}` under
+  `BY host, pool` were two series by `seriesKey` and drew as two lines
+  both labelled `a`. An absent slot renders as `<label>=`.
+- `peek` reports a `.gz` it cannot open instead of answering "no head, no
+  error", which sent the caller on to select a profile and discover
+  identity against an empty head before failing on the same file a moment
+  later for the same reason.
+- `--ssh-strict-host-key=false` sets `StrictHostKeyChecking=no` rather
+  than merely omitting the strict setting, which fell back to a client
+  default that the `BatchMode=yes` alongside it still refuses — so the
+  flag named for turning verification off turned nothing off.
+- `ingest.Config.Log` is defaulted like every other optional field. It was
+  the one that was not, and the acquisition paths call it unconditionally,
+  so a caller that filled in everything else got a nil-interface panic on
+  the first skipped file.
 
 ## 7. Known gaps worth naming
 
