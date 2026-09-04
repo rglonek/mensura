@@ -32,9 +32,10 @@ type RemoteOptions struct {
 	// StartAt is "checkpoint" (default), "beginning" or "end", the same
 	// three choices the local follower offers.
 	StartAt string
-	// ProbeInterval is how often the remote file's size is re-checked.
-	// Rotation cannot be observed directly over a tail, so it is inferred
-	// from the file becoming shorter than the bytes already read.
+	// ProbeInterval is how often the remote file is re-checked. Rotation
+	// cannot be observed directly over a tail, so it is inferred from the
+	// file becoming shorter than the bytes already read, or from its
+	// inode changing under the same name.
 	ProbeInterval time.Duration
 	// MaxRecordBytes bounds one record, so a newline-free remote file
 	// cannot be read into memory in one piece.
@@ -143,6 +144,12 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		progress.set(off)
 		save(off)
 	}
+	saveIdentity := func(ident string) {
+		snap := box.setIdentity(ident)
+		if err := cps.Save(&snap); err != nil {
+			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+		}
+	}
 	// startAtPending records that --start-at has not been honoured yet.
 	// The flag used to be accepted on the command line and ignored on
 	// this path entirely, so `--start-at end` against a remote host
@@ -160,15 +167,19 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 			resetTo(0)
 			startAtPending = false
 		}
-		// The size is the only rotation signal this path has. A file
-		// shorter than what has already been read was truncated,
-		// copytruncated or replaced, and resuming at the stored byte
-		// offset would seek past the whole of the new one.
-		if size, serr := i.remoteSize(ctx, opts, path); serr != nil {
+		// A file shorter than what has already been read was truncated
+		// or copytruncated, and resuming at the stored byte offset would
+		// seek past the whole of the new one. A file whose identity has
+		// changed was renamed away and re-created, and its length says
+		// nothing at all -- a replacement that has already grown past
+		// the acknowledged offset looks perfectly healthy by size.
+		size, ident, serr := i.remoteStat(ctx, opts, path)
+		if serr != nil {
 			// The probe is retried on the next pass rather than treated
 			// as an answer; startAtPending stays set until it succeeds.
-			i.cfg.Log.Printf("WARNING cannot size %s: %v", target, serr)
+			i.cfg.Log.Printf("WARNING cannot stat %s: %v", target, serr)
 		} else {
+			known := box.identity()
 			switch {
 			case startAtPending:
 				// Only when there is no checkpoint, which is what the
@@ -178,9 +189,18 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 				// the identical local command resumed.
 				resetTo(size)
 				startAtPending = false
-			case size < progress.ackedOffset():
-				i.cfg.Log.Printf("INFO %s was truncated or rotated; re-reading from the start", target)
+			case ident != "" && known != "" && ident != known:
+				i.cfg.Log.Printf("INFO %s has been replaced by a new file; re-reading from the start", target)
 				resetTo(0)
+			case size < progress.ackedOffset():
+				i.cfg.Log.Printf("INFO %s was truncated; re-reading from the start", target)
+				resetTo(0)
+			}
+			// Recorded on the checkpoint, so a rotation that happens
+			// while this process is down is seen on the next start
+			// rather than resumed into at an offset that means nothing.
+			if ident != "" && ident != known {
+				saveIdentity(ident)
 			}
 		}
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
@@ -189,10 +209,11 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		err = i.runRemoteTail(ctx, opts, path, target, ex, labels, progress)
+		err = i.runRemoteTail(ctx, opts, path, target, ex, labels, progress, box.identity())
 		if flushed := ex.Flush(); len(flushed) > 0 {
 			flushSeq++
 			pos := flushPos(flushSeq)
+			i.cfg.Progress.AddSamples(int64(len(flushed)))
 			for n, r := range flushed {
 				_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
 			}
@@ -233,6 +254,25 @@ func (b *checkpointBox) ackedOffset() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.cp.AckedOffset
+}
+
+// identity is the remote file this checkpoint's offsets belong to. It is
+// held in the same field a local follow keeps its content fingerprint in:
+// both answer "are these offsets still about this file?".
+func (b *checkpointBox) identity() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cp.Fingerprint
+}
+
+// setIdentity records the file the offsets now belong to and returns the
+// record to persist.
+func (b *checkpointBox) setIdentity(ident string) Checkpoint {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cp.Fingerprint = ident
+	b.cp.UpdatedUnix = time.Now().Unix()
+	return *b.cp
 }
 
 // remoteProgress carries a remote tail's byte position between the reader
@@ -396,30 +436,49 @@ func sshDest(opts RemoteOptions) string {
 	return opts.Host
 }
 
-// remoteSize reports the current length of a remote file.
+// remoteStat reports the current length of a remote file and an identity
+// for the file itself.
 //
-// It is what stands in for the local follower's fingerprint: a tail cannot
-// report that the file underneath it was replaced, and the byte offsets
-// this path checkpoints are meaningless once it has been. A file shorter
-// than what has already been read is the observable signature of a
-// truncate, a copytruncate or a rotation, and `wc -c` needs no GNU
-// coreutils on the far end.
-func (i *Ingest) remoteSize(ctx context.Context, opts RemoteOptions, path string) (int64, error) {
-	args := append(sshArgs(opts), sshDest(opts), "wc -c < "+shellQuote(path))
+// Together they stand in for the local follower's fingerprint: a tail
+// cannot report that the file underneath it was replaced, and the byte
+// offsets this path checkpoints are meaningless once it has been.
+//
+// A file shorter than what has already been read is the signature of a
+// truncate or a copytruncate. It is not the signature of a rename-and-
+// create rotation, which is the common one: `tail -F` follows the new
+// file while the offsets keep climbing from the old, so by the time the
+// next probe runs the replacement has often already grown past the
+// acknowledged offset and the size test sees nothing wrong. The inode
+// does: `ls -Li` is POSIX, needs no GNU coreutils on the far end, and
+// dereferences a symlinked log path the way tail does. A host whose ls
+// cannot answer leaves the identity empty, which is exactly the
+// size-only behaviour this path had before.
+func (i *Ingest) remoteStat(ctx context.Context, opts RemoteOptions, path string) (int64, string, error) {
+	q := shellQuote(path)
+	args := append(sshArgs(opts), sshDest(opts), "wc -c < "+q+"; ls -Li "+q+" 2>/dev/null || true")
 	cmd := exec.CommandContext(ctx, opts.SSHBinary, args...)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return 0, fmt.Errorf("%w: %s", err, msg)
+			return 0, "", fmt.Errorf("%w: %s", err, msg)
 		}
-		return 0, err
+		return 0, "", err
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(out.String()), 10, 64)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	n, err := strconv.ParseInt(strings.TrimSpace(lines[0]), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("unreadable size %q", strings.TrimSpace(out.String()))
+		return 0, "", fmt.Errorf("unreadable size %q", strings.TrimSpace(lines[0]))
 	}
-	return n, nil
+	ident := ""
+	if len(lines) > 1 {
+		if f := strings.Fields(lines[1]); len(f) > 0 {
+			if _, perr := strconv.ParseInt(f[0], 10, 64); perr == nil {
+				ident = "ino:" + f[0]
+			}
+		}
+	}
+	return n, ident, nil
 }
 
 // runRemoteTail streams one connection's worth of bytes, publishing the
@@ -430,7 +489,7 @@ func (i *Ingest) remoteSize(ctx context.Context, opts RemoteOptions, path string
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress) error {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) error {
 	args := sshArgs(opts)
 	dest := sshDest(opts)
 	start := progress.ackedOffset()
@@ -479,12 +538,25 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 				return
 			case <-t.C:
 				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				size, serr := i.remoteSize(sctx, opts, path)
+				size, now, serr := i.remoteStat(sctx, opts, path)
 				cancel()
-				if serr != nil || size >= progress.pendingOffset() {
+				if serr != nil {
 					continue
 				}
-				i.cfg.Log.Printf("INFO %s is shorter than the bytes already read; reconnecting from the start", target)
+				switch {
+				case now != "" && ident != "" && now != ident:
+					// tail -F is already following the replacement while
+					// the offsets here keep climbing from the file it
+					// left, so the acknowledged offset is drifting into
+					// a file that never held those bytes. Only the size
+					// used to be watched, which misses this entirely
+					// once the new file is longer than the old offset.
+					i.cfg.Log.Printf("INFO %s has been replaced by a new file; reconnecting from the start", target)
+				case size < progress.pendingOffset():
+					i.cfg.Log.Printf("INFO %s is shorter than the bytes already read; reconnecting from the start", target)
+				default:
+					continue
+				}
 				_ = cmd.Process.Kill()
 				return
 			}
@@ -514,6 +586,7 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 			i.cfg.Progress.AddBytes(int64(rec.Consumed))
 			results, perr := ex.Process(string(rec.Line))
 			i.recordOutcome(perr)
+			i.cfg.Progress.AddSamples(int64(len(results)))
 			for n, res := range results {
 				if aerr := i.cfg.Sink.Add(ctx, res, labels, keyHint(target, offsetPos(recStart), n)); aerr != nil {
 					_ = cmd.Process.Kill()

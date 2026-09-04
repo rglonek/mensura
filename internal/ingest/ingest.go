@@ -279,6 +279,11 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		return err
 	}
 	i.cfg.Sink.DeclareFields(profile)
+	// Deferred, so a read error part-way through a file still contributes
+	// its sample of unmatched lines -- the output this code goes out of
+	// its way elsewhere to preserve, and exactly what an operator needs
+	// when a file fails to import cleanly.
+	defer i.cfg.Progress.MergeStream(&stream.Stats)
 
 	rc, err := openRecords(path)
 	if err != nil {
@@ -315,6 +320,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			i.cfg.Progress.AddBytes(int64(rec.Consumed))
 			results, err := stream.Process(string(rec.Line))
 			i.recordOutcome(err)
+			i.cfg.Progress.AddSamples(int64(len(results)))
 			for n, r := range results {
 				if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, offsetPos(recStart), n)); err != nil {
 					return err
@@ -328,12 +334,13 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			return rerr
 		}
 	}
-	for n, r := range stream.Flush() {
+	flushed := stream.Flush()
+	i.cfg.Progress.AddSamples(int64(len(flushed)))
+	for n, r := range flushed {
 		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, flushPos(0), n)); err != nil {
 			return err
 		}
 	}
-	i.cfg.Progress.MergeStream(&stream.Stats)
 	return nil
 }
 

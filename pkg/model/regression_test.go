@@ -106,3 +106,20 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// The write API decodes with DisallowUnknownFields so a typo fails loudly,
+// but Value has a custom unmarshaller, and a custom unmarshaller replaces
+// the outer decoder's settings. Plain json.Unmarshal inside it meant an
+// extra key inside a field value was dropped in silence.
+func TestValueRejectsUnknownKeys(t *testing.T) {
+	var v Value
+	if err := json.Unmarshal([]byte(`{"i":1,"flaot":2}`), &v); err == nil {
+		t.Fatal("a misspelled key inside a field value was accepted and dropped")
+	}
+	if err := json.Unmarshal([]byte(`{"i":1}`), &v); err != nil {
+		t.Fatalf("a well-formed value was refused: %v", err)
+	}
+	if v.T != TypeInt || v.I != 1 {
+		t.Fatalf("decoded to %+v", v)
+	}
+}

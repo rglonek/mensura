@@ -231,9 +231,16 @@ func Series(points []Point, spec Spec, window int64) []Output {
 	// at the moment the cadence was first missed, and only if it is
 	// strictly later than everything already emitted, because points must
 	// stay strictly increasing in time (C1).
-	if spec.GapMs != 0 && spec.EndMs > 0 && lastPointTime != -1 && spec.EndMs-lastPointTime > spec.GapMs {
+	//
+	// A series that emitted nothing gets nothing. lastPointTime is set
+	// before the DELTA and RATE stages consume the first sample, so a
+	// series holding a single sample used to render as one lone null: a
+	// break drawn just after a moment when data did arrive, whose real
+	// cause is that a rate needs two samples. Saying nothing is the
+	// honest answer.
+	if len(out) > 0 && spec.GapMs != 0 && spec.EndMs > 0 && lastPointTime != -1 && spec.EndMs-lastPointTime > spec.GapMs {
 		at := lastPointTime + spec.GapMs
-		if len(out) == 0 || at > out[len(out)-1].TSMs {
+		if at > out[len(out)-1].TSMs {
 			out = append(out, Output{TSMs: at, Null: true})
 		}
 	}

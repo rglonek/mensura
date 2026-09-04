@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rglonek/mensura/pkg/extract"
 )
 
 const testSpec = `
@@ -57,5 +59,45 @@ func TestInvalidOperatorLabelsAreRefusedAtStartup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// `check` predicts what the import will do, so it has to select a profile
+// the way the import does: processFile passes the operator labels, and
+// checkSample passed nil, so a profile chosen by select.label_equals could
+// never match and the tool reported "no profile matched" for a spec that
+// works.
+func TestCheckSelectsOnOperatorLabels(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: prod
+    select:
+      label_equals: {env: prod}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: app
+        search: "n="
+        extract: ['n=(?P<n>\d+)']
+`
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(specPath, []byte(spec), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	sample := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(sample, []byte("1756382400000 n=1\n"), 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
+	s, err := extract.Load(specPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := checkSample(s, sample, nil, false); err == nil {
+		t.Fatal("a label-selected profile matched with no labels supplied")
+	}
+	if err := checkSample(s, sample, map[string]string{"env": "prod"}, false); err != nil {
+		t.Fatalf("--label did not reach profile selection: %v", err)
 	}
 }

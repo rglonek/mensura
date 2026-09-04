@@ -17,7 +17,7 @@ import (
 // what it did not, and the first lines it could not handle. Unmatched
 // lines are the single most useful spec-debugging output there is, so they
 // are printed rather than counted silently.
-func checkSample(spec *extract.Spec, path string, verbose bool) error {
+func checkSample(spec *extract.Spec, path string, labels map[string]string, verbose bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -30,13 +30,18 @@ func checkSample(spec *extract.Spec, path string, verbose bool) error {
 	head := make([]byte, 64<<10)
 	n, _ := f.ReadAt(head, 0)
 
-	profile := spec.SelectProfile(path, head[:n], nil, "")
+	// The operator labels are passed exactly as processFile passes
+	// i.cfg.Labels. Selecting with nil meant a profile chosen by
+	// select.label_equals could never match here, so the tool whose job
+	// is to predict what the import will do answered "no profile matched"
+	// for a spec the import handles.
+	profile := spec.SelectProfile(path, head[:n], labels, "")
 	if profile == nil {
 		return fmt.Errorf("no profile matched %s: add a select: rule, or a default profile", path)
 	}
 	fmt.Printf("\nsample %s matched profile %q\n", path, profile.Name)
-	if labels := spec.DiscoverIdentity(path, head[:n]); len(labels) > 0 {
-		fmt.Printf("discovered identity: %v\n", labels)
+	if found := spec.DiscoverIdentity(path, head[:n]); len(found) > 0 {
+		fmt.Printf("discovered identity: %v\n", found)
 	}
 
 	stream, err := spec.NewStream(profile, extract.StreamOptions{RefTime: info.ModTime()})

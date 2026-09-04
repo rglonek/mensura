@@ -147,6 +147,16 @@ type fieldEntry struct {
 	LastSeenMs  int64      `json:"last_seen_ms,omitempty"`
 }
 
+// staleAfter is how long a field may go unseen before a query that reads
+// it is worth a warning.
+const staleAfter = 7 * 24 * time.Hour
+
+// stale reports whether the field has not been written recently. A field
+// that was never observed has no age, so it is never stale.
+func (f fieldEntry) stale() bool {
+	return f.LastSeenMs > 0 && time.Since(time.UnixMilli(f.LastSeenMs)) > staleAfter
+}
+
 // dictionary is the string-to-index map for one label key. The store owns
 // it because with many independent ingesters a single writer is the only
 // way to keep indices consistent without a coordination protocol.
@@ -480,6 +490,16 @@ func (s *Store) loadDictionaries() error {
 		}
 		d.index = make(map[string]int32, len(d.Entries))
 		for i, e := range d.Entries {
+			// An empty entry is a hole left by a lost record, not a
+			// value. Indexing it made lookup(key, "") answer with the
+			// hole's position, so a query lowering label = "" produced
+			// Eq(label, <hole>) instead of the constant-false plus W201
+			// that an unknown value gets. Nothing may intern one --
+			// ValidateLabelValue refuses it on the write side -- so the
+			// entry can only ever be a hole.
+			if e == "" {
+				continue
+			}
 			d.index[e] = int32(i)
 		}
 		s.dict[strings.TrimPrefix(k, dictPackedPrefix)] = &d
@@ -504,6 +524,9 @@ func (s *Store) loadDictionaries() error {
 			d.Entries = append(d.Entries, "")
 		}
 		d.Entries[idx] = v
+		if v == "" {
+			continue
+		}
 		if _, dup := d.index[v]; !dup {
 			d.index[v] = idx
 		}
@@ -937,7 +960,7 @@ func (sc Schema) Field(set, field string) (mql.FieldInfo, bool) {
 		Kind: f.Kind, Unit: f.Unit, UnitHint: f.UnitHint, Description: f.Description,
 		MaxInterval: f.MaxInterval, LimitMin: f.LimitMin, LimitMax: f.LimitMax,
 		BucketSet: f.BucketSet, BucketIndex: f.BucketIndex, BucketEdge: f.BucketEdge,
-		Stale: f.LastSeenMs > 0 && time.Since(time.UnixMilli(f.LastSeenMs)) > 7*24*time.Hour,
+		Stale: f.stale(),
 	}, true
 }
 
@@ -1022,6 +1045,13 @@ func (s *Store) Catalogue() wire.Catalogue {
 				Kind: fe.Kind, Unit: fe.Unit, UnitHint: fe.UnitHint, Description: fe.Description,
 				MaxInterval: fe.MaxInterval, LimitMin: fe.LimitMin, LimitMax: fe.LimitMax,
 				BucketSet: fe.BucketSet, BucketIndex: fe.BucketIndex, BucketEdge: fe.BucketEdge,
+				// Computed here as well as in Schema.Field, because this
+				// is the form that travels over the wire: a proxy-mode
+				// plugin validates against the catalogue it fetched, so
+				// leaving it out meant the same query answered W203
+				// "field has not been seen recently" under mode: plugin
+				// and nothing at all under mode: proxy.
+				Stale: fe.stale(),
 			}
 		}
 		for l := range e.Labels {

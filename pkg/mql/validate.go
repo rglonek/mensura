@@ -239,6 +239,15 @@ func arms(e Expr) int {
 	return n
 }
 
+// validateArm validates one arm of a compound predicate, where an empty
+// node is a fault rather than the absence of a predicate.
+func validateArm(q *Query, e Expr, s Schema, warns *[]Diag, parent string) error {
+	if e.Empty() {
+		return Diag{"E001", fmt.Sprintf("empty predicate node inside %q; every arm must set one of and|or|not|eq|ne|in|match|noMatch|has|missing", parent)}
+	}
+	return validateExpr(q, e, s, warns)
+}
+
 func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 	if e.Empty() {
 		return nil
@@ -246,18 +255,24 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 	if n := arms(e); n > 1 {
 		return Diag{"E001", fmt.Sprintf("predicate node sets %d fields; exactly one of and|or|not|eq|ne|in|match|noMatch|has|missing is allowed", n)}
 	}
+	// An arm that sets nothing is refused rather than folded away. A
+	// whole-predicate Empty() above means "no predicate", which is
+	// legitimate; an empty node *inside* a list is not. It executed
+	// fine -- the store lowers it to a constant true -- but Print emitted
+	// "( AND host = "x")" for it, which does not parse, and the AST and
+	// its canonical text are documented to round-trip losslessly.
 	for _, sub := range e.And {
-		if err := validateExpr(q, sub, s, warns); err != nil {
+		if err := validateArm(q, sub, s, warns, "and"); err != nil {
 			return err
 		}
 	}
 	for _, sub := range e.Or {
-		if err := validateExpr(q, sub, s, warns); err != nil {
+		if err := validateArm(q, sub, s, warns, "or"); err != nil {
 			return err
 		}
 	}
 	if e.Not != nil {
-		if err := validateExpr(q, *e.Not, s, warns); err != nil {
+		if err := validateArm(q, *e.Not, s, warns, "not"); err != nil {
 			return err
 		}
 	}

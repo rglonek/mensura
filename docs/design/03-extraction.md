@@ -15,6 +15,9 @@ A spec is validated by `mensura-ingest check --spec F [--sample FILE]`, which
 compiles every regex, checks that captures resolve, detects unreachable
 patterns (a `search` literal shadowed by an earlier pattern), and — with
 `--sample` — reports match rates and the first unmatched lines per profile.
+`--label k=v` supplies the operator labels the import would carry, because
+profile selection reads them: a profile chosen by `select.label_equals`
+matches nothing without them.
 
 ## 2. Document structure
 

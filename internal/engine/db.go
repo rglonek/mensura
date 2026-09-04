@@ -78,6 +78,22 @@ type DB struct {
 	byID   map[uint32]*setMeta
 	nextID uint32
 
+	// dropMu excludes a drop from every write that could be creating or
+	// filling the same set. It is held shared by PutBatch and RegisterSet
+	// for their whole duration -- the map bookkeeping *and* the pebble
+	// apply -- and exclusively by DropSet.
+	//
+	// mu alone is not enough, because neither half of a write happens
+	// under it end to end. A drop that released mu before applying its
+	// batch let a concurrent PutBatch re-create the set under a fresh id,
+	// write its rows and persist its meta record -- and then deleted that
+	// record, because the delete is keyed by name. The rows survived the
+	// range deletes, which name the old id, so the set came back after a
+	// restart as disk nobody could query, drop or expire. The mirror case
+	// is a write that had already resolved its set id and applied its
+	// rows after the drop's range deletes had gone in.
+	dropMu sync.RWMutex
+
 	writeOpts *pebble.WriteOptions
 	// metaOpts is used for schema and version records. It syncs only when
 	// the WAL is enabled: Pebble rejects a sync write outright when the
@@ -136,6 +152,11 @@ func Open(opts Options) (*DB, error) {
 	}
 	if opts.EnableWAL && opts.SyncWrites {
 		d.writeOpts = pebble.Sync
+	}
+	// A pebble fatal calls os.Exit, so nothing deferred by the caller
+	// runs. The memtable is pushed down here instead, best effort.
+	if pl, ok := po.Logger.(*pebbleLogger); ok {
+		pl.setFatalHook(func() error { return pdb.Flush() })
 	}
 	d.metaOpts = pebble.NoSync
 	if opts.EnableWAL {
@@ -260,6 +281,8 @@ func (d *DB) RegisterSet(name string, cols []ColumnSpec) error {
 	if d.closed.Load() {
 		return ErrClosed
 	}
+	d.dropMu.RLock()
+	defer d.dropMu.RUnlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.setLocked(name, cols)
@@ -356,6 +379,11 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 	if len(recs) == 0 {
 		return nil
 	}
+	// Held until the rows are on disk, not only while the set id is
+	// resolved: a drop that landed in between would range-delete around
+	// rows this batch had not written yet.
+	d.dropMu.RLock()
+	defer d.dropMu.RUnlock()
 	d.mu.Lock()
 	cols := make([]ColumnSpec, 0, 8)
 	seen := map[string]struct{}{}
@@ -383,13 +411,13 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 		if indexed != "" {
 			iv, ok := recs[i].Row[indexed]
 			if !ok {
-				// A row without the indexed column is invisible to indexed
-				// range scans by design; store it under D/ so a full scan
-				// can still see it.
-				if err := b.Set(dataKey(setID, recs[i].Key), payload, nil); err != nil {
-					return err
-				}
-				continue
+				// Refused rather than stored under D/. Every scan of an
+				// indexed set is bounded to the index prefix, so nothing
+				// reads such a row back: it used to be written, counted
+				// as a put and never seen again. Saying so is the only
+				// honest answer, and it costs the store nothing because
+				// its rows always carry a timestamp.
+				return fmt.Errorf("engine: set %q is indexed on %q and this row does not carry it", set, indexed)
 			}
 			ts, ok := iv.AsInt()
 			if !ok {
@@ -434,11 +462,12 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 	_ = closer.Close()
 
 	// On an indexed set the D/ value is normally a tagged forward
-	// pointer, but PutBatch also stores a row that carries no indexed
-	// column there, payload and all. The tag distinguishes them; the
-	// untagged 8-byte form an earlier build wrote is still followed, and
-	// falls back to reading the bytes as a row when the index key it
-	// names does not exist.
+	// pointer, but an earlier build also stored a row that carries no
+	// indexed column there, payload and all -- PutBatch refuses that row
+	// now, and the ones already on disk are still readable here. The tag
+	// distinguishes the two; the untagged 8-byte pointer form an earlier
+	// build wrote is still followed, and falls back to reading the bytes
+	// as a row when the index key it names does not exist.
 	if ts, isPtr := readDataPointer(payload); isPtr && sm.indexed != "" {
 		v2, c2, err := d.pdb.Get(indexKey(sm.id, sm.indexCol, ts, pk))
 		switch {
@@ -459,10 +488,17 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 // DropSet removes a set and everything in it with two range deletes, which
 // is what makes retention cheap: one tombstone per shard rather than one
 // per row.
+//
+// It runs to completion before any write may create or fill a set again:
+// the meta record is keyed by name while the rows are keyed by id, so a
+// write interleaved with the delete produced rows no later drop, query or
+// retention sweep could reach.
 func (d *DB) DropSet(name string) error {
 	if d.closed.Load() {
 		return ErrClosed
 	}
+	d.dropMu.Lock()
+	defer d.dropMu.Unlock()
 	d.mu.Lock()
 	sm, ok := d.sets[name]
 	if !ok {

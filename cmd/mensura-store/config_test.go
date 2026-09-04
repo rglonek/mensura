@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rglonek/mensura/internal/store"
 )
 
 // "1h30d" used to expand to "24h": Sscanf stopped at the 'h' and reported
@@ -138,5 +144,40 @@ func TestQueryListenerMayNotShareTheWriteAddress(t *testing.T) {
 	cfg.Listen.Query.Addr = ""
 	if err := checkAuthPosture(cfg); err != nil {
 		t.Fatalf("an unset query listener was refused: %v", err)
+	}
+}
+
+// A listener that cannot bind must fail startup. The bind used to happen
+// inside the serving goroutine, where the error was logged and nothing
+// else: an address already in use still printed "api listener on ..." and
+// "mensura-store ... listening on ...", and the process then sat on its
+// context serving nothing.
+func TestStartListenersFailsWhenAnAddressIsTaken(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("take an address: %v", err)
+	}
+	defer held.Close()
+
+	dir := t.TempDir()
+	s, err := store.Open(store.Config{DataDir: filepath.Join(dir, "data"), Durability: "batch", RetentionSweep: 0})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	api := store.NewAPI(s, store.APIConfig{})
+
+	cfg := &fileConfig{}
+	cfg.Listen.Write.Addr = "127.0.0.1:0"
+	cfg.Listen.Query.Addr = held.Addr().String()
+	logger := log.New(io.Discard, "", 0)
+
+	servers, err := startListeners(context.Background(), cfg, api, logger)
+	if err == nil {
+		shutdown(servers)
+		t.Fatal("startListeners accepted an address that is already in use")
+	}
+	if !strings.Contains(err.Error(), "query listener") {
+		t.Errorf("the error does not name the listener that failed: %v", err)
 	}
 }

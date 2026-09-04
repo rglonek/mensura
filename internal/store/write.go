@@ -583,16 +583,35 @@ func (s *Store) SetRetentionFor(set string, retention, shard time.Duration) {
 	// restart and then kept the set forever, in the unsharded shard that
 	// retention skips.
 	s.mu.Lock()
+	_, known := s.catalogue[set]
 	e := s.entryLocked(set)
+	// entryLocked creates the entry, so a spec whose sets: block names a
+	// set with no field metadata added it to the catalogue with the
+	// version standing still -- and handleCatalogue answers 304 to every
+	// client still holding the old ETag, so a datasource that caches it
+	// never saw the set at all. Only a real change moves the version,
+	// which is the rule the field-metadata path already follows: a
+	// declaration repeated on every ingest start must not wake every
+	// client watching catalogue_version.
+	changed := !known
 	if retention >= 0 {
 		ms := retention.Milliseconds()
+		if e.RetentionMs == nil || *e.RetentionMs != ms {
+			changed = true
+		}
 		e.RetentionMs = &ms
 	}
 	if shard > 0 {
 		ms := shard.Milliseconds()
+		if e.ShardMs == nil || *e.ShardMs != ms {
+			changed = true
+		}
 		e.ShardMs = &ms
 	}
 	s.mu.Unlock()
+	if changed {
+		s.catVer.Add(1)
+	}
 }
 
 // retentionFor resolves the effective retention for a logical set: a

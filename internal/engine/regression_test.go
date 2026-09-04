@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
+	"sync"
 	"testing"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/rglonek/mensura/pkg/model"
 )
 
@@ -190,11 +193,11 @@ func TestSetIDsAreNeverReissuedAfterADrop(t *testing.T) {
 	}
 }
 
-// PutBatch stores a row that carries no indexed column under D/, payload
-// and all, and an indexed row's D/ value is a forward pointer. The tag
-// tells them apart; the untagged 8-byte form an earlier build wrote is
-// still followed, and the fallback is what keeps an 8-byte *row* payload
-// readable rather than being misread as a pointer.
+// An earlier build stored a row that carries no indexed column under D/,
+// payload and all, while an indexed row's D/ value is a forward pointer.
+// The tag tells them apart; the untagged 8-byte form an even earlier build
+// wrote is still followed, and the fallback is what keeps an 8-byte *row*
+// payload readable rather than being misread as a pointer.
 func TestShortRowPayloadIsNotMistakenForALegacyPointer(t *testing.T) {
 	db := openTestDB(t)
 	// An indexed set, so Get consults readDataPointer at all.
@@ -204,14 +207,20 @@ func TestShortRowPayloadIsNotMistakenForALegacyPointer(t *testing.T) {
 	if err := db.PutBatch("s", []Record{indexed}); err != nil {
 		t.Fatalf("put indexed: %v", err)
 	}
-	// A row with no timestamp column lands under D/ with its payload
+	// A row with no timestamp column sits under D/ with its payload
 	// there. encodeRow of one small column is exactly the length the
-	// legacy pointer form used to be recognised by.
+	// legacy pointer form used to be recognised by. PutBatch refuses to
+	// write one now -- it would be invisible to every scan -- so the
+	// record an older build left behind is written straight to pebble.
 	var bare Record
 	bare.Key[0] = 2
 	bare.Row = Row{"ab": model.Bool(true)}
-	if err := db.PutBatch("s", []Record{bare}); err != nil {
-		t.Fatalf("put bare: %v", err)
+	if err := db.PutBatch("s", []Record{bare}); err == nil {
+		t.Fatal("PutBatch accepted a row with no indexed column on an indexed set")
+	}
+	sm, _ := db.setRef("s")
+	if err := db.pdb.Set(dataKey(sm.id, bare.Key), encodeRow(bare.Row), db.writeOpts); err != nil {
+		t.Fatalf("write legacy bare row: %v", err)
 	}
 	row, ok, err := db.Get("s", bare.Key)
 	if err != nil || !ok {
@@ -226,5 +235,92 @@ func TestShortRowPayloadIsNotMistakenForALegacyPointer(t *testing.T) {
 	}
 	if v := row["n"]; v.I != 7 {
 		t.Fatalf("indexed row did not follow its pointer: %+v", row)
+	}
+}
+
+// A drop and a write to the same set name must not interleave.
+//
+// DropSet used to release the lock before applying its batch, so a
+// PutBatch landing in that window re-created the set under a fresh id --
+// its rows written outside the range deletes, its meta record then deleted
+// by name. After a restart the shard was absent from Sets(), so it was
+// invisible to every query, to the catalogue and to the retention sweep,
+// while its rows still occupied disk with no way to reclaim them.
+func TestDropDoesNotOrphanAConcurrentWrite(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *DB {
+		t.Helper()
+		db, err := Open(Options{Path: dir, CacheBytes: NoBlockCache, MemTableSizeBytes: 1 << 20})
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		return db
+	}
+	db := open()
+	rec := func(n int64) Record {
+		var r Record
+		r.Key[0] = byte(n)
+		r.Key[1] = byte(n >> 8)
+		r.Row = Row{model.TimestampField: model.Int(n), "n": model.Int(n)}
+		return r
+	}
+	// Many rounds with several writers per drop: the window between the
+	// map removal and the batch apply is short, so the odds of landing in
+	// it come from repetition rather than from any one attempt.
+	for round := int64(0); round < 200; round++ {
+		if err := db.PutBatch("s", []Record{rec(round*100 + 1)}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(5)
+		go func() {
+			defer wg.Done()
+			if err := db.DropSet("s"); err != nil && err != ErrUnknownSet {
+				t.Errorf("drop: %v", err)
+			}
+		}()
+		for w := int64(0); w < 4; w++ {
+			go func(n int64) {
+				defer wg.Done()
+				if err := db.PutBatch("s", []Record{rec(n)}); err != nil {
+					t.Errorf("put: %v", err)
+				}
+			}(round*100 + 2 + w)
+		}
+		wg.Wait()
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Whatever survived has to be reachable: a set holding rows must be
+	// in the meta the reopen loads, or nothing can ever read or drop it.
+	db = open()
+	defer func() { _ = db.Close() }()
+	sets := map[string]bool{}
+	for _, n := range db.Sets() {
+		sets[n] = true
+	}
+	it, err := db.pdb.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	defer it.Close()
+	orphans := 0
+	for ok := it.First(); ok; ok = it.Next() {
+		k := it.Key()
+		if len(k) < 5 || (k[0] != prefixData && k[0] != prefixIndex) {
+			continue
+		}
+		id := binary.BigEndian.Uint32(k[1:5])
+		db.mu.RLock()
+		_, known := db.byID[id]
+		db.mu.RUnlock()
+		if !known {
+			orphans++
+		}
+	}
+	if orphans > 0 {
+		t.Fatalf("%d row(s) belong to a set id no meta record names: they are invisible to every query, drop and retention sweep", orphans)
 	}
 }

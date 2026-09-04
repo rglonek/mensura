@@ -85,6 +85,7 @@ type commonFlags struct {
 	progress   string
 	printEvery time.Duration
 	compress   bool
+	maxRecord  int
 }
 
 func (c *commonFlags) register(fs *flag.FlagSet) {
@@ -98,6 +99,10 @@ func (c *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.progress, "progress-file", "", "write the progress document here")
 	fs.DurationVar(&c.printEvery, "print-interval", 30*time.Second, "how often to print progress; 0 disables")
 	fs.BoolVar(&c.compress, "compress", true, "gzip write requests (turn off on loopback)")
+	// Honoured by every acquisition path and settable by none of them
+	// until now: the library bounded a record and the operator had no way
+	// to say where.
+	fs.IntVar(&c.maxRecord, "max-record-bytes", 0, "largest record read on any path before it is truncated and counted; 0 uses the built-in 1 MiB")
 }
 
 type labelFlag map[string]string
@@ -153,6 +158,10 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	ing, err := ingest.New(ingest.Config{
 		Spec: spec, Sink: sink, Labels: c.labels, From: from, To: to,
 		StateDir: c.stateDir, ClientName: c.client, Log: logger,
+		// The record cap the batch importer and the TCP listener read.
+		// The follow paths take their own copy of it in FollowOptions
+		// and RemoteOptions, so one flag bounds a record everywhere.
+		ReadBufferBytes: c.maxRecord,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -265,6 +274,7 @@ func runFollow(argv []string) error {
 	paths := fs.String("path", "", "comma-separated paths or globs to tail")
 	startAt := fs.String("start-at", "checkpoint", "checkpoint | beginning | end")
 	poll := fs.Duration("poll-interval", 250*time.Millisecond, "how often to check followed files (local follow only)")
+	idleFlush := fs.Duration("idle-flush", 0, "how long a partial multiline record or half-filled aggregation window may wait; 0 uses the built-in 30s")
 	// A separate flag, not a reuse of --poll-interval: a local poll is a
 	// stat() and defaults to 250ms, while a remote probe is an SSH round
 	// trip running `wc -c`. Wiring the local cadence into the remote path
@@ -318,7 +328,7 @@ func runFollow(argv []string) error {
 		return ing.FollowRemote(ctx, ingest.RemoteOptions{
 			Host: *sshHost, User: *sshUser, Port: *sshPort,
 			CredentialPath: *sshCred, InsecureHostKey: !*strictHost, Paths: list,
-			StartAt: *startAt, ProbeInterval: *probe,
+			StartAt: *startAt, ProbeInterval: *probe, MaxRecordBytes: common.maxRecord,
 		})
 	}
 	if isFlagSet(fs, "ssh-probe-interval") {
@@ -326,6 +336,7 @@ func runFollow(argv []string) error {
 	}
 	return ing.Follow(ctx, ingest.FollowOptions{
 		Paths: list, StartAt: *startAt, PollInterval: *poll,
+		IdleFlush: *idleFlush, MaxRecordBytes: common.maxRecord,
 	})
 }
 
@@ -342,6 +353,8 @@ func runReceive(argv []string) error {
 	maxDatagram := fs.Int("max-datagram-bytes", 0, "largest accepted UDP record")
 	udpQueue := fs.Int("udp-queue", 0, "UDP backlog before datagrams are dropped and counted")
 	maxPeers := fs.Int("max-peers", 0, "how many distinct senders may hold extraction state")
+	maxConns := fs.Int("max-connections", 0, "how many TCP connections may be served at once; 0 uses the built-in 1024")
+	peerIdle := fs.Duration("peer-idle", 0, "how long a silent sender's extraction state is kept; 0 uses the built-in 30m")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -371,6 +384,8 @@ func runReceive(argv []string) error {
 		MaxDatagramBytes: *maxDatagram,
 		UDPQueue:         *udpQueue,
 		MaxPeers:         *maxPeers,
+		MaxConnections:   *maxConns,
+		PeerIdle:         *peerIdle,
 	})
 }
 
@@ -381,12 +396,27 @@ func runCheck(argv []string) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
 	specPath := fs.String("spec", "", "path to the extraction spec")
 	sample := fs.String("sample", "", "sample log file to test the spec against")
+	// The same flag the acquisition modes take, because profile selection
+	// reads it: a spec whose select.label_equals names an operator label
+	// matches nothing without it.
+	var labels labelFlag
+	fs.Var(&labels, "label", "label the import would attach, key=value (repeatable); profiles may select on it")
 	verbose := fs.Bool("v", false, "print every extracted sample")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if *specPath == "" {
 		return fmt.Errorf("--spec is required")
+	}
+	// Validated exactly as setup() validates them, so a typo is refused
+	// here rather than quietly changing which profile matches.
+	for k, v := range labels {
+		if err := model.ValidateLabelKey(k); err != nil {
+			return fmt.Errorf("--label: %w", err)
+		}
+		if err := model.ValidateLabelValue(v); err != nil {
+			return fmt.Errorf("--label %q: %w", k, err)
+		}
 	}
 	spec, err := extract.Load(*specPath)
 	if err != nil {
@@ -411,7 +441,7 @@ func runCheck(argv []string) error {
 		}
 	}
 	if *sample != "" {
-		if err := checkSample(spec, *sample, *verbose); err != nil {
+		if err := checkSample(spec, *sample, labels, *verbose); err != nil {
 			return err
 		}
 	}

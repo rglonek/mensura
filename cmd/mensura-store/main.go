@@ -147,7 +147,10 @@ func runWithEngine(ctx context.Context, cfg *fileConfig) error {
 
 	api := store.NewAPI(s, cfg.toAPIConfig(cfg.Mode))
 
-	servers := startListeners(ctx, cfg, api, sc.Logger)
+	servers, err := startListeners(ctx, cfg, api, sc.Logger)
+	if err != nil {
+		return err
+	}
 	defer shutdown(servers)
 
 	// Persist the catalogue periodically so a crash loses at most an
@@ -277,11 +280,19 @@ func checkAuthPosture(cfg *fileConfig) error {
 	return nil
 }
 
-func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger *log.Logger) []*http.Server {
+// startListeners binds every configured address before serving any of
+// them, and reports the first bind that fails.
+//
+// The bind used to happen inside the serving goroutine, where a failure
+// was logged and nothing else: an address already in use -- the exact
+// two-owners mistake this file's package doc is about -- still printed
+// "api listener on ...", still printed "mensura-store ... listening on
+// ...", and then sat on <-ctx.Done() serving nothing.
+func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger *log.Logger) ([]*http.Server, error) {
 	var servers []*http.Server
-	start := func(name, addr string, h http.Handler, tls listenSpec) {
+	start := func(name, addr string, h http.Handler, tls listenSpec) error {
 		if addr == "" {
-			return
+			return nil
 		}
 		srv := &http.Server{
 			Addr:    addr,
@@ -294,37 +305,60 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 			WriteTimeout:      5 * time.Minute,
 			IdleTimeout:       2 * time.Minute,
 		}
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("%s listener on %s: %w", name, addr, err)
+		}
 		servers = append(servers, srv)
 		go func() {
 			var err error
 			if tls.TLS.Cert != "" && tls.TLS.Key != "" {
-				err = srv.ListenAndServeTLS(tls.TLS.Cert, tls.TLS.Key)
+				err = srv.ServeTLS(ln, tls.TLS.Cert, tls.TLS.Key)
 			} else {
-				err = srv.ListenAndServe()
+				err = srv.Serve(ln)
 			}
 			if err != nil && err != http.ErrServerClosed {
 				logger.Printf("ERROR %s listener: %v", name, err)
 			}
 		}()
 		logger.Printf("%s listener on %s", name, addr)
+		return nil
 	}
-	start("api", cfg.Listen.Write.Addr, api.Handler(), cfg.Listen.Write)
-	// The read surface only. An address an operator publishes to Grafana
-	// must not also accept /v1/write and /v1/admin/*. checkAuthPosture
-	// refuses a query address equal to the write address rather than
-	// letting this silently fall back to the full mux on one listener.
-	start("query", cfg.Listen.Query.Addr, api.QueryHandler(), cfg.Listen.Query)
-	// The debug surface is loopback-only and is never proxied. Its own
-	// TLS settings are still honoured: loadConfig validates the cert/key
-	// pair for all four listeners, and passing a zero spec here made two
-	// of those four serve plaintext no matter what the config said.
-	start("debug", cfg.Listen.Debug.Addr, api.DebugHandler(), cfg.Listen.Debug)
-	start("metrics", cfg.Listen.Metrics.Addr, api.MetricsHandler(), cfg.Listen.Metrics)
+	// Named in the order they are bound, so the error says which one.
+	listeners := []struct {
+		name string
+		spec listenSpec
+		h    http.Handler
+	}{
+		{"api", cfg.Listen.Write, api.Handler()},
+		// The read surface only. An address an operator publishes to
+		// Grafana must not also accept /v1/write and /v1/admin/*.
+		// checkAuthPosture refuses a query address equal to the write
+		// address rather than letting this silently fall back to the
+		// full mux on one listener.
+		{"query", cfg.Listen.Query, api.QueryHandler()},
+		// The debug surface is loopback-only and is never proxied. Its
+		// own TLS settings are still honoured: loadConfig validates the
+		// cert/key pair for all four listeners, and passing a zero spec
+		// here made two of those four serve plaintext no matter what the
+		// config said.
+		{"debug", cfg.Listen.Debug, api.DebugHandler()},
+		{"metrics", cfg.Listen.Metrics, api.MetricsHandler()},
+	}
+	for _, l := range listeners {
+		if err := start(l.name, l.spec.Addr, l.h, l.spec); err != nil {
+			// Whatever did bind is closed again: a half-started store
+			// holding one port is harder to diagnose than one that
+			// refused to start.
+			shutdown(servers)
+			return nil, err
+		}
+	}
 	go func() {
 		<-ctx.Done()
 		shutdown(servers)
 	}()
-	return servers
+	return servers, nil
 }
 
 func shutdown(servers []*http.Server) {
