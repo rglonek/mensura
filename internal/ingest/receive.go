@@ -82,27 +82,86 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 		r.allowed[a] = struct{}{}
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	// Every address is bound before any of them serves, and a bind that
+	// fails takes the command down with it.
+	//
+	// The bind used to happen inside the serving goroutine, and its error
+	// went into a channel nothing read until every *other* listener had
+	// exited -- which they only do on cancellation. So a port already in
+	// use printed nothing at all, the surviving listeners logged
+	// "receiving on ...", and every record sent to the dead address was
+	// refused at the kernel with nothing on this side recording it. The
+	// store's own listeners were changed away from exactly this shape;
+	// this is the same fix on the ingest side.
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type listener struct {
+		name string
+		run  func() error
+	}
+	var (
+		listeners []listener
+		bound     []io.Closer
+	)
+	abandon := func(err error) error {
+		for _, c := range bound {
+			_ = c.Close()
+		}
+		return err
+	}
 	if opts.TCPAddr != "" {
-		wg.Add(1)
-		go func() { defer wg.Done(); errCh <- r.serveTCP(ctx) }()
+		ln, err := net.Listen("tcp", opts.TCPAddr)
+		if err != nil {
+			return abandon(fmt.Errorf("ingest: tcp listener on %s: %w", opts.TCPAddr, err))
+		}
+		bound = append(bound, ln)
+		listeners = append(listeners, listener{"tcp", func() error { return r.serveTCP(serveCtx, ln) }})
 	}
 	if opts.UDPAddr != "" {
-		wg.Add(1)
-		go func() { defer wg.Done(); errCh <- r.serveUDP(ctx) }()
+		addr, err := net.ResolveUDPAddr("udp", opts.UDPAddr)
+		if err != nil {
+			return abandon(fmt.Errorf("ingest: udp listener on %s: %w", opts.UDPAddr, err))
+		}
+		conn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			return abandon(fmt.Errorf("ingest: udp listener on %s: %w", opts.UDPAddr, err))
+		}
+		bound = append(bound, conn)
+		listeners = append(listeners, listener{"udp", func() error { return r.serveUDP(serveCtx, conn) }})
 	}
 	if opts.HTTPAddr != "" {
+		ln, err := net.Listen("tcp", opts.HTTPAddr)
+		if err != nil {
+			return abandon(fmt.Errorf("ingest: http listener on %s: %w", opts.HTTPAddr, err))
+		}
+		bound = append(bound, ln)
+		listeners = append(listeners, listener{"http", func() error { return r.serveHTTP(serveCtx, ln) }})
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(listeners))
+	for _, l := range listeners {
 		wg.Add(1)
-		go func() { defer wg.Done(); errCh <- r.serveHTTP(ctx) }()
+		go func(l listener) {
+			defer wg.Done()
+			if err := l.run(); err != nil {
+				i.cfg.Log.Printf("ERROR %s listener: %v", l.name, err)
+				errCh <- fmt.Errorf("%s listener: %w", l.name, err)
+				// One listener dying takes the rest down, the way
+				// FollowRemote cancels its siblings on the first error.
+				// A receiver that is serving two of its three addresses
+				// looks healthy and is not.
+				cancel()
+			}
+		}(l)
 	}
 	go func() { wg.Wait(); close(errCh) }()
 
 	// Multiline records and aggregation windows need a clock of their own
 	// here: a receiving stream has no end of file to flush at.
-	// stopIdle, not ctx alone: a listener can fail while the context is
-	// still live, and the drain below would then wait for a goroutine
-	// that is waiting for a cancellation that never comes.
+	// stopIdle, not serveCtx alone: the drain below would otherwise wait
+	// for a goroutine that is waiting for a cancellation that never comes.
 	stopIdle := make(chan struct{})
 	idleDone := make(chan struct{})
 	go func() {
@@ -111,12 +170,12 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 		defer t.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-serveCtx.Done():
 				return
 			case <-stopIdle:
 				return
 			case now := <-t.C:
-				r.flushIdle(ctx, now)
+				r.flushIdle(serveCtx, now)
 			}
 		}
 	}()
@@ -341,11 +400,10 @@ func (r *receiver) flushAll(ctx context.Context) {
 	r.drain(ctx, peers)
 }
 
-func (r *receiver) serveTCP(ctx context.Context) error {
-	ln, err := net.Listen("tcp", r.opts.TCPAddr)
-	if err != nil {
-		return err
-	}
+// serveTCP serves an already-bound listener. Binding happens in Receive,
+// so a port that is in use fails the command rather than this goroutine.
+func (r *receiver) serveTCP(ctx context.Context, ln net.Listener) error {
+	defer ln.Close()
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	r.ing.cfg.Log.Printf("receiving on tcp %s (%s)", r.opts.TCPAddr, r.opts.Mode)
 	for {
@@ -396,13 +454,27 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		rec, err := readRecord(br, r.ing.cfg.ReadBufferBytes)
-		if len(rec.Line) > 0 || rec.Terminated {
-			if rec.Oversize {
+		// A record with no terminator is only worth extracting when it is
+		// complete as far as the sender is concerned: it hit the size cap
+		// so no newline is coming, or the sender closed cleanly after it.
+		// A connection cut mid-record leaves a fragment, and half a line
+		// fed to the extractor does not fail cleanly -- a prefix-anchored
+		// pattern matches it and invents a sample from a truncated
+		// number. There is no re-read on a socket, so the honest answer
+		// is to discard it and say so.
+		oversizeUnterminated := !rec.Terminated && rec.Consumed > recordCap(r.ing.cfg.ReadBufferBytes)
+		usable := rec.Terminated || oversizeUnterminated ||
+			(len(rec.Line) > 0 && errors.Is(err, io.EOF))
+		switch {
+		case usable:
+			if rec.Oversize || oversizeUnterminated {
 				r.ing.cfg.Progress.OversizeRecord()
 			}
 			if rerr := r.handleRecord(ctx, peer, string(rec.Line)); rerr != nil {
 				r.warnRecord(peer, rerr)
 			}
+		case len(rec.Line) > 0:
+			r.warnRecord(peer, errRecordCutShort)
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
@@ -416,19 +488,17 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// errRecordCutShort names a record the sender never finished. It is a
+// constant so warnRecord's collapsing map keys on one entry rather than
+// one per byte count.
+var errRecordCutShort = errors.New("the connection ended mid-record; the fragment was discarded rather than extracted from half a line")
+
 // connIdleTimeout is how long a TCP sender may go silent before its
 // connection is closed. A live log stream is nowhere near this quiet.
 const connIdleTimeout = 15 * time.Minute
 
-func (r *receiver) serveUDP(ctx context.Context) error {
-	addr, err := net.ResolveUDPAddr("udp", r.opts.UDPAddr)
-	if err != nil {
-		return err
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return err
-	}
+// serveUDP serves an already-bound socket, for the reason serveTCP does.
+func (r *receiver) serveUDP(ctx context.Context, conn *net.UDPConn) error {
 	defer conn.Close()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 	r.ing.cfg.Log.Printf("receiving on udp %s (%s)", r.opts.UDPAddr, r.opts.Mode)
@@ -485,7 +555,8 @@ func (r *receiver) serveUDP(ctx context.Context) error {
 	}
 }
 
-func (r *receiver) serveHTTP(ctx context.Context) error {
+// serveHTTP serves an already-bound listener, for the reason serveTCP does.
+func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/v1/lines", func(w http.ResponseWriter, req *http.Request) {
 		peer := hostOf(req.RemoteAddr)
@@ -541,6 +612,16 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 			Set     string         `json:"set"`
 			Samples []model.Sample `json:"samples"`
 		}
+		// Answered before the body is read, exactly as /ingest/v1/lines
+		// is. Deciding afterwards meant a sender excluded by
+		// --allow-source could still make the receiver decode 32 MiB of
+		// JSON, and got a 400 about a set name rather than the 403 that
+		// was actually true.
+		peer := hostOf(req.RemoteAddr)
+		if !r.permitted(peer) {
+			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
+			return
+		}
 		if err := json.NewDecoder(io.LimitReader(req.Body, 32<<20)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -551,11 +632,6 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 		}
 		if model.IsReserved(body.Set) {
 			http.Error(w, fmt.Sprintf("set %q uses the reserved prefix", body.Set), http.StatusBadRequest)
-			return
-		}
-		peer := hostOf(req.RemoteAddr)
-		if !r.permitted(peer) {
-			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
 		for i := range body.Samples {
@@ -604,7 +680,7 @@ func (r *receiver) serveHTTP(ctx context.Context) error {
 		_ = srv.Shutdown(sctx)
 	}()
 	r.ing.cfg.Log.Printf("receiving on http %s", r.opts.HTTPAddr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
@@ -632,7 +708,7 @@ func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (
 	if !r.permitted(peer) {
 		return false, fmt.Errorf("sender %s is not in allowed_sources", peer)
 	}
-	r.ing.cfg.Progress.AddBytes(int64(len(text) + 1))
+	r.ing.cfg.Progress.AddRecord(int64(len(text) + 1))
 	if r.opts.Mode == "metrics" {
 		set, sample, err := ParseLineProtocol(text, time.Now())
 		if err != nil {

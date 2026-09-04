@@ -132,6 +132,13 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | A fractional integer is a positioned parse error | `…:TestFractionalIntegerIsAPositionedParseError` |
 | A partial histogram is not a row of zeros | `pkg/extract/regression_test.go:TestPartialHistogramDoesNotInventZeroBuckets`, `…:TestPartialHistogramSkipsDerivedColumns` |
 | A trailing gap draws a connect-break | `pkg/render/render_test.go:TestTrailingGapDrawsAConnectBreak`, `…:TestNoTrailingBreakWhenTheCadenceIsHonoured` |
+| A receive listener that cannot bind fails the command | `internal/ingest/fixes_test.go:TestReceiveRefusesToStartWhenTheFirstListenerCannotBind`, `…:TestReceiveReleasesBoundListenersWhenALaterOneFails` |
+| A record the extractor is still holding holds the checkpoint | `…:TestFollowHoldsTheCheckpointBehindABufferedRecord`, `pkg/extract/fixes_test.go:TestHeldFromNamesTheOldestBufferedRecord`, `…:TestHeldFromCoversAnOpenAggregationWindow` |
+| An empty `IN` list is an error, not an empty panel | `pkg/mql/empty_in_test.go:TestEmptyInListIsRefused`, `…:TestEmptyInListIsRefusedInsideAnAndArm` |
+| `check --sample` reads compressed and skipped sources as the import does | `cmd/mensura-ingest/fixes_test.go:TestCheckSampleReadsACompressedFile`, `…:TestCheckSampleDeclinesWhatTheImportSkips` |
+| An epoch unit that cannot describe the value is a timestamp failure | `pkg/extract/fixes_test.go:TestEpochSecondsRefusesAValueThatCannotBeSeconds` |
+| An excluded sender is refused before its body is read | `internal/ingest/fixes_test.go:TestReceiveHTTPSamplesRefusesTheSenderBeforeReadingTheBody` |
+| An out-of-range `bucket_index` is named, and the version still moves | `internal/store/fixes_test.go:TestFieldMetaRefusesAnOutOfRangeBucketIndex`, `…:TestFieldMetaVersionTracksRealChanges` |
 
 ## 5. Implementation status
 
@@ -1127,6 +1134,131 @@ when it stops.
   the outer decoder's settings, so `handleWrite`'s `DisallowUnknownFields`
   stopped at the edge of a field value and `{"i":1,"flaot":2}` was
   accepted with the typo dropped.
+
+### 6.56 The ingest listeners bind before they serve
+
+`Receive` started `serveTCP`, `serveUDP` and `serveHTTP` on goroutines and
+each of them called `net.Listen` itself. The error went into a channel
+nothing read until every *other* listener had exited, and they only exit on
+cancellation — so a port already in use printed nothing at all, the
+surviving listeners logged `receiving on …`, and every record sent to the
+dead address was refused by the kernel with nothing on this side recording
+it. It is the same shape `startListeners` was moved away from in §6.48.
+
+Every address is now bound in `Receive` before any of them serves,
+whatever did bind is closed again on the way out, and the error names the
+listener that failed. One listener failing mid-flight also cancels the
+others, the way `FollowRemote` cancels its siblings on the first error: a
+receiver serving two of its three addresses looks healthy and is not.
+
+### 6.57 A record the extractor is still holding holds the checkpoint
+
+02-ingest.md section 5 says `acked_offset` advances "to the highest byte
+offset fully covered by acked samples". The read loop advanced it per
+*record consumed* instead, and those are not the same thing. A line that
+matched a `start_contains` opened a multiline buffer and returned no
+samples; a line folded into an `aggregate:` window returned none until the
+window closed. Both advanced the offset, so bytes whose sample existed only
+inside `extract.Stream` were recorded as delivered. A crash inside the
+idle-flush window lost them silently, and `applyRewind` — which discards
+the extractor and re-reads from the frozen offset — threw away whatever an
+open window had already absorbed.
+
+`extract.Stream` now carries a caller-supplied `Mark` per record and
+answers `HeldFrom`: the mark of the oldest record it is still holding. The
+follow and SSH-follow loops pull `pending` back to it, and release it when
+the buffer flushes — on the next block marker, on the idle flush, on
+rotation, on shutdown. Checkpoints therefore lag an open aggregation window
+by at most its own width, which is the honest answer; they do not freeze,
+because every path that empties the extractor republishes the offset.
+
+### 6.58 An empty `IN` list is an error, not an empty panel
+
+`{"in": {"label": "host", "values": []}}` validated clean. The lowering
+turns it into a constant false — correctly, nothing can match — but with no
+diagnostic, so the panel came back empty with nothing saying why: the one
+outcome the validator exists to prevent. `Print` also emitted
+`host IN ()`, which does not parse, so an AST and its canonical text
+stopped round-tripping losslessly. The parser cannot produce such a node;
+only a hand-authored or builder-generated AST can. It is now `E007`.
+
+### 6.59 `check` reads a sample the way the import does
+
+§6.28 gave `check` the acquisition paths' framing. It still opened the file
+with a bare `os.Open`, while `processFile` goes through `peek` and
+`openRecords`, which decompress single-file gzip and bzip2 and decline
+archives and binary content by name. So `check --sample app.log.gz` handed
+the extractor deflate bytes and reported "no profile matched" — or a 100%
+unmatched rate — for a file `batch` imports without trouble, from the one
+tool whose job is to predict what the import will do. It now uses the
+importer's own `OpenSource`/`SniffSource`, and takes `--max-record-bytes`
+so a record is truncated at the same point on both paths.
+
+### 6.60 The hot paths are off the shared locks
+
+Three places did work under a lock, or repeated work, that the rest of the
+codebase had already been moved away from:
+
+- `engine.PutBatch` derived its column set — every column of every record,
+  ten thousand map operations for a default batch — while holding `DB.mu`
+  exclusively. It touches no shared state, so it serialised every writer in
+  the process behind it and contended with every query's `setRef`. It now
+  runs before the lock is taken.
+- `queryLabelValues` called `shardsFor` once per set carrying the label,
+  and `shardsFor` walks and sorts every set name in the store. With hourly
+  shards that is quadratic in the shard count, on the path a dashboard hits
+  on every variable refresh. `shardsFor` is now a thin wrapper over
+  `shardsInRange`, which takes a list the caller already has, and the scan
+  builds one with `shardsByLogical` — the same fix §6 applied to the
+  catalogue.
+- A regex label filter copied and sorted the whole value list and then took
+  the dictionary lock again for each match: at the default 100k-value
+  budget, a hundred thousand lock acquisitions to lower one clause. It is
+  one pass under one lock (`labelIndicesMatching`), which also matches a
+  value that appears at two dictionary positions at both of them.
+
+### 6.61 Smaller corrections
+
+- `/ingest/v1/samples` decoded up to 32 MiB of JSON and validated the set
+  name before checking `allowed_sources`. Its sibling `/ingest/v1/lines`
+  was changed to answer first (§6 above); an excluded sender got a `400`
+  about a set name rather than the `403` that was true.
+- A TCP connection cut mid-record fed the fragment to the extractor. Half a
+  line does not fail cleanly — a prefix-anchored pattern matches it and
+  invents a sample from a truncated number — and there is no re-read on a
+  socket. A record with no terminator is now extracted only when it is
+  complete as far as the sender is concerned: it hit the size cap, or the
+  sender closed cleanly after it. A cut leaves a counted warning instead.
+- `intern` popped a hole from the free list and, if the dictionary write
+  then failed, dropped it: the position stayed empty and was never listed
+  again, leaking the cardinality budget this function defends.
+- An out-of-range `bucket_index` was silently skipped with a `continue`
+  that also jumped over the change detection at the end of
+  `applyFieldMeta`'s loop — so a kind or unit change carried in the same
+  declaration was written with `CatalogueVersion` standing still, and every
+  ETag-caching client was answered `304` for a catalogue that had moved. It
+  is now refused by name in the validating pass, like every other field of
+  a declaration.
+- `applySetMeta` refused every reserved set while `applyFieldMeta` exempts
+  `_mensura_ingest`, so the one set every ingester writes was also the one
+  set no spec could give a retention.
+- `Validate` returned a literal `nil` warning slice on the `LABELS` path
+  while `validateExpr` was accumulating into a pointer. Nothing can produce
+  a warning there today, only because the schema is passed as `nil`.
+- `--start-at` accepted any string. Both followers take "from the
+  beginning" as their default arm, so `--start-at END` silently re-read
+  every source in full on every restart.
+- `epoch_s` multiplied by 1000 on trust. A nanosecond value declared as
+  seconds overflows `int64` and wraps to a timestamp that is not the one in
+  the record — sometimes back inside `model.MaxTSMs`, the bound that exists
+  to catch exactly that unit mismatch. Out-of-range values are now a
+  timestamp failure, which is counted and dropped. `epoch_us` and
+  `epoch_ns` floor rather than truncate towards zero, so a pre-epoch
+  timestamp lands in the millisecond it belongs to.
+- `runProxy` ignored the signal context `runServer` had built for it, so
+  `SIGTERM` reached nothing in proxy mode.
+- `Progress.AddBytes` was the only thing that incremented the record
+  counter, which its name did not say. It is `AddRecord`.
 
 ## 7. Known gaps worth naming
 

@@ -582,6 +582,14 @@ func (s *Store) intern(key, value string) (int32, error) {
 	// would make interning the n-th value cost O(n) bytes, so filling a
 	// 100k-value dictionary would write ~5 GB under the dictionary lock.
 	if err := s.db.PutDict(dictEntryKey(key, idx), []byte(value)); err != nil {
+		// The hole goes back on the free list. Dropping it on this path
+		// lost the position for the life of the process: the entry stays
+		// empty, so nothing can use it, and it is no longer listed, so
+		// nothing will look at it again -- a slow leak of a budget this
+		// function exists to defend.
+		if reused {
+			d.holes = append(d.holes, idx)
+		}
 		return 0, err
 	}
 	if int(idx) < len(d.Entries) {
@@ -616,6 +624,39 @@ func (s *Store) labelValue(key string, idx int32) (string, bool) {
 		return "", false
 	}
 	return d.Entries[idx], true
+}
+
+// labelIndicesMatching resolves every value of a label key that satisfies
+// a predicate to its dictionary index, and reports how many values the key
+// holds in all -- which is what tells a regex clause it matched everything
+// and can be folded to an existence test.
+//
+// One pass under one lock. The regex path used to copy and sort the whole
+// value list and then take the dictionary lock again for each match, so a
+// key at the default 100k-value budget cost a hundred thousand lock
+// acquisitions to lower one clause. Reading the index off the entry
+// position also keeps a value that appears at two positions -- a hole
+// repaired by an older build -- matching at both, which the reverse map
+// cannot express.
+func (s *Store) labelIndicesMatching(key string, keep func(string) bool) ([]model.Value, int) {
+	s.dictMu.RLock()
+	defer s.dictMu.RUnlock()
+	d, ok := s.dict[key]
+	if !ok {
+		return nil, 0
+	}
+	var vals []model.Value
+	total := 0
+	for i, e := range d.Entries {
+		if e == "" {
+			continue // a hole left by a lost record, not a value
+		}
+		total++
+		if keep(e) {
+			vals = append(vals, model.Int(int64(i)))
+		}
+	}
+	return vals, total
 }
 
 // LabelValues lists the known values of a label key.
@@ -738,13 +779,25 @@ func mod(a, b int64) int64 {
 // shardsFor lists the physical shards of a logical set that overlap a time
 // range, oldest first.
 func (s *Store) shardsFor(set string, fromMs, toMs int64) []string {
+	return shardsInRange(set, s.db.Sets(), fromMs, toMs)
+}
+
+// shardsInRange is shardsFor over a shard list the caller already has.
+//
+// It exists because shardsFor walks and sorts every set name in the store
+// on each call, so a loop that asked for one logical set at a time was
+// quadratic in the shard count -- which hourly sharding makes large. The
+// catalogue was moved off that shape onto shardsByLogical; the LABELS
+// filter scan, which walks every set carrying a label on every dashboard
+// variable refresh, was left on it.
+func shardsInRange(set string, names []string, fromMs, toMs int64) []string {
 	prefix := set + "@"
 	type shard struct {
 		name  string
 		start int64
 	}
 	var found []shard
-	for _, name := range s.db.Sets() {
+	for _, name := range names {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}

@@ -49,10 +49,22 @@ func NewProgress() *Progress { return &Progress{c: Snapshot{Started: time.Now()}
 
 func (p *Progress) SetFilesTotal(n int) { p.mu.Lock(); p.c.FilesTotal = n; p.mu.Unlock() }
 func (p *Progress) FileDone()           { p.mu.Lock(); p.c.FilesDone++; p.mu.Unlock() }
-func (p *Progress) AddBytes(n int64)    { p.mu.Lock(); p.c.BytesRead += n; p.c.Records++; p.mu.Unlock() }
-func (p *Progress) Unmatched()          { p.mu.Lock(); p.c.UnmatchedLines++; p.mu.Unlock() }
-func (p *Progress) TSError()            { p.mu.Lock(); p.c.TSParseErrors++; p.mu.Unlock() }
-func (p *Progress) ExtractError()       { p.mu.Lock(); p.c.ExtractErrors++; p.mu.Unlock() }
+
+// AddRecord counts one framed record and the bytes it occupied. The two
+// move together on every acquisition path, and the name says so: it was
+// called AddBytes while also being the only thing that incremented the
+// record counter, so a reader of the call sites could not tell that
+// "records" was being counted at all.
+func (p *Progress) AddRecord(n int64) {
+	p.mu.Lock()
+	p.c.BytesRead += n
+	p.c.Records++
+	p.mu.Unlock()
+}
+
+func (p *Progress) Unmatched()    { p.mu.Lock(); p.c.UnmatchedLines++; p.mu.Unlock() }
+func (p *Progress) TSError()      { p.mu.Lock(); p.c.TSParseErrors++; p.mu.Unlock() }
+func (p *Progress) ExtractError() { p.mu.Lock(); p.c.ExtractErrors++; p.mu.Unlock() }
 
 // Unjoined counts a continuation line that matched a multiline
 // continue_regex but no join rule, so it was absorbed into nothing. It

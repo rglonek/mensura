@@ -293,6 +293,16 @@ func runFollow(argv []string) error {
 	if *paths == "" {
 		return fmt.Errorf("--path is required")
 	}
+	// Refused rather than fallen through. Both followers switch on this
+	// string and take "start from the beginning" as their default arm, so
+	// a typo -- `--start-at END`, `--start-at latest` -- silently re-read
+	// every source in full on every restart, which is the opposite of
+	// what either spelling was asking for.
+	switch *startAt {
+	case "checkpoint", "beginning", "end":
+	default:
+		return fmt.Errorf("--start-at %q: expected checkpoint, beginning or end", *startAt)
+	}
 	// 02-ingest.md section 5 gives --state-dir a default. It had none, so
 	// a follow started without the flag kept no checkpoints at all and
 	// re-read every source from the beginning on every restart, silently.
@@ -402,6 +412,10 @@ func runCheck(argv []string) error {
 	var labels labelFlag
 	fs.Var(&labels, "label", "label the import would attach, key=value (repeatable); profiles may select on it")
 	verbose := fs.Bool("v", false, "print every extracted sample")
+	// The acquisition modes take this too, and framing is half of what
+	// `check` predicts: without it a record was truncated at a different
+	// point here than on import.
+	maxRecord := fs.Int("max-record-bytes", 0, "largest record read before it is truncated and counted; 0 uses the built-in 1 MiB")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -441,7 +455,7 @@ func runCheck(argv []string) error {
 		}
 	}
 	if *sample != "" {
-		if err := checkSample(spec, *sample, labels, *verbose); err != nil {
+		if err := checkSample(spec, *sample, labels, *maxRecord, *verbose); err != nil {
 			return err
 		}
 	}

@@ -335,16 +335,8 @@ func (s *Store) buildExpr(set string, e mql.Expr, proj map[string]struct{}) (eng
 			}
 			// The regex is evaluated once against the dictionary, not once
 			// per row: the scan only ever sees an integer set.
-			all := s.LabelValues(m.Label)
-			var vals []model.Value
-			for _, v := range all {
-				if re.MatchString(v) {
-					if idx, ok := s.lookup(m.Label, v); ok {
-						vals = append(vals, model.Int(int64(idx)))
-					}
-				}
-			}
-			if len(vals) == len(all) && len(all) > 0 && !negate {
+			vals, all := s.labelIndicesMatching(m.Label, re.MatchString)
+			if len(vals) == all && all > 0 && !negate {
 				warns = append(warns, mql.Diag{Code: "W202", Msg: fmt.Sprintf("regex /%s/ matches every value of %s; the clause was folded away", m.Regex, m.Label)})
 				return engine.Exists(m.Label)
 			}
@@ -949,6 +941,11 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 	seen := map[string]struct{}{}
 	var gateErr string
 	points := 0
+	// One pass over the shard list for the whole scan. shardsFor walks and
+	// sorts every set name in the store, so calling it once per set made
+	// this quadratic in the shard count on the path a dashboard hits on
+	// every variable refresh.
+	byLogical := s.shardsByLogical()
 	for _, set := range s.setsWithLabel(q.Label) {
 		if gateErr != "" {
 			break
@@ -960,7 +957,7 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 			continue
 		}
 		p := &queryPlan{
-			shards: s.shardsFor(set, req.FromMs, req.ToMs),
+			shards: shardsInRange(set, byLogical[set], req.FromMs, req.ToMs),
 			expr:   expr,
 		}
 		for c := range proj {

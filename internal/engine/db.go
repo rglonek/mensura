@@ -384,7 +384,11 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 	// rows this batch had not written yet.
 	d.dropMu.RLock()
 	defer d.dropMu.RUnlock()
-	d.mu.Lock()
+	// The column set is derived before the lock, not under it. This walks
+	// every column of every record -- ten thousand map operations for a
+	// default batch -- and touches no shared state, so holding d.mu across
+	// it serialised every writer in the process behind it, and every
+	// query's setRef along with them.
 	cols := make([]ColumnSpec, 0, 8)
 	seen := map[string]struct{}{}
 	for i := range recs {
@@ -396,6 +400,7 @@ func (d *DB) PutBatch(set string, recs []Record) error {
 			cols = append(cols, ColumnSpec{Name: name, Type: v.T, Indexed: name == model.TimestampField})
 		}
 	}
+	d.mu.Lock()
 	sm, err := d.setLocked(set, cols)
 	if err != nil {
 		d.mu.Unlock()

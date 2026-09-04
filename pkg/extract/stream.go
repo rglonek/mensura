@@ -62,15 +62,37 @@ type Stream struct {
 	// per-record cost grew with cardinality, on the hot path, per stream.
 	aggQ aggQueue
 
+	// mark is the caller-supplied position of the record currently being
+	// processed -- a byte offset, for a caller that checkpoints one. It is
+	// copied onto every buffer this stream opens so HeldFrom can say which
+	// bytes are still only in memory.
+	mark int64
+	// holds lists the open aggregation windows in the order they were
+	// opened. Marks only ever increase, so append order is mark order and
+	// the oldest live window is at the front: no heap is needed, only a
+	// lazy pop of entries whose window has since closed.
+	holds []holdEntry
+
 	Stats Stats
 
 	maxUnmatchedSamples int
+}
+
+// holdEntry remembers where an open aggregation window started. Windows
+// close out of mark order only when a profile mixes several `every`
+// widths, which the lazy scan below tolerates.
+type holdEntry struct {
+	mark int64
+	key  string
+	a    *aggregator
 }
 
 type mlBuffer struct {
 	line string
 	ts   time.Time
 	seen time.Time
+	// mark is where the record that opened this buffer began.
+	mark int64
 }
 
 type aggregator struct {
@@ -82,6 +104,8 @@ type aggregator struct {
 	line       string
 	field      string
 	mode       string
+	// mark is where the record that opened this window began.
+	mark int64
 }
 
 // StreamOptions configure a new stream.
@@ -133,6 +157,66 @@ func (s *Spec) NewStream(p *Profile, opts StreamOptions) (*Stream, error) {
 // Profile exposes the bound profile, so callers can read field metadata.
 func (st *Stream) Profile() *Profile { return st.profile }
 
+// Mark tags the record that Process is about to be handed with the
+// position it started at, so HeldFrom can name it later. Callers that do
+// not checkpoint byte offsets never call it and never read HeldFrom.
+//
+// Positions must not decrease within one stream: the hold list below is
+// kept in mark order by appending to it.
+func (st *Stream) Mark(pos int64) { st.mark = pos }
+
+// HeldFrom reports the mark of the oldest record whose data this stream is
+// still holding rather than having returned -- an open multiline buffer or
+// an unfinished aggregation window -- and whether it is holding anything
+// at all.
+//
+// It exists because a record that yields no samples is not the same as a
+// record that has been dealt with. A driver that checkpoints byte offsets
+// used to advance past both alike, so the bytes of a line that had merely
+// opened a multiline block, or of one that had been folded into a window
+// that had not closed yet, were recorded as delivered while their sample
+// existed only in this struct. A crash in that window lost them with
+// nothing saying so, and a rewind threw away the part of an open window
+// that came from bytes already acknowledged.
+func (st *Stream) HeldFrom() (int64, bool) {
+	oldest, held := int64(0), false
+	for _, b := range st.multiline {
+		if !held || b.mark < oldest {
+			oldest, held = b.mark, true
+		}
+	}
+	// Entries whose window has closed are dropped from the front; the
+	// first live one is the oldest, because marks only increase.
+	for len(st.holds) > 0 {
+		e := st.holds[0]
+		if a, ok := st.aggs[e.key]; ok && a == e.a {
+			if !held || e.mark < oldest {
+				oldest, held = e.mark, true
+			}
+			break
+		}
+		st.holds = st.holds[1:]
+	}
+	// Stale entries *behind* a live one are not reached by the pop above.
+	// Windows close in roughly the order they opened, so that is normally
+	// nothing; a profile mixing a one-hour `every` with a one-minute one
+	// is the case where it is not, and left alone the list would grow by
+	// an entry per closed window for as long as the long one is open.
+	if len(st.holds) > 2*len(st.aggs)+16 {
+		live := st.holds[:0]
+		for _, e := range st.holds {
+			if a, ok := st.aggs[e.key]; ok && a == e.a {
+				live = append(live, e)
+			}
+		}
+		st.holds = live
+	}
+	if len(st.holds) == 0 {
+		st.holds = nil // let the backing array go
+	}
+	return oldest, held
+}
+
 // Process handles one record. It returns zero or more samples: zero is
 // normal (the record opened a multiline, or fed an aggregator), and an
 // error reports why a record produced nothing so the counters stay honest.
@@ -166,7 +250,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			if buf, ok := st.multiline[m.StartContains]; ok {
 				out, _ = st.process(buf.line, buf.ts)
 			}
-			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now()}
+			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark}
 			return out, nil
 		}
 		buf, ok := st.multiline[m.StartContains]
@@ -237,6 +321,7 @@ func (st *Stream) Flush() []Result {
 		st.Stats.Samples++
 	}
 	st.aggQ = nil
+	st.holds = nil
 	return out
 }
 
@@ -443,9 +528,11 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			start: ts, end: ts.Add(ag.every),
 			labels: copyLabels(labels), fields: copyFields(fields),
 			set: set, line: line, field: ag.Field, mode: ag.Mode,
+			mark: st.mark,
 		}
 		st.aggs[key] = a
 		heap.Push(&st.aggQ, aggEntry{key: key, end: a.end, a: a})
+		st.holds = append(st.holds, holdEntry{mark: a.mark, key: key, a: a})
 		switch ag.Mode {
 		case "increment":
 			// One occurrence, counted. Seeding with the captured value

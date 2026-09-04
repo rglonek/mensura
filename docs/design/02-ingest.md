@@ -163,6 +163,14 @@ Rules:
   advances when the store acks a batch, to the highest byte offset fully
   covered by acked samples. `offset` is a read-ahead pointer, kept for
   diagnostics only.
+- "Fully covered" excludes a record the extractor is still holding. A line
+  that opened a multiline block, or that was folded into an aggregation
+  window which has not closed, produced no sample yet: its data exists only
+  in memory, so `acked_offset` stops short of it and the resume point waits
+  for the flush that turns it into one. Checkpoints therefore lag an open
+  aggregation window by at most its own width. They do not stall: every
+  path that empties the extractor — the next block marker, the idle flush,
+  rotation, shutdown — republishes the offset.
 - Spec-change invalidation (`spec_hash` plus an `on_spec_change: reread`
   policy, re-reading the file from 0) is **not implemented**. The fields it
   needed were written into every checkpoint and never read by anything, so
