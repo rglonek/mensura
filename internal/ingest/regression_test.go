@@ -1001,7 +1001,7 @@ func TestTruncationIsAlwaysCounted(t *testing.T) {
 // cache describes nothing.
 func TestProgressFileIsWrittenAtomically(t *testing.T) {
 	p := NewProgress()
-	p.AddBytes(120)
+	p.AddRecord(120)
 	p.Unmatched()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "progress.json")
@@ -1023,7 +1023,7 @@ func TestProgressFileIsWrittenAtomically(t *testing.T) {
 		t.Error("the temporary file was left behind")
 	}
 	// Overwriting an existing document must work too.
-	p.AddBytes(80)
+	p.AddRecord(80)
 	if err := p.WriteFile(path); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}

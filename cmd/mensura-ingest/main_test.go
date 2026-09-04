@@ -94,10 +94,10 @@ profiles:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if err := checkSample(s, sample, nil, false); err == nil {
+	if err := checkSample(s, sample, nil, 0, false); err == nil {
 		t.Fatal("a label-selected profile matched with no labels supplied")
 	}
-	if err := checkSample(s, sample, map[string]string{"env": "prod"}, false); err != nil {
+	if err := checkSample(s, sample, map[string]string{"env": "prod"}, 0, false); err != nil {
 		t.Fatalf("--label did not reach profile selection: %v", err)
 	}
 }

@@ -201,7 +201,19 @@ func runProxy(ctx context.Context, cfg *fileConfig) error {
 	}
 	client := wire.NewClient(cfg.StoreURL, os.Getenv("MENSURA_STORE_TOKEN"))
 	log.Printf("proxying Grafana queries to %s", cfg.StoreURL)
-	return plugin.ServeRemote(client)
+	// Served on a goroutine so a signal unwinds, the same shape plugin
+	// mode uses. Blocking here meant runServer's signal context was set
+	// up and then ignored, so SIGTERM reached nothing and the process had
+	// to be killed.
+	served := make(chan error, 1)
+	go func() { served <- plugin.ServeRemote(client) }()
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+		log.Printf("shutting down")
+		return nil
+	}
 }
 
 // isLoopbackAddr reports whether a listen address is bound to loopback and

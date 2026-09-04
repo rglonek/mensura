@@ -17,7 +17,11 @@ patterns (a `search` literal shadowed by an earlier pattern), and — with
 `--sample` — reports match rates and the first unmatched lines per profile.
 `--label k=v` supplies the operator labels the import would carry, because
 profile selection reads them: a profile chosen by `select.label_equals`
-matches nothing without them.
+matches nothing without them. The sample is opened and framed exactly as
+the import opens and frames it — single-file gzip and bzip2 are
+decompressed, archives and binary content are declined by name, and
+`--max-record-bytes` truncates where the import truncates — because a tool
+that predicts an import must not read differently from one.
 
 ## 2. Document structure
 

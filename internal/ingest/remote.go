@@ -209,7 +209,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		err = i.runRemoteTail(ctx, opts, path, target, ex, labels, progress, box.identity())
+		read, err := i.runRemoteTail(ctx, opts, path, target, ex, labels, progress, box.identity())
 		if flushed := ex.Flush(); len(flushed) > 0 {
 			flushSeq++
 			pos := flushPos(flushSeq)
@@ -217,6 +217,14 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 			for n, r := range flushed {
 				_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
 			}
+		}
+		// The tail held the offset back to the oldest record its
+		// extractor was buffering; that buffer has just been flushed into
+		// the sink, so the whole of what was read is now the store's to
+		// hold and the checkpoint may cover it. Skipped on the error
+		// path, where the read stopped short of what it had queued.
+		if err == nil {
+			progress.advance(read)
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -489,7 +497,7 @@ func (i *Ingest) remoteStat(ctx context.Context, opts RemoteOptions, path string
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) error {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) (int64, error) {
 	args := sshArgs(opts)
 	dest := sshDest(opts)
 	start := progress.ackedOffset()
@@ -507,12 +515,12 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 	cmd := exec.CommandContext(ctx, opts.SSHBinary, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return start, err
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return err
+		return start, err
 	}
 	// A rotation cannot be seen from inside the stream: `tail -F` follows
 	// the new file while this counter keeps climbing on the old one, so
@@ -583,7 +591,12 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 			if rec.Oversize || oversizeUnterminated {
 				i.cfg.Progress.OversizeRecord()
 			}
-			i.cfg.Progress.AddBytes(int64(rec.Consumed))
+			i.cfg.Progress.AddRecord(int64(rec.Consumed))
+			// Where this record began, so a line that only opens a
+			// multiline block or feeds an aggregation window holds the
+			// checkpoint back to its own offset rather than letting it
+			// run past data that exists only in the extractor.
+			ex.Mark(recStart)
 			results, perr := ex.Process(string(rec.Line))
 			i.recordOutcome(perr)
 			i.cfg.Progress.AddSamples(int64(len(results)))
@@ -591,12 +604,12 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 				if aerr := i.cfg.Sink.Add(ctx, res, labels, keyHint(target, offsetPos(recStart), n)); aerr != nil {
 					_ = cmd.Process.Kill()
 					_ = cmd.Wait()
-					return aerr
+					return consumed, aerr
 				}
 			}
 			// Only complete records advance the offset, so a connection
 			// that dies mid-line resumes at the start of that line.
-			progress.advance(consumed)
+			progress.advance(heldOffset(ex, consumed))
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -607,7 +620,7 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 	}
 	waitErr := cmd.Wait()
 	if readErr != nil {
-		return readErr
+		return consumed, readErr
 	}
 	if waitErr != nil {
 		if flag == "-F" && consumed == start {
@@ -616,10 +629,20 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 			i.markRemoteNoFollowName(opts.Host, path)
 		}
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return fmt.Errorf("%w: %s", waitErr, msg)
+			return consumed, fmt.Errorf("%w: %s", waitErr, msg)
 		}
 	}
-	return waitErr
+	return consumed, waitErr
+}
+
+// heldOffset pulls a read offset back to the start of the oldest record
+// the extractor is still holding, so a checkpoint never claims bytes whose
+// sample exists only inside extract.Stream.
+func heldOffset(ex *extract.Stream, read int64) int64 {
+	if at, held := ex.HeldFrom(); held && at < read {
+		return at
+	}
+	return read
 }
 
 // remoteFollowName tracks which targets accepted "tail -F".

@@ -59,7 +59,15 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		// The optional filter is a real predicate (06-query.md section 5),
 		// so it is shape-checked here even though it carries no FROM set
 		// to resolve label names against.
-		return nil, validateExpr(q, q.Where, nil, &warns)
+		//
+		// The warnings travel with the verdict rather than being dropped
+		// on the floor: nothing can produce one on this path today, only
+		// because the schema is passed as nil, and a literal nil here is
+		// a trap for whoever threads one through. Sequenced, not returned
+		// inline: return operands are evaluated left to right, so the
+		// slice header would be copied before validateExpr appended to it.
+		verr := validateExpr(q, q.Where, nil, &warns)
+		return warns, verr
 	}
 	if q.From == "" {
 		return nil, Diag{"E002", "query has no FROM set"}
@@ -305,6 +313,15 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 		return check(e.Ne.Label)
 	case e.In != nil:
+		// An empty list is refused rather than folded away. The lowering
+		// turns it into a constant false with no diagnostic, so the panel
+		// came back empty with nothing at all saying why -- and Print
+		// emitted `host IN ()`, which does not parse, so the AST and its
+		// canonical text stopped round-tripping. The parser cannot build
+		// one; only a hand-authored or machine-generated AST can.
+		if len(e.In.Values) == 0 {
+			return Diag{"E007", fmt.Sprintf("IN on %q lists no values; an empty list can never match", e.In.Label)}
+		}
 		if err := unresolved(e.In.Values...); err != nil {
 			return err
 		}

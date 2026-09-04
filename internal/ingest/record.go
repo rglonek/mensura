@@ -36,6 +36,16 @@ func flushPos(seq int) string { return "flush:" + strconv.Itoa(seq) }
 // defaultMaxRecordBytes bounds one record on every acquisition path.
 const defaultMaxRecordBytes = 1 << 20
 
+// recordCap resolves a configured record bound the way readRecord does, so
+// a caller deciding whether a record hit the cap cannot disagree with the
+// framing that applied it.
+func recordCap(max int) int {
+	if max <= 0 {
+		return defaultMaxRecordBytes
+	}
+	return max
+}
+
 // Record is one framed record, exported so tools outside this package --
 // `mensura-ingest check` in particular -- frame a file exactly the way
 // the acquisition paths do rather than reimplementing it.
@@ -77,9 +87,7 @@ type record struct {
 // buffer, and a record longer than the cap is truncated and reported
 // rather than being allowed to fail or exhaust anything.
 func readRecord(r *bufio.Reader, max int) (record, error) {
-	if max <= 0 {
-		max = defaultMaxRecordBytes
-	}
+	max = recordCap(max)
 	var rec record
 	for {
 		chunk, err := r.ReadSlice('\n')

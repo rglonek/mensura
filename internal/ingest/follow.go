@@ -448,7 +448,11 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		if rec.Oversize || oversizeUnterminated {
 			f.ing.cfg.Progress.OversizeRecord()
 		}
-		f.ing.cfg.Progress.AddBytes(int64(rec.Consumed))
+		f.ing.cfg.Progress.AddRecord(int64(rec.Consumed))
+		// The extractor is told where this record began, so a line that
+		// only opens a multiline block or feeds an aggregation window can
+		// hold the checkpoint back to its own offset.
+		t.ex.Mark(recStart)
 		results, perr := t.ex.Process(string(rec.Line))
 		f.ing.recordOutcome(perr)
 		f.ing.cfg.Progress.AddSamples(int64(len(results)))
@@ -469,7 +473,7 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		// pending is only advanced once every sample from these bytes
 		// has been handed to the sink, so a commit can never
 		// acknowledge a byte whose samples are still unqueued.
-		t.setPending(t.offset)
+		f.syncPending(t)
 		if oversizeUnterminated {
 			continue
 		}
@@ -482,6 +486,27 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 	}
 }
 
+// syncPending publishes the offset a commit may acknowledge: the read
+// head, pulled back to the start of the oldest record the extractor is
+// still holding.
+//
+// A record that produces no samples is not the same as a record that has
+// been dealt with. One that merely opened a multiline block, or that was
+// folded into an aggregation window which has not closed yet, exists only
+// inside extract.Stream -- so acknowledging its bytes claims a durability
+// the store has never been offered. It used to be acknowledged anyway,
+// because the read loop advanced pending per record rather than per
+// delivered sample: a crash inside the idle-flush window lost those
+// records silently, and applyRewind's discard of the extractor threw away
+// the part of an open window that came from bytes already acked.
+func (f *follower) syncPending(t *tailer) {
+	if at, held := t.ex.HeldFrom(); held && at < t.offset {
+		t.setPending(at)
+		return
+	}
+	t.setPending(t.offset)
+}
+
 // applyRewind seeks a thawed tailer back to its frozen offset.
 //
 // The extractor's buffered state -- an open multiline record, a
@@ -489,6 +514,13 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 // was built from the bytes that are about to be read again, so delivering
 // it would emit each of those records twice. This is what a restart does
 // with the same state.
+//
+// Discarding it is only lossless because syncPending holds the acked
+// offset at or before the oldest record the extractor is holding, so the
+// re-read starts early enough to rebuild the whole window. Advancing
+// pending past a buffered record, which is what the read loop used to do,
+// made this an unconditional loss of everything the window had already
+// absorbed.
 func (f *follower) applyRewind(t *tailer) {
 	at, ok := t.takeRewind()
 	if !ok {
@@ -581,6 +613,10 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 	results := t.ex.Flush()
 	if len(results) == 0 {
+		// Still worth republishing: the flush emptied the extractor, so
+		// the bytes it was holding the checkpoint back for are now the
+		// store's problem rather than this process's memory.
+		f.syncPending(t)
 		return
 	}
 	t.flushSeq++
@@ -589,6 +625,9 @@ func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 	for n, r := range results {
 		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
 	}
+	// Published only once every flushed sample is queued, so the offset
+	// this releases is one the sink already holds.
+	f.syncPending(t)
 }
 
 func (f *follower) retire(ctx context.Context, t *tailer) {
@@ -710,6 +749,11 @@ func (f *follower) flushIdle(ctx context.Context) {
 		for n, r := range results {
 			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
 		}
+		// The idle flush is what releases a checkpoint held back by an
+		// open window on a quiet file. Without this the release waited
+		// for the next record, which on a stream that has gone silent is
+		// exactly the case the idle flush exists for.
+		f.syncPending(t)
 	}
 }
 

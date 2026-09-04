@@ -197,6 +197,35 @@ func (i *Ingest) resolve(sources []string) ([]string, error) {
 // one as a record stream is not a degraded result, it is a wrong one.
 var errArchive = errors.New("ingest: archive members are not unpacked")
 
+// OpenSource opens a source exactly as batch import does: archives are
+// refused by name, and a single-file gzip or bzip2 stream is decompressed
+// transparently.
+//
+// It is exported for `mensura-ingest check`, which has to read a sample
+// the way the import will. Opening the file raw there meant `check
+// --sample app.log.gz` handed deflate bytes to the extractor and reported
+// a spec as broken for a file the importer reads without trouble.
+func OpenSource(path string) (io.ReadCloser, error) { return openRecords(path) }
+
+// SniffSource returns the first n decompressed bytes of a source, its
+// modification time, and whether the import would classify it as binary
+// or as an archive and skip it. It is the half of processFile that
+// decides what to do with a file, exported for the same reason
+// OpenSource is.
+func SniffSource(path string, n int) (head []byte, mtime time.Time, skip error) {
+	if isArchive(path) {
+		return nil, time.Time{}, fmt.Errorf("%w: unpack %s and point at its contents", errArchive, path)
+	}
+	head, mtime, err := peek(path, n)
+	if err != nil {
+		return nil, mtime, err
+	}
+	if isBinary(head) {
+		return head, mtime, fmt.Errorf("ingest: %s holds a NUL byte in its first block, so it is treated as binary and skipped", path)
+	}
+	return head, mtime, nil
+}
+
 // isArchive reports whether a path names a multi-file container.
 //
 // A .tgz is a tar inside a gzip, not a compressed log. Decompressing it
@@ -317,7 +346,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			if rec.Oversize {
 				i.cfg.Progress.OversizeRecord()
 			}
-			i.cfg.Progress.AddBytes(int64(rec.Consumed))
+			i.cfg.Progress.AddRecord(int64(rec.Consumed))
 			results, err := stream.Process(string(rec.Line))
 			i.recordOutcome(err)
 			i.cfg.Progress.AddSamples(int64(len(results)))

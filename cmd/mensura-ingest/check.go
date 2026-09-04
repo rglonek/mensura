@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"time"
 
@@ -17,37 +16,41 @@ import (
 // what it did not, and the first lines it could not handle. Unmatched
 // lines are the single most useful spec-debugging output there is, so they
 // are printed rather than counted silently.
-func checkSample(spec *extract.Spec, path string, labels map[string]string, verbose bool) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
+func checkSample(spec *extract.Spec, path string, labels map[string]string, maxRecord int, verbose bool) error {
+	// Sniffed and opened through the importer's own helpers, decompression
+	// and all. Reading the file raw here meant `check --sample app.log.gz`
+	// handed the extractor deflate bytes and reported "no profile matched"
+	// -- or a 100% unmatched rate -- for a file `batch` imports without
+	// trouble, from the one tool whose job is to predict what the import
+	// will do.
+	head, mtime, skip := ingest.SniffSource(path, 64<<10)
+	if skip != nil {
+		return fmt.Errorf("%w; the import skips it for the same reason", skip)
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	head := make([]byte, 64<<10)
-	n, _ := f.ReadAt(head, 0)
 
 	// The operator labels are passed exactly as processFile passes
 	// i.cfg.Labels. Selecting with nil meant a profile chosen by
 	// select.label_equals could never match here, so the tool whose job
 	// is to predict what the import will do answered "no profile matched"
 	// for a spec the import handles.
-	profile := spec.SelectProfile(path, head[:n], labels, "")
+	profile := spec.SelectProfile(path, head, labels, "")
 	if profile == nil {
 		return fmt.Errorf("no profile matched %s: add a select: rule, or a default profile", path)
 	}
 	fmt.Printf("\nsample %s matched profile %q\n", path, profile.Name)
-	if found := spec.DiscoverIdentity(path, head[:n]); len(found) > 0 {
+	if found := spec.DiscoverIdentity(path, head); len(found) > 0 {
 		fmt.Printf("discovered identity: %v\n", found)
 	}
 
-	stream, err := spec.NewStream(profile, extract.StreamOptions{RefTime: info.ModTime()})
+	stream, err := spec.NewStream(profile, extract.StreamOptions{RefTime: mtime})
 	if err != nil {
 		return err
 	}
+	f, err := ingest.OpenSource(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	perSet := map[string]int{}
 	lines := 0
 	// readRecord, not a bufio.Scanner: a Scanner fails the whole file
@@ -57,7 +60,10 @@ func checkSample(spec *extract.Spec, path string, labels map[string]string, verb
 	// import has to frame the way the import does.
 	br := bufio.NewReader(f)
 	for {
-		rec, rerr := ingest.ReadRecord(br, 0)
+		// The same cap the acquisition paths take from
+		// --max-record-bytes, so a record is truncated here exactly where
+		// it would be on import.
+		rec, rerr := ingest.ReadRecord(br, maxRecord)
 		if len(rec.Line) > 0 || rec.Terminated {
 			lines++
 			results, _ := stream.Process(string(rec.Line))

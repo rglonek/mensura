@@ -227,7 +227,11 @@ func (s *Store) applySetMeta(metas []wire.SetMeta) error {
 		if err := model.ValidateSetName(m.Set); err != nil {
 			return &ErrBadRequest{Msg: err.Error()}
 		}
-		if model.IsReserved(m.Set) {
+		// The same exemption applyFieldMeta makes. The ingest-progress set
+		// is the one reserved name a client may write, so refusing to let
+		// it carry a retention or a shard width meant the one set every
+		// ingester produces was also the one set no spec could age out.
+		if model.IsReserved(m.Set) && m.Set != model.IngestSet {
 			return badRequestf("set %q uses the reserved prefix", m.Set)
 		}
 		retention, shard := time.Duration(-1), time.Duration(0)
@@ -440,6 +444,14 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		if err := model.ValidateFieldName(m.Field); err != nil {
 			return &ErrBadRequest{Msg: err.Error()}
 		}
+		// Named here rather than skipped below. The index is used as an
+		// allocation size so it cannot be taken on trust, but silently
+		// ignoring the declaration left the field in the catalogue with
+		// no bucket set and nothing anywhere saying why the heatmap it
+		// was declared for draws nothing.
+		if m.BucketSet != "" && (m.BucketIndex < 0 || m.BucketIndex >= maxBucketIndex) {
+			return badRequestf("%s.%s: bucket index %d is outside 0..%d", m.Set, m.Field, m.BucketIndex, maxBucketIndex-1)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -501,13 +513,16 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 			v := *m.LimitMax
 			f.LimitMax = &v
 		}
+		// BucketIndex is unauthenticated client input and is used below as
+		// an allocation size. It is bounded in the validating pass above,
+		// which refuses the request rather than skipping the rest of this
+		// iteration: the `continue` that used to sit here jumped over the
+		// change detection at the bottom of the loop, so a kind or unit
+		// change carried in the same declaration was applied to the
+		// catalogue with CatalogueVersion standing still -- and every
+		// client holding the old ETag was answered 304 for a catalogue
+		// that had moved.
 		if m.BucketSet != "" {
-			// BucketIndex is unauthenticated client input and is used
-			// below as an allocation size, so it is bounded here rather
-			// than trusted.
-			if m.BucketIndex < 0 || m.BucketIndex >= maxBucketIndex {
-				continue
-			}
 			f.BucketSet = m.BucketSet
 			f.BucketIndex = m.BucketIndex
 			f.BucketEdge = m.BucketEdge

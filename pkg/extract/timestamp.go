@@ -2,8 +2,11 @@ package extract
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
+
+	"github.com/rglonek/mensura/pkg/model"
 )
 
 var (
@@ -63,6 +66,45 @@ func (st *Stream) tryFormat(i int, line string) (time.Time, int, error) {
 	return ts, off, nil
 }
 
+// epochMillis converts an epoch count in a declared unit to milliseconds.
+//
+// The seconds form is range-checked rather than multiplied on trust: the
+// realistic mistake is a spec declaring epoch_s against a source emitting
+// nanoseconds, and n*1000 on a nanosecond value overflows int64 and wraps
+// to a plausible-looking timestamp -- past model.MaxTSMs, which exists to
+// catch exactly that mismatch, and sometimes back inside it. A record the
+// declared unit cannot describe is reported as a timestamp failure, which
+// is counted and dropped, rather than stored at a fabricated time.
+//
+// The sub-millisecond units floor rather than truncate, so a pre-epoch
+// timestamp lands in the millisecond it belongs to instead of the one
+// after it.
+func epochMillis(layout string, n int64) (int64, error) {
+	switch layout {
+	case "epoch_s":
+		if n > model.MaxTSMs/1000 || n < -(model.MaxTSMs/1000) {
+			return 0, fmt.Errorf("%w: %d seconds is beyond the representable range; a value this large is usually epoch milliseconds, microseconds or nanoseconds declared as epoch_s", ErrNoTimestamp, n)
+		}
+		return n * 1000, nil
+	case "epoch_ms":
+		return n, nil
+	case "epoch_us":
+		return floorDiv(n, 1000), nil
+	default:
+		return floorDiv(n, 1_000_000), nil
+	}
+}
+
+// floorDiv divides towards negative infinity, because Go's / truncates
+// towards zero and would round a pre-epoch timestamp up.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
+}
+
 func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, prev time.Time) (time.Time, error) {
 	switch layout {
 	case "epoch_s", "epoch_ms", "epoch_us", "epoch_ns":
@@ -70,16 +112,11 @@ func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, pre
 		if err != nil {
 			return time.Time{}, err
 		}
-		switch layout {
-		case "epoch_s":
-			return time.UnixMilli(n * 1000).UTC(), nil
-		case "epoch_ms":
-			return time.UnixMilli(n).UTC(), nil
-		case "epoch_us":
-			return time.UnixMilli(n / 1000).UTC(), nil
-		default:
-			return time.UnixMilli(n / 1_000_000).UTC(), nil
+		ms, err := epochMillis(layout, n)
+		if err != nil {
+			return time.Time{}, err
 		}
+		return time.UnixMilli(ms).UTC(), nil
 	}
 	ts, err := time.ParseInLocation(layout, text, loc)
 	if err != nil {
