@@ -116,6 +116,15 @@ func readDataPointer(payload []byte) (int64, bool) {
 	return 0, false
 }
 
+// taggedDataPointer reports whether a D/ payload is the tagged forward
+// pointer this build writes, as opposed to the untagged eight-byte form an
+// earlier one did. The distinction matters where the index key a pointer
+// names is missing: a tagged payload is a pointer and nothing else, while
+// an untagged one may still be a small row.
+func taggedDataPointer(payload []byte) bool {
+	return len(payload) == 9 && payload[0] == dataPointerTag
+}
+
 // prefixEnd returns the exclusive upper bound covering every key that
 // starts with prefix.
 func prefixEnd(prefix []byte) []byte {

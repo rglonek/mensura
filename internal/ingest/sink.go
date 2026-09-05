@@ -90,8 +90,24 @@ type Sink struct {
 	// credential that will not change for minutes.
 	holdMu    sync.Mutex
 	holdUntil time.Time
-	// now is the clock, overridable in tests.
+	// now is the clock, overridable through setClock.
+	//
+	// It is guarded by holdMu, which is not ceremony: the only reader is
+	// holding(), which the background flush goroutine calls on every
+	// tick, so replacing the function while that goroutine is running is
+	// a data race on a func value -- and the race detector reports it
+	// against whichever test happens to be running rather than the one
+	// that swapped the clock.
 	now func() time.Time
+}
+
+// setClock replaces the sink's clock. It is the seam a test uses to step
+// over a delivery hold without sleeping through it; the write goes under
+// the same lock the read already takes.
+func (s *Sink) setClock(f func() time.Time) {
+	s.holdMu.Lock()
+	s.now = f
+	s.holdMu.Unlock()
 }
 
 // deliveryHold is how long the sink waits after a rejected credential

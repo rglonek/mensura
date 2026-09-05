@@ -435,7 +435,7 @@ func TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord(t *testing.T) {
 	// the sink spinning on a store that is refusing writes, not to delay
 	// one that has recovered.
 	refuse.Store(false)
-	sink.now = func() time.Time { return time.Now().Add(2 * retryHold) }
+	sink.setClock(func() time.Time { return time.Now().Add(2 * retryHold) })
 	if err := f.read(context.Background(), tl); err != nil {
 		t.Fatalf("re-read: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestRetryExhaustionRequeuesRatherThanDropping(t *testing.T) {
 	// The store recovers; the hold exists to stop the sink spinning on an
 	// overloaded store, not to delay one that is answering again.
 	refuse.Store(false)
-	sink.now = func() time.Time { return time.Now().Add(2 * retryHold) }
+	sink.setClock(func() time.Time { return time.Now().Add(2 * retryHold) })
 	if err := sink.Close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -663,7 +663,7 @@ func TestAFullBufferStillDropsAndSaysSo(t *testing.T) {
 	// The hold is stepped over between flushes; each one finds the buffer
 	// fuller than the last.
 	for i := 0; i < 3; i++ {
-		sink.now = func() time.Time { return time.Now().Add(time.Duration(i+1) * 2 * retryHold) }
+		sink.setClock(func() time.Time { return time.Now().Add(time.Duration(i+1) * 2 * retryHold) })
 		_ = sink.Flush(ctx)
 	}
 	if got := sink.Snapshot().Dropped; got == 0 {
@@ -1826,5 +1826,78 @@ func TestRemoteIdleTickIsBounded(t *testing.T) {
 	}
 	if got := remoteIdleTick(30 * time.Second); got != 15*time.Second {
 		t.Fatalf("remoteIdleTick(30s) = %s, want 15s", got)
+	}
+}
+
+// "Incomplete record" and "the read failed" arrive in exactly the same
+// shape -- no terminator, nothing consumed -- and the failure used to be
+// dropped along with the record. An unreadable file was then polled
+// forever, five times a second, reporting nothing to anyone: no error from
+// the sweep, no log line, and a lag that never moved.
+func TestFollowReportsAReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+	appendLines(t, path, 0, 3)
+	f := newTestFollower(t, dir, FollowOptions{})
+
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	// A descriptor that stats and seeks like any other and refuses every
+	// read, which is what a revoked permission or a disk fault looks like
+	// from inside the loop.
+	wo, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("reopen write-only: %v", err)
+	}
+	t.Cleanup(func() { _ = wo.Close() })
+	_ = tl.file.Close()
+	tl.file = wo
+
+	if err := f.read(context.Background(), tl); err == nil {
+		t.Fatal("a failing read reported success, so the sweep polls an unreadable file forever in silence")
+	}
+	if tl.offset != 0 {
+		t.Fatalf("offset moved to %d on a read that returned nothing", tl.offset)
+	}
+}
+
+// lag_bytes is the backlog, and SetLag overwrites. With a glob matching
+// several files the reported number was whichever tailer the sweep visited
+// last, so a file that was megabytes behind was hidden by any other file
+// that happened to be caught up.
+func TestFollowLagCoversEveryFile(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.log")
+	b := filepath.Join(dir, "b.log")
+	appendLines(t, a, 0, 4)
+	appendLines(t, b, 100, 104)
+	f := newTestFollower(t, dir, FollowOptions{Paths: []string{filepath.Join(dir, "*.log")}})
+
+	// Both files are opened at their start and neither has been read, so
+	// each is its whole length behind.
+	for _, p := range []string{a, b} {
+		if _, err := f.ensure(p); err != nil {
+			t.Fatalf("ensure %s: %v", p, err)
+		}
+	}
+	var want int64
+	for _, t2 := range f.snapshotTailers() {
+		info, err := t2.file.Stat()
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		want += info.Size()
+		if err := f.atEOF(t2); err != nil {
+			t.Fatalf("atEOF: %v", err)
+		}
+	}
+	if want == 0 {
+		t.Fatal("the fixture files are empty")
+	}
+	f.publishLag()
+	if got := f.ing.cfg.Progress.Snapshot().LagBytes; got != want {
+		t.Fatalf("lag_bytes = %d, want %d: the backlog has to cover every followed file, not the last one visited", got, want)
 	}
 }

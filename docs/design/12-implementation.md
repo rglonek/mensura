@@ -1464,6 +1464,87 @@ same hint.
   unit — was told they had all landed, and the only trace of the loss was
   the store's own log on the far side of the sink.
 
+### 6.72 A `route:` target is a destination set
+
+`route:` fans one pattern out to several sets (03-extraction.md §7), and
+its `set:` was the one destination name nothing validated. `set:` on the
+pattern is checked against the charset and the reserved prefix; the route's
+was only defaulted to it when absent and otherwise taken on trust.
+
+A spec routing to a name carrying the `@` that separates a set from its
+shard suffix, or to the store's own reserved prefix, therefore compiled
+cleanly — `check` reported it good — and then failed at run time twice
+over. `Declarations()` derives field metadata per destination set, so the
+first write carrying that declaration comes back `400`, which
+`wire.Client` classifies as fatal: the batch is dropped outright, reported
+to the delivery observers as a hole, and every followed file's checkpoint
+freezes until a later flush thaws it. And every sample the route ever
+produces is rejected by the store, per sample, for the life of the
+process, with nothing anywhere pointing back at the spec.
+
+Both halves are decidable from the spec, so `Profile.compile` decides
+them.
+
+### 6.73 A spec may age out the ingest-progress set
+
+`applySetMeta` exempts `_mensura_ingest` by name — it is the one reserved
+set a client may write, so refusing to let it carry a retention meant the
+one set every ingester produces was also the one set no spec could age out
+(§6.55). The compiler still refused it, which made that exemption
+unreachable: the declaration could never leave the ingester. With no
+retention the set is routed to the unsharded `@all` shard, which the sweep
+skips by construction, and then kept forever with nothing saying so.
+
+The `sets:` block now makes the same single exemption the store does.
+
+### 6.74 The sink's clock is not a lock-free field
+
+`Sink.now` is the seam a test uses to step over a delivery hold without
+sleeping through it. It was a bare field, and its only reader is
+`holding()` — which the background flush goroutine calls on every tick. So
+replacing it raced with that goroutine, and `go test -race` failed
+intermittently in whichever test happened to be running rather than in the
+one that swapped the clock. It is written through `setClock`, under the
+lock `holding()` already takes.
+
+### 6.75 Smaller corrections
+
+- A dictionary hole is not a label value. `labelValue` reported a position
+  whose record was lost as the empty string, while `LabelValues` and the
+  regex lowering both skip one — so `LABELS host WHERE …`, the filtered
+  form, which is the one that translates indices off rows, listed an empty
+  value among the hosts and a dashboard variable grew a blank option that
+  the unfiltered form never showed.
+- A failing read on a followed file is reported. "No terminator, nothing
+  consumed" is the shape of a partial line *and* the shape of a read that
+  failed, and the failure was dropped along with the record: an unreadable
+  file — a disk fault, a revoked permission, a network mount that went
+  away — was polled forever, five times a second, with no error from the
+  sweep and no log line. `io.EOF` is the one that really means "nothing
+  more yet".
+- `lag_bytes` covers every followed file. `SetLag` overwrites, and the
+  local follower called it once per tailer at the end of that tailer's
+  read, so with a glob matching several files the published backlog was
+  whichever one the sweep visited last: a file megabytes behind was hidden
+  by any other file that happened to be caught up. The sweep now publishes
+  the sum once, after the retirement pass, so a file that has left the
+  glob stops contributing.
+- The auxiliary query forms answer `"series": []`. `Series` carries no
+  `omitempty`, so `SETS`, `FIELDS`, `LABEL KEYS` and `LABELS` put
+  `"series": null` on the wire — for exactly the queries a dashboard
+  variable runs — while every other query answers a list, which is the
+  contract the data path states in its own comment.
+- `Get` reports a missing indexed row as absent. A tagged forward pointer
+  whose index key is gone means the row is gone; falling through decoded
+  the pointer's own nine bytes as a row, and `encodeRow`'s leading column
+  count read as zero, so `Get` answered "found" with a row carrying no
+  columns. The untagged eight-byte form an earlier build wrote still falls
+  through, because there those bytes really may be a small row.
+- The plugin fetches the catalogue only where it reads it. `CallResource`
+  fetched it for every path, and in proxy mode that is a network round
+  trip to the store — on `parse`, which the query editor calls on every
+  keystroke, and on `print`, neither of which looks at the result.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

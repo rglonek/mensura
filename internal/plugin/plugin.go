@@ -294,9 +294,17 @@ func (d *Datasource) CallResource(ctx context.Context, req *backend.CallResource
 			Body:    body,
 		})
 	}
-	cat, err := d.svc.Catalogue(ctx)
-	if err != nil && req.Path != "print" {
-		return send(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	// Fetched only where it is read. In proxy mode Catalogue is a network
+	// round trip to the store, and "parse" is the path the query editor
+	// calls on every keystroke -- neither it nor "print" looks at the
+	// result, so fetching it there bought a request per character typed.
+	var cat wire.Catalogue
+	switch req.Path {
+	case "sets", "fields", "labels":
+		var err error
+		if cat, err = d.svc.Catalogue(ctx); err != nil {
+			return send(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 	}
 
 	switch req.Path {

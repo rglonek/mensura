@@ -146,6 +146,23 @@ type tailer struct {
 	// It is set on the flush goroutine and consumed on the poll one,
 	// which is the goroutine that owns offset and file.
 	rewind bool
+	// lag is how many bytes this file held past the read head the last
+	// time the sweep reached its end. It lives here rather than being
+	// published directly so the progress document can report the backlog
+	// across every followed file rather than the last one visited.
+	lag int64
+}
+
+func (t *tailer) setLag(n int64) {
+	t.mu.Lock()
+	t.lag = n
+	t.mu.Unlock()
+}
+
+func (t *tailer) lagBytes() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lag
 }
 
 // setPending publishes how far the reader has handed bytes to the sink.
@@ -335,6 +352,10 @@ func (f *follower) poll(ctx context.Context) error {
 		}
 	}
 	f.retireUnmatched(ctx, paths)
+	// After the retirement pass, so a file that has left the glob stops
+	// contributing to the backlog rather than pinning it at whatever it
+	// held when it went away.
+	f.publishLag()
 	return firstErr
 }
 
@@ -504,6 +525,17 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		if !rec.Terminated {
 			if rec.Consumed <= max {
 				// Incomplete: leave the offset where it was and stop.
+				//
+				// "Incomplete" is the shape of a partial line *and* the
+				// shape of a read that failed, and the failure used to be
+				// dropped here along with the record: an unreadable file
+				// -- a disk fault, a revoked permission, a network mount
+				// that went away -- was polled forever, five times a
+				// second, reporting nothing to anyone. EOF is the one
+				// that really does mean "nothing more yet".
+				if err != nil && !errors.Is(err, io.EOF) {
+					return err
+				}
 				return f.atEOF(t)
 			}
 			// No newline within the cap. Consuming it is the only way
@@ -606,11 +638,30 @@ func (f *follower) applyRewind(t *tailer) {
 	t.reset(at)
 }
 
+// atEOF records how far this tailer is behind its file. The number is kept
+// on the tailer rather than published straight to the progress document:
+// SetLag overwrites, so with a glob matching several files the reported
+// lag was whichever tailer happened to run last in the sweep, which on a
+// busy directory is a number that describes nothing. poll publishes the
+// sum once the sweep is done.
 func (f *follower) atEOF(t *tailer) error {
 	if info, serr := t.file.Stat(); serr == nil {
-		f.ing.cfg.Progress.SetLag(info.Size() - t.offset)
+		if lag := info.Size() - t.offset; lag > 0 {
+			t.setLag(lag)
+		} else {
+			t.setLag(0)
+		}
 	}
 	return nil
+}
+
+// publishLag reports the whole backlog across every followed file.
+func (f *follower) publishLag() {
+	total := int64(0)
+	for _, t := range f.snapshotTailers() {
+		total += t.lagBytes()
+	}
+	f.ing.cfg.Progress.SetLag(total)
 }
 
 // checkRotation detects the five rotation shapes: rename+create,
