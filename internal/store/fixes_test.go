@@ -317,3 +317,62 @@ func TestAnOversizedBodyIsStillTooLarge(t *testing.T) {
 		t.Fatalf("status %d for an oversized body, want 413", resp.StatusCode)
 	}
 }
+
+// A batch the store refuses wholesale must not produce a response body
+// the write client cannot read.
+//
+// Every refused sample used to be named individually and the reasons are
+// sentences, so a few thousand of them passed the megabyte the client
+// reads: the client got truncated JSON, reported "unexpected end of JSON
+// input", and the sink classified that as neither fatal nor an auth
+// failure -- so it requeued the batch and retried it forever, with the
+// store re-committing whatever it accepted each time and no checkpoint
+// ever advancing again.
+func TestWriteResponseStaysReadable(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{})
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	const n = 8000
+	samples := make([]model.Sample, 0, n)
+	for i := 0; i < n; i++ {
+		samples = append(samples, model.Sample{
+			// Past model.MaxTSMs, whose rejection reason is a sentence.
+			TSMs:   999999999999999999,
+			Fields: map[string]model.Value{"x": model.Int(1)},
+		})
+	}
+	client := wire.NewClient(srv.URL, "")
+	client.Compress = false
+	resp, err := client.Write(context.Background(), &wire.WriteRequest{
+		Batches: []model.Batch{{Set: "s", Samples: samples}},
+	})
+	if err != nil {
+		t.Fatalf("a fully-rejected batch made the write client fail to read the reply: %v", err)
+	}
+	if resp.Refused() != n {
+		t.Fatalf("Refused() = %d, want %d", resp.Refused(), n)
+	}
+	if len(resp.Rejected) != wire.MaxReportedRejections {
+		t.Fatalf("named %d rejections, want the cap of %d", len(resp.Rejected), wire.MaxReportedRejections)
+	}
+	// The body has to stay small enough that no reader has to guess.
+	direct, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{Set: "s", Samples: samples}}}, "", "")
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	b, err := json.Marshal(direct)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(b) > 1<<20 {
+		t.Fatalf("response body is %d bytes, past the megabyte a client reads", len(b))
+	}
+	// A response from a store built before the count existed still reports
+	// the right number.
+	legacy := &wire.WriteResponse{Rejected: []wire.Rejection{{Index: 0, Reason: "old"}}}
+	if legacy.Refused() != 1 {
+		t.Fatalf("Refused() = %d on a countless response, want 1", legacy.Refused())
+	}
+}

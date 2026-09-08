@@ -516,9 +516,30 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	}
 	key := strings.Join(keyParts, "\x00")
 
+	// The verdict AsFloat returns is honoured rather than discarded.
+	//
+	// It reports false for a value that is not a finite number, which is
+	// exactly what model.Coerce produces from a log line spelling a field
+	// "NaN", "Inf" or "+Infinity" -- strconv.ParseFloat accepts all
+	// three. Folding one into an accumulator did not cost that record, it
+	// cost the window: `sum` stays NaN for every later record, and a
+	// window seeded with one never moves again because `incoming > NaN`
+	// is false. The window's sample is then refused outright by the sink
+	// as unencodable, so one junk line silently erased every record that
+	// shared its window. It reports false for a non-numeric string too,
+	// and summing that as zero is the same silent wrong answer one
+	// magnitude smaller.
+	//
+	// Absence is not the same as junk: a record that simply does not
+	// carry the field contributes nothing and is not an error, which is
+	// what `increment` relies on and what a sparse `sum` source produces.
 	var incoming float64
+	var usable bool
 	if v, ok := fields[ag.Field]; ok {
-		incoming, _ = v.AsFloat()
+		if incoming, usable = v.AsFloat(); !usable && ag.Mode != "increment" {
+			return fmt.Errorf("extract: aggregate field %q is %s, which is not a finite number, so it cannot be %s into a window",
+				ag.Field, v.String(), ag.Mode)
+		}
 	}
 	a, ok := st.aggs[key]
 	if !ok {
@@ -541,7 +562,19 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			// window of each key reported a number nothing had counted.
 			a.value = 1
 		default:
-			a.value = incoming
+			// A window opened by a record that carries no value starts at
+			// zero, which is what a sum of nothing is.
+			if usable {
+				a.value = incoming
+			}
+		}
+		return nil
+	}
+	if !usable {
+		// Nothing to fold. `increment` counts the occurrence regardless;
+		// the value modes leave the window exactly as it was.
+		if ag.Mode == "increment" {
+			a.value++
 		}
 		return nil
 	}
@@ -620,12 +653,18 @@ func (q *aggQueue) Pop() any {
 	return e
 }
 
+// maxExactInt is the largest magnitude a float64 carries as an exact
+// integer. Past it float-to-int conversion is undefined by the Go spec --
+// amd64 yields the indefinite value and arm64 saturates -- so the test
+// below is range-checked before it is made rather than relying on either.
+const maxExactInt = 1 << 53
+
 func (a *aggregator) emit() Result {
 	fields := map[string]model.Value{}
 	for k, v := range a.fields {
 		fields[k] = v
 	}
-	if a.value == float64(int64(a.value)) {
+	if a.value >= -maxExactInt && a.value <= maxExactInt && a.value == float64(int64(a.value)) {
 		fields[a.field] = model.Int(int64(a.value))
 	} else {
 		fields[a.field] = model.Float(a.value)

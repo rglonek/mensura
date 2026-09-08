@@ -80,6 +80,12 @@ modifier     = "DELTA"
              | "CLAMP" clamp-spec { "," clamp-spec } [ "ELSE" ( "RAW" | "BOUND" ) ] ;
 clamp-spec   = ( "MIN" | "MAX" ) number ;
 
+(* The CLAMP bound list nests inside the comma-separated SELECT list, so
+   a comma continues the CLAMP only when MIN or MAX follows it: the
+   parser takes one token of lookahead there. `SELECT cpu CLAMP MIN 0,
+   mem` is two fields; `SELECT cpu CLAMP MIN 0, MAX 100` is one.
+   12-implementation.md section 6.76. *)
+
 predicate    = or-expr ;
 or-expr      = and-expr { "OR" and-expr } ;
 and-expr     = unary { "AND" unary } ;
@@ -399,7 +405,7 @@ in tests. Warnings never fail a query; errors always do.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
-| `E001` | error | Parse error (position and expected-token set included) |
+| `E001` | error | Parse error (position and expected-token set included); also a hand-built AST the grammar cannot express — an empty predicate arm, or an empty field, `BY` or comparison name |
 | `E002` | error | Unknown set |
 | `E003` | error | Unknown field on set, and the field is `REQUIRED` |
 | `E004` | error | Unknown label key referenced in `WHERE` or `BY` |

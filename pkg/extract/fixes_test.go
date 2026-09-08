@@ -1,6 +1,8 @@
 package extract
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,5 +191,115 @@ func TestHeldFromCoversAnOpenAggregationWindow(t *testing.T) {
 	}
 	if at, held := st.HeldFrom(); !held || at != 300 {
 		t.Fatalf("HeldFrom = (%d, %v) after the window closed, want (300, true)", at, held)
+	}
+}
+
+// One junk value must cost its own record, not the whole window.
+//
+// model.Coerce turns the literal text "NaN", "Inf" or "+Infinity" in a
+// log line into exactly that float -- strconv.ParseFloat accepts all
+// three. The accumulator discarded AsFloat's verdict and folded it in, so
+// `sum` stayed NaN for every later record and a window seeded with one
+// never moved again (`incoming > NaN` is false). The window's sample is
+// then refused outright by the sink as unencodable, so a single bad line
+// silently erased every record that shared its window.
+func TestAggregationSurvivesANonFiniteValue(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    labels: [op]
+    patterns:
+      - set: s
+        search: 'lat'
+        extract: ['lat op=(?P<op>\w+) v=(?P<v>\S+)']
+        aggregate:
+          every: 1h
+          on: [op]
+          field: v
+          mode: MODE
+`
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{"sum", "6"},
+		{"max", "3"},
+		{"last", "3"},
+	} {
+		sp, err := Parse([]byte(strings.ReplaceAll(spec, "MODE", tc.mode)))
+		if err != nil {
+			t.Fatalf("%s: spec: %v", tc.mode, err)
+		}
+		st, err := sp.NewStream(sp.Profile("p"), StreamOptions{})
+		if err != nil {
+			t.Fatalf("%s: stream: %v", tc.mode, err)
+		}
+		junk := 0
+		for i, v := range []string{"1", "2", "NaN", "not-a-number", "3"} {
+			line := fmt.Sprintf("%d lat op=read v=%s", base+int64(i)*1000, v)
+			if _, err := st.Process(line); err != nil {
+				junk++
+			}
+		}
+		if junk != 2 {
+			t.Errorf("%s: %d record(s) reported as unusable, want 2", tc.mode, junk)
+		}
+		out := st.Flush()
+		if len(out) != 1 {
+			t.Fatalf("%s: %d window(s), want 1", tc.mode, len(out))
+		}
+		if got := out[0].Fields["v"].String(); got != tc.want {
+			t.Errorf("%s: window value %s, want %s: a junk record poisoned the whole window", tc.mode, got, tc.want)
+		}
+	}
+}
+
+// increment counts occurrences, so a junk value in the field it names is
+// irrelevant to it: the record still happened.
+func TestIncrementAggregationIgnoresTheFieldValue(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    labels: [op]
+    patterns:
+      - set: s
+        search: 'lat'
+        extract: ['lat op=(?P<op>\w+) v=(?P<v>\S+)']
+        aggregate:
+          every: 1h
+          on: [op]
+          field: v
+          mode: increment
+`
+	sp, err := Parse([]byte(spec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	st, err := sp.NewStream(sp.Profile("p"), StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	for i, v := range []string{"1", "NaN", "x"} {
+		if _, err := st.Process(fmt.Sprintf("%d lat op=read v=%s", base+int64(i)*1000, v)); err != nil {
+			t.Errorf("increment refused a record over its field value: %v", err)
+		}
+	}
+	out := st.Flush()
+	if len(out) != 1 || out[0].Fields["v"].String() != "3" {
+		t.Fatalf("counted %v, want one window of 3", out)
 	}
 }

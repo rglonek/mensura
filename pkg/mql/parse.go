@@ -65,6 +65,37 @@ func (p *parser) acceptPunct(s string) bool {
 	return false
 }
 
+// acceptCommaBefore consumes a comma only when one of the given keywords
+// follows it, leaving a comma that belongs to an enclosing list alone.
+//
+// It exists because two comma-separated lists nest: SELECT separates its
+// fields with a comma, and a field's CLAMP separates its bounds with one.
+// Consuming it unconditionally meant `SELECT cpu CLAMP MIN 0, mem` -- an
+// ordinary two-field query, and exactly the text Print emits for one --
+// was read as a CLAMP with a second bound and failed with "expected MIN
+// or MAX after CLAMP". One token of lookahead separates the two cases
+// without changing the language: a field whose name collides with MIN or
+// MAX has to be quoted to be a name at all, and a quoted name lexes as a
+// string rather than as the keyword tested here.
+func (p *parser) acceptCommaBefore(keywords ...string) bool {
+	if p.cur().kind != tokPunct || p.cur().text != "," {
+		return false
+	}
+	// Safe to index: the current token is a comma, so it is not the EOF
+	// the lexer always appends last.
+	next := p.toks[p.i+1]
+	if next.kind != tokKeyword {
+		return false
+	}
+	for _, kw := range keywords {
+		if next.text == kw {
+			p.i++
+			return true
+		}
+	}
+	return false
+}
+
 // name accepts a bare identifier or a quoted string, which is how names
 // that collide with keywords are written.
 //
@@ -338,7 +369,8 @@ func (p *parser) clamp() (*Clamp, error) {
 		default:
 			return nil, p.errf("expected MIN or MAX after CLAMP")
 		}
-		if !p.acceptPunct(",") {
+		// Only a comma that another bound follows belongs to this CLAMP.
+		if !p.acceptCommaBefore("MIN", "MAX") {
 			break
 		}
 	}

@@ -587,10 +587,17 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 	s.Stats.mu.Lock()
 	s.Stats.Sent++
 	s.Stats.Accepted += int64(resp.Accepted)
-	s.Stats.Rejected += int64(len(resp.Rejected))
+	s.Stats.Rejected += int64(resp.Refused())
 	s.Stats.mu.Unlock()
-	if len(resp.Rejected) > 0 {
-		s.log.Printf("WARNING store rejected %d sample(s): %s", len(resp.Rejected), resp.Rejected[0].Reason)
+	// Refused, not len(Rejected): the store caps the rejections it names
+	// so its response body stays bounded, and the count is what says how
+	// many there really were.
+	if n := resp.Refused(); n > 0 {
+		reason := ""
+		if len(resp.Rejected) > 0 {
+			reason = resp.Rejected[0].Reason
+		}
+		s.log.Printf("WARNING store rejected %d sample(s): %s", n, reason)
 	}
 	// Symmetric with the beginFlush above. A partial take deliberately
 	// announces nothing, because some of the buffer's samples are not in

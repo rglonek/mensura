@@ -369,12 +369,25 @@ func TestRejectedCredentialHoldsTheBatchInsteadOfDroppingIt(t *testing.T) {
 	}
 }
 
-// The read offset must stay before a record until every sample it
-// produced has reached the sink. Advancing first meant a delivery
-// failure part-way through a record left the rest unqueued and the next
-// poll seeking past the bytes that would have produced them -- silently,
-// because a later record's own advance then carried the skipped bytes
-// into the acknowledged range.
+// A record is handed to the sink whole before a delivery failure is
+// reported, and the offset then covers exactly the record the sink now
+// holds.
+//
+// Two bugs meet here. The first: the offset was advanced before the
+// samples were queued, so a failure part-way through a record left the
+// rest unqueued and the next poll seeking past the bytes that would have
+// produced them. The second, which the first fix introduced: returning
+// on the first failure left the offset before a record the *extractor*
+// had already consumed, and extract.Stream is stateful -- so the next
+// poll fed the same record into it a second time, which double-counts an
+// aggregation window and appends a multiline join's capture twice.
+//
+// Sink.Add buffers the sample and only then flushes, so its error is the
+// flush's verdict and never a refusal to take the sample. Queuing the
+// rest of the record settles both: nothing is unqueued, the extractor
+// stays in step with the offset, and the samples wait in the sink's
+// buffer -- which is where an undelivered batch belongs, because acked
+// only ever moves on a committed flush.
 func TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
@@ -423,11 +436,22 @@ func TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord(t *testing.T) {
 	if err := f.read(context.Background(), tl); err == nil {
 		t.Fatal("read reported success against a shedding store")
 	}
-	if tl.offset != 0 {
-		t.Fatalf("offset moved to %d past a record whose samples never reached the sink", tl.offset)
+	// The record's one sample is in the sink, held rather than lost.
+	if got := sink.buffered(); got != 1 {
+		t.Fatalf("sink holds %d sample(s); the record's samples must be queued before the failure is reported", got)
 	}
-	if got := tl.pendingOffsetForTest(); got != 0 {
-		t.Fatalf("pending moved to %d, so a commit could acknowledge undelivered bytes", got)
+	// The offset covers exactly the record the sink now holds, and no
+	// more: the loop stopped at the first failure.
+	firstRecord := tl.offset
+	if firstRecord == 0 {
+		t.Fatal("the offset did not move past a record the extractor has already consumed; the next poll would feed it in twice")
+	}
+	if got := tl.pendingOffsetForTest(); got != firstRecord {
+		t.Fatalf("pending = %d, want %d: it must cover exactly the bytes whose samples the sink holds", got, firstRecord)
+	}
+	// Nothing is acknowledged: acked only moves on a committed flush.
+	if got := tl.ackedOffset(); got != 0 {
+		t.Fatalf("acked = %d after a failed delivery", got)
 	}
 
 	// With the store healthy the same bytes are read again, whole. The
@@ -442,10 +466,16 @@ func TestFollowLeavesTheOffsetBeforeAnUndeliveredRecord(t *testing.T) {
 	if err := sink.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
+	counts := rs.counts()
 	for i := int64(0); i < 3; i++ {
-		if !recorded(rs, i) {
-			t.Errorf("record %d was skipped rather than re-read", i)
+		if counts[i] == 0 {
+			t.Errorf("record %d was skipped rather than delivered", i)
 		}
+	}
+	// Once, not twice: the record whose delivery failed was queued whole
+	// and never handed to the extractor again.
+	if counts[0] != 1 {
+		t.Errorf("record 0 reached the store %d times; the failed record was re-read into the extractor", counts[0])
 	}
 }
 

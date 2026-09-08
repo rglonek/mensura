@@ -60,13 +60,52 @@ type FieldMeta struct {
 	BucketEdge   float64  `json:"bucket_edge,omitempty"`
 }
 
+// MaxReportedRejections bounds how many refused samples a write response
+// names individually.
+//
+// The bound is not cosmetic. A batch whose every sample is refused --
+// a spec declaring the wrong epoch unit does exactly that -- produced one
+// rejection record per sample, and the reasons are sentences: at a
+// configured --batch-size of a few thousand the body passed the one
+// megabyte the write client reads, so the client got truncated JSON,
+// reported "unexpected end of JSON input", and the sink classified that
+// as neither fatal nor an auth failure -- so it requeued the batch and
+// retried it forever. The store had already committed whatever it
+// accepted, no checkpoint could advance, and the ingester made no
+// progress again for the life of the process. A capped list plus a total
+// says the same thing in a bounded body.
+const MaxReportedRejections = 100
+
 // WriteResponse reports what happened to a batch. Partial rejection is
 // normal: the accepted remainder is committed and the rejects are named.
 type WriteResponse struct {
-	Accepted         int         `json:"accepted"`
-	Duplicate        bool        `json:"duplicate"`
-	Rejected         []Rejection `json:"rejected,omitempty"`
-	CatalogueVersion int64       `json:"catalogue_version"`
+	Accepted  int         `json:"accepted"`
+	Duplicate bool        `json:"duplicate"`
+	Rejected  []Rejection `json:"rejected,omitempty"`
+	// RejectedCount is how many samples were refused in all, which is
+	// more than len(Rejected) once the cap above is reached.
+	RejectedCount    int   `json:"rejected_count,omitempty"`
+	CatalogueVersion int64 `json:"catalogue_version"`
+}
+
+// Reject records one refused sample, naming it while the response has
+// room and always counting it.
+func (r *WriteResponse) Reject(index int, reason string) {
+	r.RejectedCount++
+	if len(r.Rejected) < MaxReportedRejections {
+		r.Rejected = append(r.Rejected, Rejection{Index: index, Reason: reason})
+	}
+}
+
+// Refused is how many samples the store would not take. It reads the
+// count where there is one and falls back to the named list, so a
+// response from a store built before the count existed still reports the
+// right number.
+func (r *WriteResponse) Refused() int {
+	if r.RejectedCount > len(r.Rejected) {
+		return r.RejectedCount
+	}
+	return len(r.Rejected)
 }
 
 type Rejection struct {

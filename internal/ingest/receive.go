@@ -791,10 +791,20 @@ func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (
 	// own arrival sequence: still one distinct value per occurrence.
 	pos := r.arrivalPos()
 	r.ing.cfg.Progress.AddSamples(int64(len(results)))
+	// Every sample of the record is queued before the failure is
+	// reported. Sink.Add buffers the sample and only then flushes, so its
+	// error is the flush's verdict rather than a refusal to take it, and
+	// returning on the first one abandoned the rest of a record that has
+	// no offset to be re-read from -- a silent partial loss on the one
+	// acquisition path with no way back to the bytes.
+	var addErr error
 	for n, res := range results {
-		if err := r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(peer, pos, n)); err != nil {
-			return false, err
+		if err := r.ing.cfg.Sink.Add(ctx, res, labels, keyHint(peer, pos, n)); err != nil && addErr == nil {
+			addErr = err
 		}
+	}
+	if addErr != nil {
+		return false, addErr
 	}
 	return perr != nil, nil
 }
