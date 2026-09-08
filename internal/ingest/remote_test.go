@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rglonek/mensura/pkg/extract"
+	"github.com/rglonek/mensura/pkg/wire"
 )
 
 // fakeSSH writes a stand-in for the ssh client: it records the remote
@@ -259,4 +262,122 @@ func TestRemoteFollowDetectsARotationThatGrewPastTheOffset(t *testing.T) {
 		}
 		t.Fatalf("%d line(s) of the replacement file were skipped, starting at %d", len(missing), missing[0])
 	}
+}
+
+// The spec used by the checkpoint test below: one aggregation window an
+// hour wide, so it never closes on its own and the extractor is still
+// holding the records when the connection ends.
+const remoteAggSpec = `
+version: 1
+profiles:
+  - name: numbered
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    patterns:
+      - set: lines
+        search: 'n='
+        extract: ['n=(?P<n>\d+)']
+        aggregate: {every: 1h, field: total, mode: increment}
+`
+
+// droppingSSH is fakeSSH with a tail that streams and then fails, which
+// is what a dropped connection looks like from this side.
+func droppingSSH(t *testing.T, dir, file string) string {
+	t.Helper()
+	for _, tool := range []string{"sh", "dd", "sed", "wc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not available, so the ssh stand-in cannot run", tool)
+		}
+	}
+	bin := filepath.Join(dir, "dropping-ssh")
+	script := fmt.Sprintf(`#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+  *"wc -c"*) wc -c < %q ;;
+  *) off=$(echo "$last" | sed -n 's/^tail -c +\([0-9][0-9]*\).*/\1/p')
+     [ -z "$off" ] && off=1
+     dd bs=1 skip=$((off-1)) if=%q 2>/dev/null
+     exit 1 ;;
+esac
+`, file, file)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ssh stand-in: %v", err)
+	}
+	return bin
+}
+
+// A dropped connection must still checkpoint the bytes behind the flush
+// it just delivered.
+//
+// The resume offset was only published when the tail exited cleanly, and
+// a tail that exits cleanly is the rare case: `tail -F` does not return.
+// So the ordinary path -- the connection drops, the extractor is flushed
+// into the sink, the loop reconnects -- delivered a window and then
+// resumed from before the records it was built from, rebuilt it and
+// delivered it again. Content keying collapses the two; under
+// `key: offset` the second copy carries a different flush hint and lands
+// as a duplicate row. Every clean shutdown did the same thing.
+func TestRemoteFollowCheckpointsWhatItFlushedAfterADroppedConnection(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+	appendLines(t, logPath, 0, 5)
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	stateDir := filepath.Join(dir, "state")
+	cps, err := NewCheckpointStore(stateDir)
+	if err != nil {
+		t.Fatalf("checkpoints: %v", err)
+	}
+	target := "h:" + logPath
+	stream := StreamID(target)
+
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newRemoteIngest(t, remoteAggSpec, rs, stateDir)
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	bin := droppingSSH(t, dir, logPath)
+	runRemoteFollowFor(t, ing, RemoteOptions{
+		Host: "h", Paths: []string{logPath}, SSHBinary: bin,
+		ProbeInterval: time.Hour, ReconnectBackoff: 50 * time.Millisecond,
+	}, func() bool {
+		cp, ok := cps.Load(stream)
+		return ok && cp.AckedOffset >= info.Size()
+	})
+
+	cp, ok := cps.Load(stream)
+	if !ok {
+		t.Fatal("no checkpoint was written at all, so every reconnect re-reads the whole file and re-emits the window it just delivered")
+	}
+	if cp.AckedOffset != info.Size() {
+		t.Fatalf("checkpoint is at %d of %d bytes: the window was delivered but the bytes it came from were never acknowledged, so the reconnect rebuilds and re-delivers it", cp.AckedOffset, info.Size())
+	}
+}
+
+// newRemoteIngest is newFollowIngest with the spec left to the caller, so
+// a test can exercise a profile that buffers records rather than emitting
+// one per line.
+func newRemoteIngest(t *testing.T, specBody string, rs *recordingStore, stateDir string) (*Ingest, *Sink) {
+	t.Helper()
+	spec, err := extract.Parse([]byte(specBody))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize = 8
+	cfg.FlushEvery = 20 * time.Millisecond
+	sink := NewSink(client, cfg, testLogger{t})
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: stateDir, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	return ing, sink
 }

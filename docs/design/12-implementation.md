@@ -1747,6 +1747,98 @@ dashboard variable built on that key.
   sent on `/v1/write` and withheld on the four endpoints that share the
   same in-memory budget.
 
+### 6.86 A fingerprint covers bytes the moment they are read
+
+`checkRotation` runs before `read`, so the content hash covering a poll's
+bytes did not exist until the poll after it — and a tailer that had just
+been opened had none at all, because `fingerprintWidth(0)` is 0. A rewrite
+in place landing in that window was invisible from both directions: the
+size test does not fire when the replacement is at least as long as the
+old read offset, and there was no stored hash to compare content against.
+The widening step then ran on the *new* content and recorded it as the
+fingerprint of bytes the tailer had never read, so the head of the
+replacement was skipped permanently and silently.
+
+`widenFingerprint` is now called where the read head stops as well as in
+`checkRotation`, which leaves no interval between consuming bytes and
+covering them. It is still only ever called *after* the comparison, never
+before: widening first would hash whatever the file holds now and call it
+what we read.
+
+### 6.87 A dropped remote connection checkpoints what it flushed
+
+`followRemotePath` published its resume offset only when the tail exited
+cleanly — and a tail that exits cleanly is the rare case, because
+`tail -F` does not return. So the ordinary path (the connection drops, the
+extractor is flushed into the sink, the loop reconnects) delivered a
+window and then resumed from *before* the records it was built from,
+rebuilt it and delivered it again. Content keying collapses the two
+copies; under `key: offset` the second carries a different `flush:N` hint
+— a per-connection sequence number, not a byte offset — and lands as a
+duplicate row. Every clean shutdown did the same thing.
+
+The offset is now published on every exit, and it is read off
+`remoteStream` rather than from the tail's own byte counter. That is what
+keeps the delivery-failure path honest: there the tail's counter has
+already moved past a record whose samples were not all queued, while
+`remoteStream.consumed` — which only advances once delivery has succeeded
+— has not.
+
+### 6.88 A receiver's TCP connections are closed and joined
+
+Cancelling a receiver closed its listener, which stops new connections and
+nothing else. The ones already accepted stayed inside a blocking read: the
+loop only tests the context between records, and `connIdleTimeout` is
+fifteen minutes. So `Receive` went on to `flushAll` and the final
+`Sink.Flush` while those goroutines were still turning records into
+samples behind it, and whatever they read in that window was buffered into
+a sink that had already flushed for the last time — with no checkpoint to
+re-read it from, because a socket has none. The UDP drain goroutine was
+joined for exactly this reason; the TCP half was left.
+
+Each connection now has a watcher that pulls its read deadline into the
+past when the context is cancelled, and `serveTCP` waits for its handlers
+before returning. The deadline the loop resets after each record cannot
+undo this, because the very next thing the loop does is test the context.
+
+### 6.89 A field kind is validated where it is declared and where it arrives
+
+A kind is a plain string all the way from a spec's `fields:` block,
+through the write API, into the catalogue and out to `mql.Validate` —
+which compares it against the four it knows and ignores anything else.
+Nothing checked it anywhere. So `kind: couter` compiled, was accepted, was
+persisted, and silently withdrew every behaviour it was written to switch
+on: no `W102` "counter is plotted raw; consider RATE", no `RATE`
+pre-selection in the builder, and for a mistyped `string` no `E005`
+refusal of numeric modifiers and no string column under `FORMAT table`. A
+typo that changes nothing visible except the diagnostics is the one an
+operator never finds.
+
+`model.ValidateKind` is now applied in `Profile.compile`, where the spec
+author sees it, and in `applyFieldMeta`, where it is client input and
+comes back as a 400 — the same treatment set and field names already get,
+and for the same reason: a fault in what was sent has to be fatal on the
+first attempt rather than retried at full rate.
+
+### 6.90 Smaller corrections
+
+- A profile's, a pattern's and `defaults.labels`' declared label keys are
+  validated at compile time. A declared label is a column name on every
+  row the profile writes, and it was the one name in a spec nothing
+  checked: the store validates it per sample, so `labels: [timestamp]` —
+  which names the indexed column — compiled cleanly and then had every
+  sample the profile produced rejected, one at a time, for the life of the
+  process, with nothing pointing back at the spec. This is the check
+  `route:` targets were given in section 6.72, at the same place.
+- `runHeatmap` records a group only where a cell exists to render it.
+  `groups[]` was written per scanned row, before any bucket column was
+  looked at, so a row that produced no cell still cost an entry — and
+  neither ceiling ever moved, because both count cells. A set holding more
+  than the histogram, grouped by a high-cardinality label, therefore grew
+  a map bounded by nothing at all — the unbounded accumulation the
+  heatmap's two ceilings were added to stop, one map along from where they
+  were put.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

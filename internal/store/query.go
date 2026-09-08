@@ -555,7 +555,6 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		}
 		labels := s.rowLabels(row, q.By)
 		g := seriesKey(labels, q.By, "")
-		groups[g] = labels
 		bucketTs := floorTo(ts, window)
 		for bi, col := range bs.Buckets {
 			if col == "" {
@@ -579,6 +578,15 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 				cell = map[int64]float64{}
 				sums[k] = cell
 			}
+			// Recorded here, where a cell exists to render it, rather than
+			// once per scanned row. A row that carries none of the bucket
+			// columns -- ordinary in a set that holds more than the
+			// histogram -- created no cell and tripped no gate, so the
+			// group map grew with the cardinality of BY across the whole
+			// range while both ceilings watched a map that never moved.
+			// That is the unbounded accumulation these gates were added to
+			// stop, one map along from where they were put.
+			groups[g] = labels
 			if _, seen := cell[bucketTs]; !seen {
 				points++
 				if maxPoints > 0 && points > maxPoints {

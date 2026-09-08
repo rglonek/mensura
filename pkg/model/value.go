@@ -20,6 +20,26 @@ const (
 	KindString  Kind = "string"  // table/logs payload, never plotted
 )
 
+// ValidateKind refuses a field kind this build does not act on.
+//
+// Nothing used to check it. A kind is a plain string all the way from a
+// spec's `fields:` block, through the write API, into the catalogue and
+// out to the query validator -- which compares it against the four
+// constants above and simply does not recognise anything else. So
+// `kind: couter` compiled, was accepted, was persisted, and then silently
+// switched off every behaviour the declaration was written for: no W102
+// "counter is plotted raw; consider RATE", no RATE pre-selection in the
+// builder, and for `string` no E005 refusal of numeric modifiers and no
+// string column under FORMAT table. A typo that changes nothing visible
+// except the diagnostics is the one an operator never finds.
+func ValidateKind(k Kind) error {
+	switch k {
+	case KindCounter, KindGauge, KindDelta, KindString:
+		return nil
+	}
+	return fmt.Errorf("unknown kind %q: expected counter, gauge, delta or string", string(k))
+}
+
 // ValueType is the storage type of a field value.
 type ValueType uint8
 

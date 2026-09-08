@@ -220,7 +220,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		read, err := i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity())
+		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity())
 		if flushed, pos := rs.flushAll(); len(flushed) > 0 {
 			i.cfg.Progress.AddSamples(int64(len(flushed)))
 			for n, r := range flushed {
@@ -229,12 +229,24 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		}
 		// The tail held the offset back to the oldest record its
 		// extractor was buffering; that buffer has just been flushed into
-		// the sink, so the whole of what was read is now the store's to
-		// hold and the checkpoint may cover it. Skipped on the error
-		// path, where the read stopped short of what it had queued.
-		if err == nil {
-			progress.advance(read)
-		}
+		// the sink, so those bytes are now the store's to hold and the
+		// checkpoint may cover them.
+		//
+		// It is published on every exit, not only the clean one, and it
+		// is read off the stream rather than from the tail's own byte
+		// count. The old shape did neither, and a dropped connection is
+		// the ordinary exit here: the flush was delivered while the
+		// resume offset stayed behind the window it came from, so the
+		// reconnect re-read those records and the extractor emitted the
+		// same window a second time -- collapsed by a content key,
+		// landing as a duplicate row under `key: offset`, whose flush
+		// hint is a per-connection sequence number rather than a byte
+		// offset. The same happened on every clean shutdown. Reading it
+		// off the stream is what keeps the delivery-failure path honest:
+		// there the tail's counter has already moved past a record whose
+		// samples were not all queued, while remoteStream.consumed --
+		// which only advances once delivery has succeeded -- has not.
+		progress.advance(rs.held())
 		if ctx.Err() != nil {
 			return nil
 		}

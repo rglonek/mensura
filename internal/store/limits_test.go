@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -313,6 +314,56 @@ func TestLogsFormatReturnsNewestRecords(t *testing.T) {
 	for i := 1; i < len(resp.Rows); i++ {
 		if resp.Rows[i-1].Values[0].(int64) > resp.Rows[i].Values[0].(int64) {
 			t.Fatal("rows are not in ascending time order")
+		}
+	}
+}
+
+// A heatmap over a set that also holds rows without the bucket columns
+// must not accumulate a group for every one of them.
+//
+// groups[] was recorded per scanned row, before any bucket column was
+// looked at, so a row that produced no cell still cost an entry -- and
+// neither ceiling ever moved, because both count cells. A set holding
+// more than the histogram, grouped by a high-cardinality label, therefore
+// grew a map bounded by nothing at all: the very accumulation these gates
+// were added to stop, one map along from where they were put.
+func TestHeatmapDoesNotGroupRowsThatCarryNoBuckets(t *testing.T) {
+	s := openTuned(t, nil)
+	now := time.Now().UnixMilli()
+	s.applyFieldMeta([]wire.FieldMeta{
+		{Set: "h", Field: "b0", BucketSet: "lat", BucketIndex: 0, BucketEdge: 0},
+		{Set: "h", Field: "b1", BucketSet: "lat", BucketIndex: 1, BucketEdge: 1},
+	})
+	// One host carries the histogram; a hundred others carry only an
+	// unrelated column, which is ordinary in a set that holds more than
+	// one kind of record.
+	put(t, s, "h", model.Sample{
+		TSMs:   now,
+		Labels: map[string]string{"host": "with-buckets"},
+		Fields: map[string]model.Value{"b0": model.Int(1), "b1": model.Int(2)},
+	})
+	for i := 0; i < 100; i++ {
+		put(t, s, "h", model.Sample{
+			TSMs:   now + int64(i) + 1,
+			Labels: map[string]string{"host": fmt.Sprintf("no-buckets-%d", i)},
+			Fields: map[string]model.Value{"other": model.Int(1)},
+		})
+	}
+	q := &mql.Query{
+		Kind: mql.KindQuery, From: "h", Format: mql.FormatHeatmap,
+		Select: []mql.FieldExpr{{Histogram: "lat"}}, By: []string{"host"},
+	}
+	resp, err := s.Query(context.Background(), &wire.QueryRequest{AST: q, FromMs: 0, ToMs: math.MaxInt64, MaxPoints: 100})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	// Only the host that carried buckets draws, and it draws both of them.
+	if len(resp.Series) != 2 {
+		t.Fatalf("expected the two buckets of the one host that carries them, got %d series", len(resp.Series))
+	}
+	for _, ser := range resp.Series {
+		if ser.Labels["host"] != "with-buckets" {
+			t.Fatalf("series %q is grouped under %q, which carries no buckets", ser.Name, ser.Labels["host"])
 		}
 	}
 }
