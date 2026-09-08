@@ -652,11 +652,22 @@ func (s *Store) lookup(key, value string) (int32, bool) {
 	return idx, hit
 }
 
+// labelValue resolves a stored dictionary index back to its string. A hole
+// is not a value: it is a position whose record was lost, and every other
+// reader of the dictionary already skips one. Reporting it as the empty
+// string instead meant `LABELS host WHERE …` -- the filtered form, which
+// reads indices off rows -- listed an empty value among the hosts, so a
+// dashboard variable grew a blank option that the unfiltered `LABELS host`
+// never showed. Nothing may intern "" (ValidateLabelValue refuses it), so
+// an empty entry can only ever be a hole.
 func (s *Store) labelValue(key string, idx int32) (string, bool) {
 	s.dictMu.RLock()
 	defer s.dictMu.RUnlock()
 	d, ok := s.dict[key]
 	if !ok || idx < 0 || int(idx) >= len(d.Entries) {
+		return "", false
+	}
+	if d.Entries[idx] == "" {
 		return "", false
 	}
 	return d.Entries[idx], true

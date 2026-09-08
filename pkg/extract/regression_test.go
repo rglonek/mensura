@@ -316,6 +316,13 @@ func TestPartialHistogramSkipsDerivedColumns(t *testing.T) {
 // and the declaration then travelled with every write as metadata the
 // store refuses outright -- one spec typo turning into a 400 on every
 // batch the ingester produced.
+//
+// The ingest-progress set is the documented exemption, and it is the one
+// name that has to be accepted here: applySetMeta exempts it by name
+// precisely so a spec can age it out, and refusing it in the compiler made
+// that exemption unreachable. The one set every ingester writes was then
+// also the one set no spec could give a retention, so it was routed to the
+// unsharded shard the sweep skips and kept forever.
 func TestReservedSetNameIsRefusedInTheSetsBlock(t *testing.T) {
 	body := `
 version: 1
@@ -331,7 +338,15 @@ profiles:
         extract: ['x (?P<n>\d+)']
 `
 	mustSpec(t, strings.Replace(body, "%s", "app", 1))
-	for _, name := range []string{"_mensura_ingest", "_mensura_catalogue", "_mensura_x"} {
+	spec := mustSpec(t, strings.Replace(body, "%s", model.IngestSet, 1))
+	opt, ok := spec.Sets[model.IngestSet]
+	if !ok {
+		t.Fatalf("the ingest-progress set did not survive compilation")
+	}
+	if opt.RetentionMs() == nil || *opt.RetentionMs() != int64(time.Hour/time.Millisecond) {
+		t.Errorf("retention for %s did not compile: %v", model.IngestSet, opt.RetentionMs())
+	}
+	for _, name := range []string{"_mensura_catalogue", "_mensura_x"} {
 		msg := specError(t, strings.Replace(body, "%s", name, 1))
 		if !strings.Contains(msg, "reserved") || !strings.Contains(msg, name) {
 			t.Errorf("refusal for %q does not name the problem: %s", name, msg)
@@ -804,6 +819,44 @@ profiles:
 	for _, l := range s.Lint() {
 		if l.Code == "L004" {
 			t.Fatalf("a label `identity:` supplies was reported unused: %s", l.Msg)
+		}
+	}
+}
+
+// A `route:` target is a destination set exactly as `set:` is, and it was
+// the one that nothing checked. A spec routing to a name carrying the '@'
+// that separates a set from its shard suffix, or to the store's reserved
+// prefix, compiled cleanly and then failed at run time twice over: the
+// field metadata Declarations() derives for that set comes back 400, which
+// the write client classifies as fatal, so the first batch carrying it is
+// dropped outright -- reported as a hole, which freezes every followed
+// file's checkpoint -- and every sample the route produces is rejected by
+// the store for the life of the process, with nothing pointing at the spec.
+func TestRouteTargetSetNamesAreValidated(t *testing.T) {
+	body := `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    patterns:
+      - set: app
+        search: "x"
+        route:
+          - regex: 'x (?P<n>\d+)'
+            set: %s
+`
+	// A plain name still compiles, and a route with no set of its own
+	// still inherits the pattern's -- which is already validated.
+	mustSpec(t, strings.Replace(body, "%s", "app_errors", 1))
+	inherited := mustSpec(t, strings.Replace(body, "%s", `""`, 1))
+	if got := inherited.Profiles[0].Patterns[0].Route[0].Set; got != "app" {
+		t.Errorf("a route with no set of its own resolved to %q, expected the pattern's", got)
+	}
+	for _, name := range []string{"_mensura_ingest", "_mensura_x", `"has@at"`, `"has space"`} {
+		msg := specError(t, strings.Replace(body, "%s", name, 1))
+		if !strings.Contains(msg, "route") {
+			t.Errorf("refusal for route target %s does not say it is a route: %s", name, msg)
 		}
 	}
 }

@@ -361,12 +361,20 @@ func (s *Spec) Compile() error {
 		if err := model.ValidateSetName(name); err != nil {
 			return fmt.Errorf("extract: sets: %w", err)
 		}
-		// The same rule the patterns are held to. Without it a spec
-		// declaring retention for a reserved name compiled, and the
-		// declaration then travelled with every write as metadata the
-		// store refuses outright -- one spec typo turning into a 400 on
-		// every batch the ingester produced.
-		if model.IsReserved(name) {
+		// The same rule the patterns are held to, with the same single
+		// exemption the store makes. Without the rule a spec declaring
+		// retention for a reserved name compiled, and the declaration
+		// then travelled with every write as metadata the store refuses
+		// outright -- one spec typo turning into a 400 on every batch
+		// the ingester produced.
+		//
+		// The exemption is the ingest-progress set. applySetMeta accepts
+		// it by name precisely so a spec can age it out, and refusing it
+		// here made that exemption unreachable: the one set every
+		// ingester writes was also the one set no spec could give a
+		// retention, so it was routed to the unsharded shard the
+		// retention sweep skips and then kept forever.
+		if model.IsReserved(name) && name != model.IngestSet {
 			return fmt.Errorf("extract: set %q uses the reserved prefix %q", name, model.ReservedPrefix)
 		}
 		// A range check, not only a syntax check: ParseDuration accepts a
@@ -576,6 +584,24 @@ func (p *Profile) compile(s *Spec) error {
 			pat.Route[i].re = re
 			if pat.Route[i].Set == "" {
 				pat.Route[i].Set = pat.Set
+			}
+			// A route target is a destination set exactly as `set:` is,
+			// and it was the one that nothing checked. A spec routing to
+			// a name carrying the '@' that separates a set from its shard
+			// suffix, or to the store's own reserved prefix, compiled
+			// cleanly and then failed at run time twice over: the field
+			// metadata Declarations() derives for that set comes back
+			// 400, which the write client classifies as fatal, so the
+			// first batch carrying it is dropped outright -- reported to
+			// the delivery observers as a hole, which freezes every
+			// followed file's checkpoint -- and every sample the route
+			// ever produces is rejected by the store, for the life of the
+			// process, with nothing anywhere pointing back at the spec.
+			if err := model.ValidateSetName(pat.Route[i].Set); err != nil {
+				return fmt.Errorf("route %d: %w", i+1, err)
+			}
+			if model.IsReserved(pat.Route[i].Set) {
+				return fmt.Errorf("route %d: set %q uses the reserved prefix %q", i+1, pat.Route[i].Set, model.ReservedPrefix)
 			}
 		}
 		if len(pat.extract) == 0 && len(pat.Route) == 0 {

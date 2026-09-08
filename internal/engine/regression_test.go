@@ -432,3 +432,39 @@ func TestEmptyOrMatchesNothing(t *testing.T) {
 		t.Fatalf("an empty OR matched %d row(s); it must match none", len(rows))
 	}
 }
+
+// A tagged forward pointer whose index key is gone means the row is gone.
+// Falling through and decoding the pointer's own nine bytes as a row read
+// encodeRow's leading column count as zero, so Get answered "found" with a
+// row that carries no columns -- and every caller then saw a record that
+// exists and holds nothing rather than no record at all. The untagged
+// eight-byte form an earlier build wrote still falls through, because
+// there those bytes really may be a small row.
+func TestGetReportsAMissingIndexedRowAsAbsent(t *testing.T) {
+	db := openTestDB(t)
+	pk := [16]byte{7}
+	if err := db.PutBatch("s", []Record{{Key: pk, Row: Row{
+		model.TimestampField: model.Int(1000), "v": model.Int(42),
+	}}}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	sm, ok := db.setRef("s")
+	if !ok {
+		t.Fatal("set was not registered")
+	}
+	if _, found, err := db.Get("s", pk); err != nil || !found {
+		t.Fatalf("baseline get: found=%v err=%v", found, err)
+	}
+	// Delete the payload and leave the pointer, which is the shape a
+	// half-applied delete or a torn write leaves behind.
+	if err := db.pdb.Delete(indexKey(sm.id, sm.indexCol, 1000, pk), db.writeOpts); err != nil {
+		t.Fatalf("delete index key: %v", err)
+	}
+	row, found, err := db.Get("s", pk)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if found {
+		t.Fatalf("a dangling pointer read as a found row with %d column(s)", len(row))
+	}
+}

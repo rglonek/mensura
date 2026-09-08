@@ -1493,3 +1493,92 @@ func TestSeriesNameKeepsAbsentLabelSlotsDistinct(t *testing.T) {
 		t.Fatalf("legend is %q, want %q", got, "a : b : req/s")
 	}
 }
+
+// A hole in a label dictionary is a position whose record was lost, not a
+// value. Every other reader already skips one -- LabelValues and the regex
+// lowering both do -- but labelValue reported it as the empty string, so
+// the filtered form of a LABELS query, which is the one that reads indices
+// off rows, listed an empty value among the hosts. A dashboard variable
+// built on it grew a blank option the unfiltered form never showed.
+func TestADictionaryHoleIsNotALabelValue(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	now := time.Now()
+	writeSamples(t, s, "http", []model.Sample{
+		{TSMs: now.UnixMilli(), Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(1)}},
+		{TSMs: now.Add(time.Millisecond).UnixMilli(), Labels: map[string]string{"host": "b"}, Fields: map[string]model.Value{"v": model.Int(2)}},
+	})
+	// Punch a hole where "a" was, the way a lost dictionary record leaves
+	// one: the rows keep pointing at the position, the position holds
+	// nothing.
+	idx, ok := s.lookup("host", "a")
+	if !ok {
+		t.Fatal("host=a was never interned")
+	}
+	s.dictMu.Lock()
+	d := s.dict["host"]
+	d.Entries[idx] = ""
+	delete(d.index, "a")
+	d.rebuildHoles()
+	s.dictMu.Unlock()
+
+	if v, ok := s.labelValue("host", idx); ok {
+		t.Fatalf("a hole resolved to %q; it is not a value", v)
+	}
+	for _, v := range s.LabelValues("host") {
+		if v == "" {
+			t.Fatal("the unfiltered LABELS form listed a hole")
+		}
+	}
+	// The filtered form scans rows and translates their indices, so it is
+	// the one that saw the hole.
+	resp := query(t, s, `LABELS host WHERE HAS v`, now.Add(-time.Hour).UnixMilli(), now.Add(time.Hour).UnixMilli())
+	for _, r := range resp.Rows {
+		if len(r.Values) > 0 && r.Values[0] == "" {
+			t.Fatalf("LABELS with a predicate listed an empty value: %+v", resp.Rows)
+		}
+	}
+}
+
+// The auxiliary query forms answer the same shape the data path does.
+// Series has no omitempty, so leaving it nil put "series": null on the
+// wire for exactly the queries a dashboard variable runs, while every
+// other query answers "series": [].
+func TestAuxiliaryFormsAnswerAnEmptySeriesList(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Durability = "batch"
+	cfg.RetentionSweep = 0
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	now := time.Now()
+	writeSamples(t, s, "http", []model.Sample{{
+		TSMs: now.UnixMilli(), Labels: map[string]string{"host": "a"},
+		Fields: map[string]model.Value{"v": model.Int(1)},
+	}})
+	for _, text := range []string{`SETS`, `FIELDS FROM http`, `LABEL KEYS FROM http`, `LABELS host`} {
+		resp := query(t, s, text, now.Add(-time.Hour).UnixMilli(), now.Add(time.Hour).UnixMilli())
+		if resp.Series == nil {
+			t.Errorf("%s answered series: null", text)
+		}
+		b, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", text, err)
+		}
+		if bytes.Contains(b, []byte(`"series":null`)) {
+			t.Errorf("%s marshalled series as null", text)
+		}
+	}
+}

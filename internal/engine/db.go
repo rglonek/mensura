@@ -529,6 +529,17 @@ func (d *DB) Get(set string, pk [16]byte, projection ...string) (Row, bool, erro
 			_ = c2.Close()
 		case err != pebble.ErrNotFound:
 			return nil, false, err
+		case taggedDataPointer(payload):
+			// The tag says this is a pointer and nothing else, so a
+			// missing index key means the row is gone -- half-deleted, or
+			// never fully written. Falling through decoded the pointer's
+			// own nine bytes as a row: encodeRow's leading column count
+			// reads as zero, so Get answered "found" with an empty row
+			// and every caller saw a record that carries no columns
+			// rather than no record at all. Only the untagged eight-byte
+			// form an earlier build wrote still falls through, because
+			// there those bytes really may be a small row.
+			return nil, false, nil
 		}
 	}
 	row, err := decodeRow(payload, projectionSet(projection))

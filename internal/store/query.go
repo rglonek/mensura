@@ -879,7 +879,7 @@ func seriesName(labels map[string]string, by []string, field string) string {
 // ---------- auxiliary query forms ----------
 
 func (s *Store) querySets() *wire.QueryResponse {
-	resp := &wire.QueryResponse{Columns: []wire.Column{{Name: "set", Type: "string"}}}
+	resp := &wire.QueryResponse{Series: []wire.Series{}, Columns: []wire.Column{{Name: "set", Type: "string"}}}
 	for _, n := range s.Sets() {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{n}})
 	}
@@ -910,7 +910,7 @@ func (s *Store) queryFields(set string) (*wire.QueryResponse, error) {
 		return nil, mql.Diag{Code: "E002", Msg: fmt.Sprintf("unknown set %q", set)}
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
-	resp := &wire.QueryResponse{Columns: []wire.Column{
+	resp := &wire.QueryResponse{Series: []wire.Series{}, Columns: []wire.Column{
 		{Name: "field", Type: "string"}, {Name: "kind", Type: "string"},
 		{Name: "unit", Type: "string"}, {Name: "max_interval_ms", Type: "number"},
 	}}
@@ -921,7 +921,7 @@ func (s *Store) queryFields(set string) (*wire.QueryResponse, error) {
 }
 
 func (s *Store) queryLabelKeys(set string) *wire.QueryResponse {
-	resp := &wire.QueryResponse{Columns: []wire.Column{{Name: "label", Type: "string"}}}
+	resp := &wire.QueryResponse{Series: []wire.Series{}, Columns: []wire.Column{{Name: "label", Type: "string"}}}
 	for _, k := range s.LabelKeys(set) {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{k}})
 	}
@@ -938,7 +938,7 @@ func (s *Store) queryLabelKeys(set string) *wire.QueryResponse {
 // dashboard variable written as `LABELS host WHERE dc = "eu-west-1"`
 // returned the hosts of every datacentre.
 func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.QueryRequest, maxSeries, maxPoints int) (*wire.QueryResponse, error) {
-	resp := &wire.QueryResponse{Columns: []wire.Column{{Name: "value", Type: "string"}}}
+	resp := &wire.QueryResponse{Series: []wire.Series{}, Columns: []wire.Column{{Name: "value", Type: "string"}}}
 	if q.Where.Empty() {
 		for _, v := range s.LabelValues(q.Label) {
 			resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
