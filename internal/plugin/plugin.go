@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -187,7 +188,7 @@ func tableFrame(resp *wire.QueryResponse, executed string) *data.Frame {
 			vals := make([]*float64, len(resp.Rows))
 			for ri, r := range resp.Rows {
 				if ci < len(r.Values) {
-					if f, ok := r.Values[ci].(float64); ok {
+					if f, ok := toFloat64(r.Values[ci]); ok {
 						v := f
 						vals[ri] = &v
 					}
@@ -198,9 +199,7 @@ func tableFrame(resp *wire.QueryResponse, executed string) *data.Frame {
 			vals := make([]string, len(resp.Rows))
 			for ri, r := range resp.Rows {
 				if ci < len(r.Values) {
-					if s, ok := r.Values[ci].(string); ok {
-						vals[ri] = s
-					}
+					vals[ri] = toString(r.Values[ci])
 				}
 			}
 			fields = append(fields, data.NewField(col.Name, nil, vals))
@@ -209,6 +208,41 @@ func tableFrame(resp *wire.QueryResponse, executed string) *data.Frame {
 	f := data.NewFrame("table", fields...)
 	f.Meta = &data.FrameMeta{ExecutedQueryString: executed}
 	return f
+}
+
+// toFloat64 and toString read a table cell without insisting that the
+// column's declared type and the cell's Go type already agree.
+//
+// The store reconciles the two before it answers, but a cell arrives here
+// as `any` -- straight from the query engine in embedded mode and through
+// encoding/json in proxy mode, where every number is a float64 whatever it
+// was. A bare type assertion turned any disagreement into an empty cell,
+// which is the one rendering that says "there was no value here" when
+// there was one.
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int64:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+func toString(v any) string {
+	switch s := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return s
+	case float64:
+		return strconv.FormatFloat(s, 'g', -1, 64)
+	case int64:
+		return strconv.FormatInt(s, 10)
+	}
+	return fmt.Sprint(v)
 }
 
 func toInt64(v any) (int64, bool) {

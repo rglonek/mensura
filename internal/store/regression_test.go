@@ -1154,7 +1154,7 @@ func TestCardinalityBudgetCountsLiveValuesNotHoles(t *testing.T) {
 	d := s.dict["host"]
 	delete(d.index, "b")
 	d.Entries[1] = ""
-	d.rebuildHoles()
+	d.rebuildIndex()
 	s.dictMu.Unlock()
 
 	if _, err := s.intern("host", "d"); err != nil {
@@ -1527,7 +1527,7 @@ func TestADictionaryHoleIsNotALabelValue(t *testing.T) {
 	d := s.dict["host"]
 	d.Entries[idx] = ""
 	delete(d.index, "a")
-	d.rebuildHoles()
+	d.rebuildIndex()
 	s.dictMu.Unlock()
 
 	if v, ok := s.labelValue("host", idx); ok {
