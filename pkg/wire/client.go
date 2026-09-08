@@ -161,6 +161,17 @@ func (c *Client) jitter(n int64) int64 {
 	return rand.Int63n(n)
 }
 
+// maxWriteResponseBytes bounds the write response this client will read.
+//
+// It is generous because truncating one is not a recoverable condition:
+// the store has already committed whatever it accepted, so a body cut
+// short unmarshals to an error that is neither fatal nor an auth failure,
+// the sink requeues the batch, and the same request is retried forever
+// with no checkpoint ever advancing. Recent stores cap the rejections
+// they name (wire.MaxReportedRejections) so the body cannot get near
+// this; the headroom is for one that does not.
+const maxWriteResponseBytes = 16 << 20
+
 func (c *Client) postWrite(ctx context.Context, payload []byte, encoding, idempotencyKey string) (*WriteResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/write", bytes.NewReader(payload))
 	if err != nil {
@@ -182,10 +193,10 @@ func (c *Client) postWrite(ctx context.Context, payload []byte, encoding, idempo
 	defer func() {
 		// Drain before closing, or a body larger than the read limit
 		// leaves the connection unreusable and the pool churns.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxWriteResponseBytes))
 		_ = resp.Body.Close()
 	}()
-	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, maxWriteResponseBytes))
 
 	switch {
 	case resp.StatusCode == http.StatusOK:

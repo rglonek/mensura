@@ -94,12 +94,22 @@ Notes:
   "accepted":  4096,
   "duplicate": false,
   "rejected":  [ {"index": 17, "reason": "label 'req_id' exceeds cardinality limit"} ],
+  "rejected_count": 1,
   "catalogue_version": 128
 }
 ```
 
 - `200` — the batch is committed (memtable + WAL if enabled). Partial rejection
   is reported in `rejected[]`; the accepted remainder is committed.
+- `rejected[]` names at most 100 samples and `rejected_count` carries the
+  total, so the response body is bounded by the cap rather than by the
+  batch. A batch a spec makes the store refuse wholesale otherwise
+  produced a body proportional to it, and one past what the client reads
+  is a truncated reply the client cannot parse — which reads as a failed
+  write, so the batch is retried forever with nothing ever advancing
+  ([12-implementation.md §6.78](12-implementation.md)). A response with no
+  `rejected_count` came from an older store; `len(rejected)` is the total
+  there.
 - `200` with `duplicate: true` — this `Idempotency-Key` was already committed;
   nothing was written. Keys are remembered for `idempotency_window` (default
   10 min) in a bounded LRU. (The shipped bound is on entry count rather than on age —

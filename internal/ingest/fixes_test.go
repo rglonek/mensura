@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -391,5 +393,121 @@ func TestReceiveHTTPSamplesReportsRefusals(t *testing.T) {
 	}
 	if out.Refused != 1 || out.Reason == "" {
 		t.Fatalf("refused %d with reason %q, want 1 and a reason", out.Refused, out.Reason)
+	}
+}
+
+// aggSpec counts occurrences per key into one-second windows, so a record
+// that closes a window also opens the next one: the shape that makes
+// re-reading a record into the extractor observable.
+const aggSpec = `
+version: 1
+profiles:
+  - name: counted
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    labels: [k]
+    patterns:
+      - set: lines
+        search: 'k='
+        extract: ['k=(?P<k>\w+)']
+        aggregate:
+          every: 1s
+          on: [k]
+          field: n
+          mode: increment
+`
+
+// A record whose delivery fails must not be fed to the extractor twice.
+//
+// extract.Stream is stateful and reading a record into it is not
+// idempotent: an aggregation window counts the line again, and a
+// multiline join appends its capture again. The follow loop used to
+// return on the first Sink.Add failure without advancing the offset, so
+// the next poll did exactly that -- and the window it had already opened
+// came back reporting one more occurrence than the file held.
+func TestFollowDoesNotCountARecordTwiceAfterADeliveryFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	writeAt := func(offsets ...int64) {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer f.Close()
+		for _, off := range offsets {
+			if _, err := fmt.Fprintf(f, "%d k=a\n", base+off); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+		}
+	}
+	// The first record opens a window; the second closes it and opens the
+	// next; the third closes that one.
+	writeAt(0, 2000)
+
+	var refuse atomic.Bool
+	refuse.Store(true)
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	guard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(wire.APIError{Error: "shedding"})
+			return
+		}
+		rs.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer guard.Close()
+
+	spec, err := extract.Parse([]byte(aggSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(guard.URL, "")
+	client.Compress, client.MaxRetries = false, 0
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize, cfg.FlushEvery = 1, time.Hour
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("checkpoints: %v", err)
+	}
+	f := &follower{ing: ing, opts: FollowOptions{MaxRecordBytes: defaultMaxRecordBytes}, cps: cps,
+		tailers: map[string]*tailer{}, noProfile: map[string]time.Time{}}
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	// The second record closes the first window; delivering it fails.
+	if err := f.read(context.Background(), tl); err == nil {
+		t.Fatal("read reported success against a shedding store")
+	}
+
+	// The store recovers, and a third record closes the second window.
+	refuse.Store(false)
+	sink.setClock(func() time.Time { return time.Now().Add(2 * retryHold) })
+	writeAt(3000)
+	if err := f.read(context.Background(), tl); err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if err := sink.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	counts := rs.counts()
+	// Two windows, one record each. A window reporting 2 is the record
+	// whose delivery failed being counted a second time.
+	if counts[2] != 0 {
+		t.Fatalf("a window reported 2 occurrences from 2 records in separate windows: %v", counts)
+	}
+	if counts[1] != 2 {
+		t.Fatalf("expected two windows of one occurrence each, got %v", counts)
 	}
 }

@@ -107,6 +107,17 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 
 	names := map[string]bool{}
 	for _, fe := range q.Select {
+		// An identifier the grammar cannot express is refused rather than
+		// executed. A selected field with an empty name -- the shape a
+		// builder produces for a half-filled row -- read a column called
+		// "" off every row, so the panel came back empty with only a
+		// W203 to explain it; and Print emitted `SELECT ""`, which does
+		// not parse, so the AST and its canonical text stopped
+		// round-tripping. The parser cannot build one: p.name refuses an
+		// empty name for exactly this reason.
+		if fe.Field == "" && fe.Histogram == "" {
+			return nil, Diag{"E001", "a selected field has no name; set either \"field\" or \"histogram\""}
+		}
 		if names[fe.Name()] {
 			return nil, Diag{"E006", fmt.Sprintf("two selected fields share the display name %q", fe.Name())}
 		}
@@ -193,6 +204,9 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		return warns, err
 	}
 	for _, l := range q.By {
+		if l == "" {
+			return warns, Diag{"E001", "BY names an empty label; every grouping slot needs a label key"}
+		}
 		if s != nil && !s.HasLabel(q.From, l) {
 			warns = append(warns, Diag{"W203", fmt.Sprintf("label %q is not present on set %q; every series will share one group", l, q.From)})
 		}
@@ -285,6 +299,14 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 	}
 	check := func(label string) error {
+		// Refused before it is looked up, and refused with no schema at
+		// all: an empty label is not a label the store could ever carry,
+		// it prints as `"" = "x"`, which does not parse, and the LABELS
+		// form validates with a nil schema so nothing else here would
+		// see it.
+		if label == "" {
+			return Diag{"E001", "a predicate compares an empty label; every comparison needs a label key"}
+		}
 		if s != nil && q.From != "" && !s.HasLabel(q.From, label) {
 			return Diag{"E004", fmt.Sprintf("unknown label %q on set %q", label, q.From)}
 		}

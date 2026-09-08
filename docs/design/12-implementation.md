@@ -1545,6 +1545,125 @@ lock `holding()` already takes.
   trip to the store — on `parse`, which the query editor calls on every
   keystroke, and on `print`, neither of which looks at the result.
 
+### 6.76 A `CLAMP` bound list does not swallow the `SELECT` separator
+
+Two comma-separated lists nest in the grammar: `SELECT` separates its
+fields with a comma, and a field's `CLAMP` separates its bounds with one.
+The `CLAMP` parser consumed a comma unconditionally and then demanded
+another bound, so
+
+```
+FROM app SELECT cpu CLAMP MIN 0, mem
+```
+
+— an ordinary two-field query — was refused with *expected MIN or MAX
+after CLAMP*, and the same text is exactly what `Print` emits for that
+AST. So a query the builder produced could not be read back, the executed
+query string a panel reports did not parse, and the round trip
+[06](06-query.md) states as a property was broken for every clamped field
+followed by another one. One token of lookahead separates the two cases
+without changing the language: a comma only continues the `CLAMP` when
+`MIN` or `MAX` follows it. A field whose name collides with either has to
+be quoted to be a name at all, and a quoted name lexes as a string rather
+than as the keyword the lookahead tests.
+
+### 6.77 An identifier the grammar cannot express is refused
+
+`Validate` checked the shape of a predicate and the sense of every
+modifier, and let an *empty* identifier through: a selected field, a `BY`
+slot or a comparison whose name is `""`. Such a query executed — the
+planner projected a column called `""`, which no row carries, so the panel
+came back empty with only a `W203` to explain it — and `Print` emitted
+`SELECT ""`, which does not parse, because `p.name` refuses an empty name
+for precisely this reason. The parser cannot build one; a builder with a
+half-filled row can, and that is the shape a panel is stored in. An empty
+name is now `E001` wherever it appears, including inside a `LABELS`
+filter, which validates with no schema at all and so had nothing else
+that would have seen it.
+
+### 6.78 A refused batch answers in a body the client can read
+
+Every sample a write refuses was named individually in the response, and
+the reasons are sentences. A batch the store refuses wholesale — a spec
+declaring the wrong epoch unit does exactly that — therefore produced a
+body proportional to the batch, and at a configured `--batch-size` of a
+few thousand it passed the megabyte `wire.Client` reads. The client got
+truncated JSON and reported *unexpected end of JSON input*, which the sink
+classifies as neither fatal nor an auth failure: it requeued the batch and
+retried it forever, the store re-committed whatever it accepted on every
+attempt, and no checkpoint advanced again for the life of the process.
+
+`WriteResponse` now names at most `wire.MaxReportedRejections` of them and
+carries `rejected_count` for the total, so the body is bounded by the cap
+rather than by the batch. `WriteResponse.Refused()` reads the count where
+there is one and falls back to the named list, so a response from a store
+built before the count existed still reports the right number; the metrics
+counter and the sink's log line both go through it. The client's own read
+limit was raised as well, because truncating a write response is not a
+recoverable condition — the store has already committed — and the headroom
+covers a store that does not cap.
+
+### 6.79 One junk value costs its record, not its window
+
+`model.Coerce` turns the literal text `NaN`, `Inf` or `+Infinity` in a log
+line into exactly that float: `strconv.ParseFloat` accepts all three. The
+aggregation accumulator discarded the verdict `AsFloat` returns and folded
+the value in anyway, so `sum` stayed `NaN` for every later record and a
+window seeded with one never moved again — `incoming > NaN` is false. The
+window's sample is then refused outright by the sink as unencodable
+(§6.30), so one bad line silently erased every record that shared its
+window rather than only itself. A non-numeric string was the same failure
+one magnitude smaller: it summed as zero.
+
+A value the accumulator cannot use is now reported as an extraction error,
+which is counted and shows up on the progress document and in the
+`refused` count the HTTP `lines` listener answers with. Absence is still
+not junk: a record that simply does not carry the field contributes
+nothing and is not an error, which is what `increment` relies on and what
+a sparse `sum` source produces — and `increment` counts the occurrence
+whatever the field says, because the value is not what it is measuring.
+
+### 6.80 A record is queued whole before a delivery failure is reported
+
+`Sink.Add` buffers the sample and only then flushes, so the error it
+returns is the flush's verdict and never a refusal to take the sample. The
+follow loop treated it as the latter and returned on the first one, which
+left two things wrong at once: the rest of that record's samples were
+never queued, and the read offset stayed before a record the *extractor*
+had already consumed.
+
+`extract.Stream` is stateful and feeding a record into it is not
+idempotent. So the next poll handed the same line to it a second time — an
+aggregation window counted the occurrence twice, a multiline join appended
+its capture twice — and the window that came back reported more than the
+file held. This is the same hazard `applyRewind` exists for: it discards
+the extractor precisely because the bytes behind it are about to be read
+again.
+
+The whole record is now queued before the failure is reported, so the
+extractor stays in step with the offset and nothing is left unqueued. The
+samples wait in the sink's buffer, which is where an undelivered batch
+belongs: `pending` means *handed to the sink*, and `acked` only ever moves
+on a committed flush. The receive path had the same shape without the
+double-processing — it has no offsets to re-read from, so its half was a
+plain partial loss on the one acquisition path with no way back to the
+bytes.
+
+### 6.81 Smaller corrections
+
+- The no-profile backoff is pruned with the tailers. Its entries are only
+  removed when the path is looked at again, and a path that has left the
+  glob never is, so a pattern whose members come and go — a file per day,
+  a file per instance — grew the map by one path string per file for the
+  life of the process. `retireUnmatched` already has the set of matched
+  paths and now drops what is not in it.
+- The aggregate's integer narrowing is range-checked. `emit` asked whether
+  the accumulated float is an exact integer by converting it to `int64`
+  and back, which the Go specification leaves undefined past the int64
+  range — amd64 yields the indefinite value and arm64 saturates. Both
+  answered "not an integer" for a value that far out, so the behaviour was
+  right by accident on both; it is now right by construction.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

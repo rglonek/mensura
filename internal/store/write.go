@@ -138,7 +138,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 	for _, batch := range req.Batches {
 		if err := model.ValidateSetName(batch.Set); err != nil {
 			for range batch.Samples {
-				resp.Rejected = append(resp.Rejected, wire.Rejection{Index: index, Reason: err.Error()})
+				resp.Reject(index, err.Error())
 				index++
 			}
 			continue
@@ -147,7 +147,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 		// write, and only for its own client label.
 		if model.IsReserved(batch.Set) && batch.Set != model.IngestSet {
 			for range batch.Samples {
-				resp.Rejected = append(resp.Rejected, wire.Rejection{Index: index, Reason: fmt.Sprintf("set %q uses the reserved prefix", batch.Set)})
+				resp.Reject(index, fmt.Sprintf("set %q uses the reserved prefix", batch.Set))
 				index++
 			}
 			continue
@@ -167,7 +167,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			idx := index
 			index++
 			if err := sm.Validate(); err != nil {
-				resp.Rejected = append(resp.Rejected, wire.Rejection{Index: idx, Reason: err.Error()})
+				resp.Reject(idx, err.Error())
 				continue
 			}
 			// A set keyed by `offset` derives its row key from the hint
@@ -177,10 +177,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			// each other, and the response would still count both as
 			// accepted. Naming the omission is the only honest answer.
 			if scheme == model.KeyOffset && sm.KeyHint == "" {
-				resp.Rejected = append(resp.Rejected, wire.Rejection{
-					Index:  idx,
-					Reason: fmt.Sprintf("set %q is keyed by offset, so every sample needs a key_hint; without one two records sharing a timestamp and labels would collapse into one row", batch.Set),
-				})
+				resp.Reject(idx, fmt.Sprintf("set %q is keyed by offset, so every sample needs a key_hint; without one two records sharing a timestamp and labels would collapse into one row", batch.Set))
 				continue
 			}
 			if batch.Set == model.IngestSet && clientName != "" {
@@ -191,7 +188,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			}
 			row, err := s.rowFor(batch.Set, sm)
 			if err != nil {
-				resp.Rejected = append(resp.Rejected, wire.Rejection{Index: idx, Reason: err.Error()})
+				resp.Reject(idx, err.Error())
 				continue
 			}
 			pk := model.PrimaryKey(batch.Set, sm, scheme)

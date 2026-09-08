@@ -330,7 +330,10 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 		return
 	}
 	a.writes.Add(1)
-	a.rejected.Add(int64(len(resp.Rejected)))
+	// Refused, not len(Rejected): the named list is capped so the response
+	// body stays bounded, and counting the list would under-report every
+	// batch that hit the cap -- which is exactly the batch worth counting.
+	a.rejected.Add(int64(resp.Refused()))
 	writeJSON(w, http.StatusOK, resp)
 }
 

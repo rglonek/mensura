@@ -383,6 +383,16 @@ func (f *follower) retireUnmatched(ctx context.Context, matched map[string]struc
 		}
 		stale = append(stale, t)
 	}
+	// The no-profile backoff is pruned with the tailers. Its entries are
+	// only ever removed when the path is looked at again, and a path that
+	// has left the glob never is, so on a pattern whose members come and
+	// go -- a file per day, a file per instance -- the map grew by one
+	// path string per file for the life of the process.
+	for path := range f.noProfile {
+		if _, ok := matched[path]; !ok {
+			delete(f.noProfile, path)
+		}
+	}
 	f.mu.Unlock()
 	// Retired in a stable order so a sweep that retires several is
 	// readable in the log.
@@ -560,17 +570,26 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		results, perr := t.ex.Process(string(rec.Line))
 		f.ing.recordOutcome(perr)
 		f.ing.cfg.Progress.AddSamples(int64(len(results)))
+		// Every sample of this record is queued before the failure is
+		// reported, and the first failure is what the sweep hears about.
+		//
+		// Sink.Add buffers the sample and only then flushes, so its error
+		// is the flush's verdict and never a refusal to take the sample:
+		// returning on it abandoned the rest of the record while keeping
+		// what came before, and left the offset before a record the
+		// extractor had already consumed. The next poll then handed that
+		// record to the extractor a *second* time -- an `increment`
+		// window counted the line twice, a multiline join appended its
+		// capture twice -- because extract.Stream is stateful and reading
+		// a record into it is not idempotent. Finishing the record leaves
+		// the extractor consistent with the offset, and the samples sit
+		// in the sink's buffer, which is exactly where an undelivered
+		// batch belongs: nothing is acknowledged, because acked only ever
+		// moves on a committed flush.
+		var addErr error
 		for n, res := range results {
-			if aerr := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); aerr != nil {
-				// The read offset stays *before* this record. It used to
-				// be advanced above, so a delivery failure part-way
-				// through a record left the remaining samples unqueued
-				// and the next poll seeking past the bytes that would
-				// have produced them -- a silent loss. Re-reading the
-				// record instead redelivers the samples that did get
-				// through, which is the at-least-once contract and what
-				// content-addressed row keys collapse back to one row.
-				return aerr
+			if aerr := f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n)); aerr != nil && addErr == nil {
+				addErr = aerr
 			}
 		}
 		t.offset = recStart + int64(rec.Consumed)
@@ -578,6 +597,9 @@ func (f *follower) read(ctx context.Context, t *tailer) error {
 		// has been handed to the sink, so a commit can never
 		// acknowledge a byte whose samples are still unqueued.
 		f.syncPending(t)
+		if addErr != nil {
+			return addErr
+		}
 		if oversizeUnterminated {
 			continue
 		}
