@@ -303,3 +303,75 @@ profiles:
 		t.Fatalf("counted %v, want one window of 3", out)
 	}
 }
+
+// maxSeedSpec aggregates a field that is not on every matching record, so
+// a window can be opened by a record that carries no value.
+const maxSeedSpec = `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^[0-9]+'}]
+    labels: [class]
+    fields:
+      n: {kind: gauge}
+    patterns:
+      - set: temps
+        search: "T"
+        extract:
+          - 'T (?P<class>\w+) n=(?P<n>-?[0-9]+)'
+          - 'T (?P<class>\w+) idle'
+        aggregate: {every: 10s, on: [class], field: n, mode: max}
+`
+
+// `mode: max` must not treat the zero an empty window starts at as a
+// reading.
+//
+// A window opened by a record that does not carry the field started at
+// zero, and zero is a floor no negative value can beat, so a window of
+// only negative readings reported 0 -- a number nothing measured, on
+// exactly the metrics where negative values are the point (a temperature,
+// a clock skew, a free-space delta).
+func TestMaxAggregationDoesNotSeedAWindowAtZero(t *testing.T) {
+	spec := mustSpec(t, maxSeedSpec)
+	st, err := spec.NewStream(spec.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	// The window opens on a record with no n at all, then sees only
+	// negative readings.
+	for _, line := range []string{
+		"1000 T cpu idle",
+		"2000 T cpu n=-9",
+		"3000 T cpu n=-4",
+	} {
+		if _, err := st.Process(line); err != nil {
+			t.Fatalf("process %q: %v", line, err)
+		}
+	}
+	out := st.Flush()
+	if len(out) != 1 {
+		t.Fatalf("expected one window, got %d", len(out))
+	}
+	got, ok := out[0].Fields["n"].AsFloat()
+	if !ok {
+		t.Fatalf("window value is not numeric: %+v", out[0].Fields["n"])
+	}
+	if got != -4 {
+		t.Fatalf("max over {-9, -4} reported %v; the empty window's zero was treated as a reading", got)
+	}
+}
+
+// A document with include: cannot be compiled from bytes.
+//
+// There is no file to resolve the paths against, so the key was decoded
+// and dropped: the spec compiled without every profile, identity rule and
+// set option the base contributed, and then reported "no profile matched"
+// for files the same spec loaded from disk handles.
+func TestParseRefusesASpecThatDeclaresIncludes(t *testing.T) {
+	body := "version: 1\ninclude: [base.yaml]\nprofiles: []\n"
+	msg := specError(t, body)
+	if !strings.Contains(msg, "include") || !strings.Contains(msg, "base.yaml") {
+		t.Fatalf("refusal does not name the includes: %s", msg)
+	}
+}

@@ -1664,6 +1664,89 @@ bytes.
   answered "not an integer" for a value that far out, so the behaviour was
   right by accident on both; it is now right by construction.
 
+### 6.82 A table column's declared type matches its cells
+
+`FORMAT table` and `FORMAT logs` take a column's type from the catalogue
+and a cell's value from the row, and the two part company the moment a
+field the catalogue calls a gauge carries a string. That is ordinary
+rather than exotic: extraction coerces per value, so a `status` field that
+is usually numeric holds `"-"` on the lines that have none, and a field
+absent from the catalogue is a gauge by default.
+
+The response then advertised a `"number"` column with a string in it. Every
+consumer that reads a column by its type dropped the cell — the plugin's
+table frame asserts `float64` and leaves the cell nil — so the value
+travelled the whole way to the panel and was rendered as an empty box, with
+nothing anywhere saying a value had been discarded.
+
+Which cells are strings is not knowable until the rows have been walked, so
+`runTabular` records it during the scan and reconciles afterwards: a column
+that carried even one string is declared a string column and every cell in
+it is rendered as one, and a column the catalogue calls a string is one
+whatever the rows held. The plugin's own reader was made tolerant to match,
+because a cell arrives there as `any` — straight from the engine in
+embedded mode and through `encoding/json` in proxy mode, where every number
+is a `float64` whatever it was.
+
+### 6.83 A path that left the glob keeps its checkpoint
+
+`filepath.Glob` reports an unreadable directory as "no matches" rather than
+as an error, so one NFS blip, permission change or mount flap makes a sweep
+see nothing at all. `retireUnmatched` then retired every tailer, and
+`retire` rewinds the resume record to offset zero — so the next sweep
+re-read every followed file in full: a duplicate row per record under
+`key: offset`, and a re-import of the whole backlog under content keying.
+
+Rewinding is right for the rotation paths, where the path now holds a
+different file. It is wrong for a path that has merely left the followed
+set, and the two are now separate: `retireKeepingCheckpoint` closes the
+tailer and leaves the record alone. Nothing is lost either way, because
+`ensure` compares the stored fingerprint against the file it finds — the
+same file resumes, a different one still starts at zero.
+
+`ensure` also clears the fingerprint when it decides to restart at offset
+zero. A start at zero is what a failed comparison produces, so the hash
+still on the loaded record describes a file this tailer has just decided it
+is not reading; leaving it there let every commit until the first widening
+persist it beside the new file's offsets, which is a checkpoint whose two
+halves describe different files.
+
+### 6.84 A comparison matches every position of a duplicated label value
+
+There is one dictionary per label key (05-storage.md section 8, ADR-004),
+and `intern` never places a value twice — but an older build repaired a
+hole by re-interning a value it had already placed, so a data directory can
+hold one value at two positions. `dictionary.index` is one-to-one and
+cannot express that, so `host = "a"` resolved to a single position and
+silently skipped every row written under the other, while `host =~ /^a$/`
+— which walks the entries rather than the map — found both. One predicate,
+two answers, with nothing to tell them apart.
+
+The extra positions are collected once at load, where the entries are
+already being walked, and `=`, `!=` and `IN` lower to the whole set. It
+costs nothing in the ordinary case, where the list has one element and the
+lowering is the same `Eq` it always was. `LabelValues` deduplicates for the
+same reason: one value listed twice put a repeated option in every
+dashboard variable built on that key.
+
+### 6.85 Smaller corrections
+
+- `mode: max` no longer treats an empty window's zero as a reading. A
+  window opened by a record that does not carry the aggregated field
+  started at zero, and zero is a floor no negative value can beat, so a
+  window of only negative readings reported 0 — a number nothing measured,
+  on exactly the metrics where negative values are the point.
+- `extract.Parse` refuses a document that declares `include:`. There is no
+  file to resolve the paths against, so the key was decoded and dropped:
+  the spec compiled without every profile, identity rule and set option the
+  base contributed, and then reported "no profile matched" for files the
+  same spec loaded through `Load` handles.
+- Every shed request body carries `Retry-After`, not only a shed write. A
+  503 without it leaves the client to invent an interval, and `wire.Client`
+  only honours the header — so the API's one "come back shortly" signal was
+  sent on `/v1/write` and withheld on the four endpoints that share the
+  same in-memory budget.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

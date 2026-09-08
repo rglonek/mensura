@@ -511,3 +511,154 @@ func TestFollowDoesNotCountARecordTwiceAfterADeliveryFailure(t *testing.T) {
 		t.Fatalf("expected two windows of one occurrence each, got %v", counts)
 	}
 }
+
+// A path that has merely left the glob keeps its checkpoint.
+//
+// filepath.Glob reports an unreadable directory as "no matches" rather
+// than as an error, so one NFS blip, permission change or mount flap makes
+// a sweep see nothing at all. Rewinding on that took every followed file
+// back to offset zero, and the next sweep re-read all of them in full:
+// a duplicate row per record under `key: offset`, and a re-import of the
+// whole backlog under content keying. A path that comes back is answered
+// by ensure(), which compares the stored fingerprint against the file it
+// finds -- so keeping the record resumes the same file and still starts a
+// different one from the beginning.
+func TestRetiringAnUnmatchedPathKeepsItsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 20)
+
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: stateDir, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &follower{ing: ing, cps: cps, tailers: map[string]*tailer{}, noProfile: map[string]time.Time{}}
+
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := f.read(context.Background(), tl); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if width := fingerprintWidth(tl.offset); width > 0 {
+		if fp, n := fingerprintAt(tl.file, width); n == width {
+			tl.setFingerprint(fp, width)
+		}
+	}
+	// The store accepted everything, so the checkpoint covers the file.
+	tl.markInflight()
+	cp, ok := tl.commitInflight(time.Now().Unix())
+	if !ok || cp.AckedOffset == 0 {
+		t.Fatalf("this test needs an acknowledged offset, got %+v", cp)
+	}
+	if err := cps.Save(&cp); err != nil {
+		t.Fatal(err)
+	}
+	acked, fp := cp.AckedOffset, cp.Fingerprint
+
+	// The sweep sees no matches at all -- the shape a transient glob
+	// failure has.
+	f.retireUnmatched(context.Background(), map[string]struct{}{})
+	if len(f.snapshotTailers()) != 0 {
+		t.Fatal("the tailer must still be retired")
+	}
+
+	after, ok := cps.Load(StreamID(path))
+	if !ok {
+		t.Fatal("the checkpoint must survive the retirement")
+	}
+	if after.AckedOffset != acked || after.Fingerprint != fp {
+		t.Fatalf("a path that left the glob had its checkpoint rewound: %+v, want offset %d fingerprint %q",
+			after, acked, fp)
+	}
+
+	// And the path coming back resumes rather than re-reading.
+	back, err := f.ensure(path)
+	if err != nil || back == nil {
+		t.Fatalf("ensure after the glob recovered: %v", err)
+	}
+	if back.offset != acked {
+		t.Fatalf("resumed at %d, want the acknowledged %d", back.offset, acked)
+	}
+}
+
+// Restarting a stream at offset zero clears the checkpoint's fingerprint.
+//
+// A start at zero is what a failed fingerprint comparison produces, so the
+// hash still on the loaded record describes a file this tailer has just
+// decided it is not reading. It used to be left there, and every commit
+// until the first widening persisted it beside the new file's offsets --
+// a checkpoint whose two halves describe different files, which is the one
+// shape the resume test cannot read correctly.
+func TestRestartingAtZeroClearsTheStoredFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 20)
+
+	rs := newRejectingStore(false)
+	defer rs.srv.Close()
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(rs.srv.URL, "")
+	client.Compress = false
+	sink := NewSink(client, DefaultSinkConfig(), testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: stateDir, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A checkpoint left by an earlier run, naming a file that is not the
+	// one on disk now.
+	stale := &Checkpoint{
+		Stream: StreamID(path), Path: path,
+		Fingerprint: "v2:deadbeefdeadbeefdeadbeefdeadbeef", FingerprintBytes: 64,
+		Offset: 4096, AckedOffset: 4096, UpdatedUnix: time.Now().Unix(),
+	}
+	if err := cps.Save(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &follower{ing: ing, cps: cps, tailers: map[string]*tailer{}, noProfile: map[string]time.Time{}}
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if tl.offset != 0 {
+		t.Fatalf("a fingerprint that does not match must restart at zero, got %d", tl.offset)
+	}
+	// The first acknowledgement persists whatever the record holds.
+	if err := f.read(context.Background(), tl); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	tl.markInflight()
+	cp, ok := tl.commitInflight(time.Now().Unix())
+	if !ok {
+		t.Fatal("this test needs a committed checkpoint")
+	}
+	if cp.Fingerprint == stale.Fingerprint || cp.FingerprintBytes == stale.FingerprintBytes {
+		t.Fatalf("the rejected file's fingerprint survived onto the new offsets: %+v", cp)
+	}
+}

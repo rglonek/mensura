@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -288,28 +289,36 @@ func (s *Store) buildExpr(set string, e mql.Expr, proj map[string]struct{}) (eng
 			return engine.Not(engine.Exists(e.Missing))
 		case e.Eq != nil:
 			proj[e.Eq.Label] = struct{}{}
-			idx, ok := s.lookup(e.Eq.Label, e.Eq.Value)
+			// Every position the value occupies, not only the one the
+			// index map names: a value an older build repaired a hole
+			// with sits at two, and naming one of them excluded every row
+			// written under the other -- while the regex form, which
+			// walks the entries, matched both.
+			idxs, ok := s.lookupPositions(e.Eq.Label, e.Eq.Value)
 			if !ok {
 				warns = append(warns, mql.Diag{Code: "W201", Msg: fmt.Sprintf("no values match %s = %q", e.Eq.Label, e.Eq.Value)})
 				return engine.Const(false)
 			}
-			return engine.Eq(e.Eq.Label, model.Int(int64(idx)))
+			if len(idxs) == 1 {
+				return engine.Eq(e.Eq.Label, idxs[0])
+			}
+			return engine.In(e.Eq.Label, idxs...)
 		case e.Ne != nil:
 			proj[e.Ne.Label] = struct{}{}
-			idx, ok := s.lookup(e.Ne.Label, e.Ne.Value)
+			idxs, ok := s.lookupPositions(e.Ne.Label, e.Ne.Value)
 			if !ok {
 				// Nothing carries that value, so the inequality holds for
 				// every row that carries the label at all.
 				return engine.Exists(e.Ne.Label)
 			}
-			return engine.And(engine.Exists(e.Ne.Label), engine.Not(engine.Eq(e.Ne.Label, model.Int(int64(idx)))))
+			return engine.And(engine.Exists(e.Ne.Label), engine.Not(engine.In(e.Ne.Label, idxs...)))
 		case e.In != nil:
 			proj[e.In.Label] = struct{}{}
 			var vals []model.Value
 			var missing []string
 			for _, v := range e.In.Values {
-				if idx, ok := s.lookup(e.In.Label, v); ok {
-					vals = append(vals, model.Int(int64(idx)))
+				if idxs, ok := s.lookupPositions(e.In.Label, v); ok {
+					vals = append(vals, idxs...)
 				} else {
 					missing = append(missing, v)
 				}
@@ -666,6 +675,9 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	for _, l := range q.By {
 		resp.Columns = append(resp.Columns, wire.Column{Name: l, Type: "string"})
 	}
+	// Where the field columns start in a row's value slice, so the
+	// reconciliation pass below can address them.
+	firstField := len(resp.Columns)
 	for _, f := range p.fields {
 		typ := "number"
 		if f.meta != nil && f.meta.Kind == model.KindString {
@@ -673,6 +685,18 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		}
 		resp.Columns = append(resp.Columns, wire.Column{Name: f.label, Type: typ})
 	}
+	// A column's type comes from the catalogue, but a cell's type comes
+	// from the row, and the two disagree the moment a field the catalogue
+	// calls a gauge carries a string -- which is ordinary, because
+	// extraction coerces per value, so a status field that is usually a
+	// number holds "-" on the lines that have no status. The response
+	// then advertised a "number" column with a string in it, and the
+	// consumer of that column reads it by type: the plugin's table frame
+	// asserts float64 and leaves the cell empty, so the value travelled
+	// all the way to the panel and was dropped there, silently. Which
+	// cells are strings is not knowable until the rows have been walked,
+	// so it is recorded here and reconciled once the scan is done.
+	sawString := make([]bool, len(p.fields))
 
 	type tsRow struct {
 		ts   int64
@@ -691,7 +715,7 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 			vals = append(vals, labels[l])
 		}
 		carries := false
-		for _, f := range p.fields {
+		for i, f := range p.fields {
 			v, ok := row[f.name]
 			if !ok {
 				vals = append(vals, nil)
@@ -699,6 +723,7 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 			}
 			if v.T == model.TypeString {
 				carries = true
+				sawString[i] = true
 				vals = append(vals, v.S)
 				continue
 			}
@@ -732,6 +757,25 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		rows = rows[:limit]
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
+	// A column that carried even one string is a string column, and every
+	// cell in it is rendered as one; a column the catalogue calls a string
+	// is one too, whatever the rows turned out to hold. Either way the
+	// declared type and the value type now agree, so nothing is dropped on
+	// the way to a renderer that reads the column by its type.
+	for i := range p.fields {
+		col := firstField + i
+		if sawString[i] {
+			resp.Columns[col].Type = "string"
+		}
+		if resp.Columns[col].Type != "string" {
+			continue
+		}
+		for r := range rows {
+			if f, ok := rows[r].vals[col].(float64); ok {
+				rows[r].vals[col] = strconv.FormatFloat(f, 'g', -1, 64)
+			}
+		}
+	}
 	resp.Stats.Truncated = truncated
 	if truncated {
 		// Truncation used to be recorded in Stats alone, which nothing

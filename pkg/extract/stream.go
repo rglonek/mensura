@@ -104,6 +104,13 @@ type aggregator struct {
 	line       string
 	field      string
 	mode       string
+	// hasValue reports whether any record has actually contributed a
+	// value. It is not the same as "the window is open": a window opened
+	// by a record that does not carry the field starts at zero, and for
+	// `max` zero is a floor no negative reading can ever beat, so a
+	// window of only negative values reported 0 -- a number nothing
+	// measured, on a metric where negative values are the point.
+	hasValue bool
 	// mark is where the record that opened this window began.
 	mark int64
 }
@@ -560,12 +567,14 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			// plus one meant a pattern that also extracted the field it
 			// counts started every window at that value, so the first
 			// window of each key reported a number nothing had counted.
-			a.value = 1
+			a.value, a.hasValue = 1, true
 		default:
 			// A window opened by a record that carries no value starts at
-			// zero, which is what a sum of nothing is.
+			// zero, which is what a sum of nothing is -- but it is not a
+			// reading, so `max` below still treats the next real value as
+			// the first one rather than comparing it against that zero.
 			if usable {
-				a.value = incoming
+				a.value, a.hasValue = incoming, true
 			}
 		}
 		return nil
@@ -584,12 +593,13 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	case "sum":
 		a.value += incoming
 	case "max":
-		if incoming > a.value {
+		if !a.hasValue || incoming > a.value {
 			a.value = incoming
 		}
 	case "last":
 		a.value = incoming
 	}
+	a.hasValue = true
 	return nil
 }
 

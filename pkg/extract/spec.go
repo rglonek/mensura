@@ -309,14 +309,23 @@ func load(path string, stack map[string]bool, done map[string]bool) (*Spec, erro
 	return &s, nil
 }
 
-// Parse compiles a spec from bytes, which is what tests and the receive
-// path use.
+// Parse compiles a spec from bytes.
+//
+// It cannot follow includes -- there is no file to resolve them relative
+// to -- so a document that declares any is refused rather than compiled
+// without them. Ignoring the key silently produced a spec missing every
+// profile, identity rule and set option the base contributed, which then
+// reads as "no profile matched" against files the same spec loaded from
+// disk handles.
 func Parse(b []byte) (*Spec, error) {
 	var s Spec
 	dec := yaml.NewDecoder(strings.NewReader(string(b)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&s); err != nil {
 		return nil, err
+	}
+	if len(s.Include) > 0 {
+		return nil, fmt.Errorf("extract: this spec declares include: %s, which only Load can resolve; load it from a file path", strings.Join(s.Include, ", "))
 	}
 	if err := s.Compile(); err != nil {
 		return nil, err

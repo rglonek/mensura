@@ -402,7 +402,7 @@ func (f *follower) retireUnmatched(ctx context.Context, matched map[string]struc
 		if err := f.read(ctx, t); err != nil {
 			f.ing.cfg.Log.Printf("WARNING draining %s before retiring it: %v", t.path, err)
 		}
-		f.retire(ctx, t)
+		f.retireKeepingCheckpoint(ctx, t)
 	}
 }
 
@@ -494,12 +494,24 @@ func (f *follower) ensure(path string) (*tailer, error) {
 	t.reset(start)
 	// The fingerprint covers what has been consumed, so it is taken from
 	// the resume point rather than from a fixed prefix.
-	if width := fingerprintWidth(start); width > 0 {
-		fp, n := fingerprintAt(fh, width)
-		if n == width {
-			t.setFingerprint(fp, width)
+	//
+	// It is *cleared* when there is nothing consumed to cover, rather than
+	// left as the checkpoint loaded it. A start at offset zero is what a
+	// failed fingerprint comparison produces, so the hash still on the
+	// record describes a file this tailer has just decided it is not
+	// reading -- and every commit until the first widening persisted that
+	// hash next to the new file's offsets. A checkpoint whose two halves
+	// describe different files is the one shape the resume test cannot
+	// read correctly.
+	fp, width := "", fingerprintWidth(start)
+	if width > 0 {
+		if got, n := fingerprintAt(fh, width); n == width {
+			fp = got
+		} else {
+			width = 0
 		}
 	}
+	t.setFingerprint(fp, width)
 	f.mu.Lock()
 	f.tailers[path] = t
 	f.mu.Unlock()
@@ -775,7 +787,29 @@ func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 	f.syncPending(t)
 }
 
-func (f *follower) retire(ctx context.Context, t *tailer) {
+// retire closes a tailer whose path now holds -- or will hold -- a
+// different file, and rewinds its checkpoint so the replacement is read
+// from its beginning.
+func (f *follower) retire(ctx context.Context, t *tailer) { f.closeTailer(ctx, t, true) }
+
+// retireKeepingCheckpoint closes a tailer whose path is simply no longer
+// in the followed set, leaving its resume record on disk untouched.
+//
+// The distinction matters because filepath.Glob reports an unreadable
+// directory as "no matches" rather than as an error: an NFS blip, a
+// permission change or a mount flap makes one sweep see nothing at all.
+// Rewinding on that took every followed file back to offset zero, so the
+// next sweep re-read every one of them in full -- a duplicate row for
+// every record under `key: offset`, and a re-import of the whole backlog
+// under content keying. A path that comes back is answered by ensure(),
+// which compares the stored fingerprint against the file it finds and
+// starts at zero when they disagree, so keeping the record is safe in
+// both directions: the same file resumes, a different one does not.
+func (f *follower) retireKeepingCheckpoint(ctx context.Context, t *tailer) {
+	f.closeTailer(ctx, t, false)
+}
+
+func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
 	f.drainExtractor(ctx, t)
 	_ = t.file.Close()
 	// Clearing the handle is what makes the retired tailer inert. poll
@@ -787,6 +821,9 @@ func (f *follower) retire(ctx context.Context, t *tailer) {
 	f.mu.Lock()
 	delete(f.tailers, t.path)
 	f.mu.Unlock()
+	if !rewind {
+		return
+	}
 	// The replacement file starts from its beginning, and the record on
 	// disk is rewound to say so now rather than on the next flush: a
 	// crash in between would otherwise resume the *new* file at the old

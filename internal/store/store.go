@@ -186,12 +186,25 @@ type dictionary struct {
 	// 100k-value limit is seconds of lock-held CPU per label key with
 	// every write serialised behind it.
 	holes []int32
+	// alias lists the *extra* positions a value occupies, beyond the one
+	// the index map names. It is normally nil: intern never stores a
+	// value twice, so a duplicate can only come off disk, where an older
+	// build repaired a hole by re-interning a value it had already
+	// placed. It exists because index is a one-to-one map and cannot say
+	// so, and a lowering that resolved `host = "a"` to a single position
+	// then silently skipped every row stored under the other one -- while
+	// `host =~ /^a$/`, which walks the entries rather than the map, found
+	// both. Two spellings of one predicate must not return different
+	// rows.
+	alias map[string][]int32
 }
 
-// rebuildHoles records the free positions in a freshly loaded dictionary,
-// and the count of positions that are not holes.
-func (d *dictionary) rebuildHoles() {
+// rebuildIndex records the free positions in a freshly loaded dictionary,
+// the count of positions that are not holes, and any value that occupies
+// more than one position.
+func (d *dictionary) rebuildIndex() {
 	d.holes = nil
+	d.alias = nil
 	d.live = 0
 	for i, e := range d.Entries {
 		if e == "" {
@@ -199,7 +212,29 @@ func (d *dictionary) rebuildHoles() {
 			continue
 		}
 		d.live++
+		if at, ok := d.index[e]; ok && at != int32(i) {
+			if d.alias == nil {
+				d.alias = map[string][]int32{}
+			}
+			d.alias[e] = append(d.alias[e], int32(i))
+		}
 	}
+}
+
+// positions lists every index a value is stored under, most-recently
+// interned first. A miss reports false so the query layer can turn it
+// into an empty result plus a warning rather than dropping the clause.
+func (d *dictionary) positions(value string) ([]int32, bool) {
+	idx, hit := d.index[value]
+	if !hit {
+		return nil, false
+	}
+	extra := d.alias[value]
+	if len(extra) == 0 {
+		return []int32{idx}, true
+	}
+	out := make([]int32, 0, len(extra)+1)
+	return append(append(out, idx), extra...), true
 }
 
 // takeHole pops a free position, skipping any that has been filled since
@@ -568,7 +603,7 @@ func (s *Store) loadDictionaries() error {
 		}
 	}
 	for _, d := range s.dict {
-		d.rebuildHoles()
+		d.rebuildIndex()
 	}
 	return nil
 }
@@ -652,6 +687,28 @@ func (s *Store) lookup(key, value string) (int32, bool) {
 	return idx, hit
 }
 
+// lookupPositions resolves a label value to every index it is stored
+// under. Normally that is exactly one; a value an older build placed at a
+// second position has two, and a comparison that only ever named the
+// first silently excluded every row written under the other.
+func (s *Store) lookupPositions(key, value string) ([]model.Value, bool) {
+	s.dictMu.RLock()
+	defer s.dictMu.RUnlock()
+	d, ok := s.dict[key]
+	if !ok {
+		return nil, false
+	}
+	idxs, hit := d.positions(value)
+	if !hit {
+		return nil, false
+	}
+	out := make([]model.Value, 0, len(idxs))
+	for _, i := range idxs {
+		out = append(out, model.Int(int64(i)))
+	}
+	return out, true
+}
+
 // labelValue resolves a stored dictionary index back to its string. A hole
 // is not a value: it is a position whose record was lost, and every other
 // reader of the dictionary already skips one. Reporting it as the empty
@@ -714,11 +771,20 @@ func (s *Store) LabelValues(key string) []string {
 	if !ok {
 		return nil
 	}
+	// Deduplicated: a value an older build placed at two positions is one
+	// value, and listing it twice put a repeated option in every
+	// dashboard variable built on this key.
 	out := make([]string, 0, len(d.Entries))
+	seen := make(map[string]struct{}, len(d.Entries))
 	for _, e := range d.Entries {
-		if e != "" {
-			out = append(out, e)
+		if e == "" {
+			continue
 		}
+		if _, dup := seen[e]; dup {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
 	}
 	sort.Strings(out)
 	return out

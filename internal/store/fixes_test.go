@@ -376,3 +376,145 @@ func TestWriteResponseStaysReadable(t *testing.T) {
 		t.Fatalf("Refused() = %d on a countless response, want 1", legacy.Refused())
 	}
 }
+
+// A table column's declared type and its cells' types must agree.
+//
+// The type came from the catalogue and the cell came from the row, and the
+// two part company the moment a field the catalogue calls a gauge carries
+// a string -- which extraction produces routinely, because it coerces per
+// value, so a status field that is usually numeric holds "-" on the lines
+// that have none. The response then advertised a "number" column holding a
+// string, and every consumer that reads a column by its type dropped the
+// cell: the value reached Grafana and was rendered as an empty box.
+func TestTabularColumnTypeMatchesTheCells(t *testing.T) {
+	s := openTestStore(t)
+	ts := base()
+	writeSamples(t, s, "app", []model.Sample{
+		{TSMs: ts, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"status": model.Int(200)}},
+		{TSMs: ts + 1, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"status": model.String("-")}},
+	})
+	resp := query(t, s, `FROM app SELECT status FORMAT table`, ts-1000, ts+1000)
+	if len(resp.Columns) != 2 {
+		t.Fatalf("columns = %+v", resp.Columns)
+	}
+	if resp.Columns[1].Type != "string" {
+		t.Fatalf("a column that carried a string must be declared string, got %q", resp.Columns[1].Type)
+	}
+	if len(resp.Rows) != 2 {
+		t.Fatalf("rows = %+v", resp.Rows)
+	}
+	for _, r := range resp.Rows {
+		if _, ok := r.Values[1].(string); !ok {
+			t.Fatalf("cell %#v in a string column is not a string; a type-reading renderer drops it", r.Values[1])
+		}
+	}
+
+	// The mirror image: a field the catalogue calls a string whose rows
+	// hold numbers must not hand a float to a string column either.
+	writeSamples(t, s, "app2", []model.Sample{
+		{TSMs: ts, Fields: map[string]model.Value{"msg": model.Int(7)}},
+	}, wire.FieldMeta{Set: "app2", Field: "msg", Kind: model.KindString})
+	resp = query(t, s, `FROM app2 SELECT msg FORMAT table`, ts-1000, ts+1000)
+	if len(resp.Rows) != 1 {
+		t.Fatalf("rows = %+v", resp.Rows)
+	}
+	if _, ok := resp.Rows[0].Values[1].(string); !ok {
+		t.Fatalf("cell %#v in a declared string column is not a string", resp.Rows[0].Values[1])
+	}
+}
+
+// A value stored at two dictionary positions must match at both.
+//
+// intern never places one twice, but an older build repaired a hole by
+// re-interning a value it had already placed, so a data directory can hold
+// one. index is a one-to-one map and cannot express that, so `host = "a"`
+// resolved to a single position and silently skipped every row written
+// under the other -- while `host =~ /^a$/`, which walks the entries, found
+// both. Two spellings of one predicate must not return different rows.
+func TestComparisonMatchesEveryPositionOfADuplicatedLabelValue(t *testing.T) {
+	s := openTestStore(t)
+	ts := base()
+	writeSamples(t, s, "app", []model.Sample{
+		{TSMs: ts, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(1)}},
+		{TSMs: ts + 1, Labels: map[string]string{"host": "b"}, Fields: map[string]model.Value{"v": model.Int(2)}},
+	})
+
+	// Reproduce the on-disk shape: "a" also occupies the position "b" had.
+	s.dictMu.Lock()
+	d := s.dict["host"]
+	second := int32(-1)
+	for i, e := range d.Entries {
+		if e == "b" {
+			d.Entries[i] = "a"
+			second = int32(i)
+		}
+	}
+	// Rebuilt exactly as loadDictionaries builds it: first position wins,
+	// so the map cannot name the second one.
+	d.index = map[string]int32{}
+	for i, e := range d.Entries {
+		if e == "" {
+			continue
+		}
+		if _, dup := d.index[e]; !dup {
+			d.index[e] = int32(i)
+		}
+	}
+	d.rebuildIndex()
+	s.dictMu.Unlock()
+	if second < 0 {
+		t.Fatal("this test needs two dictionary positions")
+	}
+
+	eq := query(t, s, `FROM app SELECT v BY host`, ts-1000, ts+1000)
+	re := query(t, s, `FROM app SELECT v WHERE host =~ /^a$/ BY host`, ts-1000, ts+1000)
+	filtered := query(t, s, `FROM app SELECT v WHERE host = "a" BY host`, ts-1000, ts+1000)
+	if len(eq.Series) != 1 {
+		t.Fatalf("both rows now carry host=a, so they are one series: %d", len(eq.Series))
+	}
+	points := func(r *wire.QueryResponse) int {
+		n := 0
+		for _, ser := range r.Series {
+			n += len(ser.TSMs)
+		}
+		return n
+	}
+	if points(filtered) != points(re) {
+		t.Fatalf(`host = "a" returned %d points and host =~ /^a$/ returned %d; one predicate, two answers`,
+			points(filtered), points(re))
+	}
+	if points(filtered) == 0 {
+		t.Fatal(`host = "a" matched nothing`)
+	}
+
+	// And the value is listed once, not once per position.
+	vals := s.LabelValues("host")
+	if len(vals) != 1 || vals[0] != "a" {
+		t.Fatalf("LabelValues = %v, want one entry", vals)
+	}
+}
+
+// Every shed body says when to come back, not only a shed write.
+//
+// A 503 without Retry-After leaves the client to invent an interval, and
+// wire.Client only honours the header -- so the one signal the API has for
+// "come back shortly" was sent on /v1/write and withheld on the four
+// endpoints that share the same in-memory budget.
+func TestEveryShedBodyCarriesRetryAfter(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20, MaxBufferedRequestBytes: 1 << 20})
+	h := api.Handler()
+	for _, path := range []string{"/v1/write", "/v1/query", "/v1/parse", "/v1/print"} {
+		api.bodyBytes.Store(1 << 20)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		h.ServeHTTP(rec, req)
+		api.bodyBytes.Store(0)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s past the buffer budget got %d, want 503", path, rec.Code)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Errorf("%s was shed without a Retry-After", path)
+		}
+	}
+}

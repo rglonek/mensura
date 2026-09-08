@@ -273,10 +273,7 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 	body, err := a.readBody(r)
 	if err != nil {
 		a.writeErrs.Add(1)
-		if errors.Is(err, errBusy) {
-			w.Header().Set("Retry-After", "1")
-		}
-		writeErr(w, bodyErrStatus(err), err.Error())
+		writeBodyErr(w, err)
 		return
 	}
 	var req wire.WriteRequest
@@ -344,7 +341,7 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 	}
 	body, err := a.readBody(r)
 	if err != nil {
-		writeErr(w, bodyErrStatus(err), err.Error())
+		writeBodyErr(w, err)
 		return
 	}
 	var req wire.QueryRequest
@@ -430,7 +427,7 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 	// MaxBufferedRequestBytes at once.
 	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, bodyErrStatus(rerr), rerr.Error())
+		writeBodyErr(w, rerr)
 		return
 	}
 	var body struct {
@@ -461,7 +458,7 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, bodyErrStatus(rerr), rerr.Error())
+		writeBodyErr(w, rerr)
 		return
 	}
 	var q mql.Query
@@ -475,7 +472,7 @@ func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
 	raw, rerr := a.readBody(r)
 	if rerr != nil {
-		writeErr(w, bodyErrStatus(rerr), rerr.Error())
+		writeBodyErr(w, rerr)
 		return
 	}
 	var req wire.QueryRequest
@@ -635,6 +632,20 @@ func bodyErrStatus(err error) int {
 	default:
 		return http.StatusBadRequest
 	}
+}
+
+// writeBodyErr answers a failed body read.
+//
+// Retry-After travels with every shed request, not only with a shed
+// write. A 503 without it tells a client to back off for an interval it
+// has to invent, and wire.Client only honours the header -- so the one
+// signal the API has for "come back shortly" was being sent on one
+// endpoint and withheld on the four that share the same budget.
+func writeBodyErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errBusy) {
+		w.Header().Set("Retry-After", "1")
+	}
+	writeErr(w, bodyErrStatus(err), err.Error())
 }
 
 func readBody(r *http.Request, max int64) ([]byte, error) {
