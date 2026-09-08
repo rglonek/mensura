@@ -375,3 +375,84 @@ func TestParseRefusesASpecThatDeclaresIncludes(t *testing.T) {
 		t.Fatalf("refusal does not name the includes: %s", msg)
 	}
 }
+
+// A field kind the rest of the system does not act on must be refused at
+// compile time.
+//
+// It used to compile: a kind is a plain string all the way from `fields:`
+// into the catalogue, and mql.Validate compares it against the four it
+// knows and ignores anything else. So `kind: couter` shipped, and
+// silently withdrew every behaviour it was written to switch on -- no
+// W102 "counter is plotted raw; consider RATE", and for a mistyped
+// `string` no E005 and no string column under FORMAT table.
+func TestCompileRefusesAnUnknownFieldKind(t *testing.T) {
+	body := `
+version: 1
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d+'}]
+    fields:
+      n: {kind: couter}
+    patterns:
+      - set: s
+        search: 'n='
+        extract: ['n=(?P<n>\d+)']
+`
+	msg := specError(t, body)
+	if !strings.Contains(msg, "couter") || !strings.Contains(msg, "counter, gauge, delta or string") {
+		t.Fatalf("refusal does not name the kind and the choices: %s", msg)
+	}
+	// The four documented spellings still compile.
+	for _, kind := range []string{"counter", "gauge", "delta", "string"} {
+		ok := strings.Replace(body, "kind: couter", "kind: "+kind, 1)
+		if _, err := Parse([]byte(ok)); err != nil {
+			t.Fatalf("kind %q was refused: %v", kind, err)
+		}
+	}
+}
+
+// A declared label that the store cannot accept must be refused here,
+// where the spec author can see it.
+//
+// It used to compile, and every sample the profile produced was then
+// rejected by the store one at a time, for the life of the process, with
+// nothing anywhere pointing back at the spec. "timestamp" is the worst
+// case: it names the indexed column.
+func TestCompileRefusesAnInvalidDeclaredLabel(t *testing.T) {
+	tmpl := `
+version: 1
+defaults:
+  labels: [DEFAULTS]
+profiles:
+  - name: p
+    select: {}
+    labels: [PROFILE]
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d+'}]
+    patterns:
+      - set: s
+        search: 'n='
+        labels: [PATTERN]
+        extract: ['n=(?P<n>\d+)']
+`
+	spec := func(defaults, profile, pattern string) string {
+		body := strings.Replace(tmpl, "DEFAULTS", defaults, 1)
+		body = strings.Replace(body, "PROFILE", profile, 1)
+		return strings.Replace(body, "PATTERN", pattern, 1)
+	}
+	if _, err := Parse([]byte(spec("dc", "env", "host"))); err != nil {
+		t.Fatalf("a spec whose labels are all valid was refused: %v", err)
+	}
+	for _, tc := range []struct{ where, defaults, profile, pattern string }{
+		{"defaults.labels", "timestamp", "env", "host"},
+		{"labels", "dc", "1st", "host"},
+		{"pattern for set", "dc", "env", "timestamp"},
+	} {
+		msg := specError(t, spec(tc.defaults, tc.profile, tc.pattern))
+		if !strings.Contains(msg, tc.where) {
+			t.Fatalf("refusal does not say the label came from %s: %s", tc.where, msg)
+		}
+	}
+}

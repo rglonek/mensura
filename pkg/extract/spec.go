@@ -435,7 +435,24 @@ func (s *Spec) Compile() error {
 
 func (p *Profile) compile(s *Spec) error {
 	p.labelSet = map[string]struct{}{}
-	for _, l := range append(append([]string{}, s.Defaults.Labels...), p.Labels...) {
+	// A declared label is a column name on every row the profile writes,
+	// and it was the one name in a spec that nothing validated. The store
+	// checks it per sample, so a name it refuses -- "timestamp", which
+	// would overwrite the indexed column, or anything outside the label
+	// charset -- compiled cleanly here and then had every sample the
+	// profile produced rejected, one at a time, for the life of the
+	// process, with nothing anywhere pointing back at the spec. This is
+	// the same check `route:` targets were given, at the same place.
+	for _, l := range s.Defaults.Labels {
+		if err := model.ValidateLabelKey(l); err != nil {
+			return fmt.Errorf("defaults.labels: %w", err)
+		}
+		p.labelSet[l] = struct{}{}
+	}
+	for _, l := range p.Labels {
+		if err := model.ValidateLabelKey(l); err != nil {
+			return fmt.Errorf("labels: %w", err)
+		}
 		p.labelSet[l] = struct{}{}
 	}
 	if len(p.Timestamp.Formats) == 0 {
@@ -546,6 +563,17 @@ func (p *Profile) compile(s *Spec) error {
 			return err
 		}
 		fs := p.Fields[name]
+		// The kind is the one field-metadata value the rest of the system
+		// acts on, and it was the one nothing checked: it travels as a
+		// plain string into the catalogue, where mql.Validate compares it
+		// against the four it knows and ignores anything else. So a typo
+		// compiled, shipped, and silently withdrew the very diagnostics
+		// the declaration exists to switch on.
+		if fs.Kind != "" {
+			if err := model.ValidateKind(model.Kind(fs.Kind)); err != nil {
+				return fmt.Errorf("field %s: %w", name, err)
+			}
+		}
 		if fs.MaxInterval != "" {
 			ms, err := mql.ParseDuration(fs.MaxInterval)
 			if err != nil {
@@ -569,6 +597,9 @@ func (p *Profile) compile(s *Spec) error {
 		}
 		pat.labelSet = map[string]struct{}{}
 		for _, l := range pat.Labels {
+			if err := model.ValidateLabelKey(l); err != nil {
+				return fmt.Errorf("pattern for set %q: labels: %w", pat.Set, err)
+			}
 			pat.labelSet[l] = struct{}{}
 		}
 		for i := range pat.Replace {

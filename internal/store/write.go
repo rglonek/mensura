@@ -441,6 +441,17 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		if err := model.ValidateFieldName(m.Field); err != nil {
 			return &ErrBadRequest{Msg: err.Error()}
 		}
+		// The kind is checked exactly as the names are, and for the same
+		// reason: it is stored, served from /v1/catalogue and read back by
+		// the MQL validator, which recognises four values and quietly
+		// ignores anything else. An unrecognised kind therefore reached a
+		// dashboard as metadata that looks declared and behaves as if it
+		// were absent.
+		if m.Kind != "" {
+			if err := model.ValidateKind(m.Kind); err != nil {
+				return badRequestf("%s.%s: %s", m.Set, m.Field, err.Error())
+			}
+		}
 		// Named here rather than skipped below. The index is used as an
 		// allocation size so it cannot be taken on trust, but silently
 		// ignoring the declaration left the field in the catalogue with

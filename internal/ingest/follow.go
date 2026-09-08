@@ -679,6 +679,23 @@ func (f *follower) applyRewind(t *tailer) {
 // busy directory is a number that describes nothing. poll publishes the
 // sum once the sweep is done.
 func (f *follower) atEOF(t *tailer) error {
+	// The fingerprint is widened here, where the read head stops, and not
+	// only at the top of the next poll.
+	//
+	// It used to be widened in checkRotation alone, which runs *before*
+	// the read -- so between the moment a file's bytes were consumed and
+	// the moment a hash covering them existed sat a whole poll interval,
+	// and a fresh tailer spent that interval with no fingerprint at all
+	// (fingerprintWidth(0) is 0). A rewrite in place landing in that
+	// window was undetectable twice over: the size test does not fire
+	// when the replacement is at least as long as the old read offset,
+	// and there was no stored hash to compare against -- and then the
+	// widening step ran on the *new* content and adopted it as the
+	// fingerprint of bytes this tailer had never read. The head of the
+	// replacement was skipped, permanently and silently. Covering the
+	// bytes the moment they are consumed leaves no interval to lose them
+	// in.
+	f.widenFingerprint(t)
 	if info, serr := t.file.Stat(); serr == nil {
 		if lag := info.Size() - t.offset; lag > 0 {
 			t.setLag(lag)
@@ -687,6 +704,24 @@ func (f *follower) atEOF(t *tailer) error {
 		}
 	}
 	return nil
+}
+
+// widenFingerprint records a content hash covering everything this tailer
+// has consumed, up to the cap. It never narrows one: the window only
+// grows with the read offset, and a short read means the file no longer
+// holds the bytes we already took from it, which is checkRotation's
+// question rather than this function's.
+func (f *follower) widenFingerprint(t *tailer) {
+	if t.file == nil {
+		return
+	}
+	width := fingerprintWidth(t.offset)
+	if width <= t.fingerprintAt {
+		return
+	}
+	if fp, n := fingerprintAt(t.file, width); n == width {
+		t.setFingerprint(fp, width)
+	}
 }
 
 // publishLag reports the whole backlog across every followed file.
@@ -735,11 +770,9 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 		return nil
 	}
 	// Widen the window as more of the file is consumed, up to the cap.
-	if width := fingerprintWidth(t.offset); width > t.fingerprintAt {
-		if fp, n := fingerprintAt(t.file, width); n == width {
-			t.setFingerprint(fp, width)
-		}
-	}
+	// Only ever after the comparison above: widening first would hash
+	// whatever the file holds now and call it what we read.
+	f.widenFingerprint(t)
 	pathInfo, err := os.Stat(t.path)
 	if os.IsNotExist(err) {
 		// The file was unlinked. Drain what is left, then wait for the path

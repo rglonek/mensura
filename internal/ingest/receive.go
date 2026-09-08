@@ -404,6 +404,15 @@ func (r *receiver) flushAll(ctx context.Context) {
 // so a port that is in use fails the command rather than this goroutine.
 func (r *receiver) serveTCP(ctx context.Context, ln net.Listener) error {
 	defer ln.Close()
+	// Waited for before serveTCP returns, exactly as the UDP drain
+	// goroutine is. Closing the listener only stops new connections: the
+	// ones already accepted kept reading records and turning them into
+	// samples while Receive went on to flushAll and the final Sink.Flush
+	// behind them, so whatever they read in that window was buffered into
+	// a sink that had already flushed for the last time -- and a socket,
+	// unlike a followed file, has no checkpoint to re-read it from.
+	var conns sync.WaitGroup
+	defer conns.Wait()
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	r.ing.cfg.Log.Printf("receiving on tcp %s (%s)", r.opts.TCPAddr, r.opts.Mode)
 	for {
@@ -425,7 +434,9 @@ func (r *receiver) serveTCP(ctx context.Context, ln net.Listener) error {
 			_ = conn.Close()
 			continue
 		}
+		conns.Add(1)
 		go func(c net.Conn) {
+			defer conns.Done()
 			defer func() { <-r.conns }()
 			r.handleConn(ctx, c)
 		}(conn)
@@ -438,6 +449,21 @@ func (r *receiver) serveTCP(ctx context.Context, ln net.Listener) error {
 func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	peer := hostOf(conn.RemoteAddr().String())
+	// A cancelled context has to reach a read that is already blocked, or
+	// the wait above is a wait for connIdleTimeout: the loop below only
+	// tests ctx between records, and a quiet sender leaves it inside the
+	// read for a quarter of an hour. Pulling the deadline into the past
+	// unblocks it now. The reset at the bottom of the loop cannot undo
+	// this, because the very next thing the loop does is test ctx.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetReadDeadline(time.Now())
+		case <-stopWatch:
+		}
+	}()
 	_ = conn.SetReadDeadline(time.Now().Add(connIdleTimeout))
 	if !r.permitted(peer) {
 		r.ing.cfg.Log.Printf("WARNING refused tcp connection from %s: not in allowed_sources", peer)

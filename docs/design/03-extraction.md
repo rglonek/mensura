@@ -200,6 +200,17 @@ store's catalogue, and is served to the plugin. Effects:
 - `unit_hint` populates the frame's field config so panels get units without
   manual configuration.
 
+`kind` is one of the four spellings above and nothing else: an unrecognised
+one is refused when the spec compiles, and by the write API if it arrives
+from anywhere else. Everything downstream compares it against those four
+and ignores what it does not know, so a typo would leave the field looking
+declared while behaving as though it carried no kind at all — no `RATE`
+pre-selection, no `W102`, no string column. Declared label keys — in
+`defaults.labels`, in a profile's `labels:` and in a pattern's — are
+validated at compile time for the same reason: they become column names on
+every row the profile writes, and one the store refuses would cost every
+sample that pattern produces, one rejection at a time.
+
 Every default is overridable per query. Metadata changes what a *new* panel
 suggests; it never silently changes an existing panel's rendering, because the
 panel stores the resolved query, not a reference to the metadata.

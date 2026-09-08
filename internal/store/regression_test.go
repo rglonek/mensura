@@ -1582,3 +1582,40 @@ func TestAuxiliaryFormsAnswerAnEmptySeriesList(t *testing.T) {
 		}
 	}
 }
+
+// An unrecognised field kind is client input and is refused as such.
+//
+// It used to be stored verbatim, served from /v1/catalogue and read back
+// by the MQL validator, which knows four values and quietly ignores
+// anything else -- so a mistyped kind reached a dashboard as metadata
+// that looks declared and behaves as if it were absent. Refusing it with
+// a 4xx is what the set and field names already get, and for the same
+// reason: the fault is in what was sent, so it has to be fatal on the
+// first attempt rather than retried at full rate.
+func TestWriteRefusesAnUnknownFieldKind(t *testing.T) {
+	s := openTestStore(t)
+	_, err := s.Write(&wire.WriteRequest{
+		FieldMeta: []wire.FieldMeta{{Set: "app", Field: "cpu", Kind: model.Kind("couter")}},
+	}, "", "test")
+	if err == nil {
+		t.Fatal("an unknown kind was accepted into the catalogue")
+	}
+	var bad *ErrBadRequest
+	if !errors.As(err, &bad) {
+		t.Fatalf("an unknown kind came back as %T, which handleWrite answers 500 to; the client retries a 500 forever: %v", err, err)
+	}
+	if !strings.Contains(bad.Msg, "couter") || !strings.Contains(bad.Msg, "app.cpu") {
+		t.Fatalf("refusal names neither the kind nor the field: %s", bad.Msg)
+	}
+	if len(s.Catalogue().Sets) != 0 {
+		t.Fatal("the refused declaration still reached the catalogue")
+	}
+	// The four documented kinds still land.
+	for i, kind := range []model.Kind{model.KindCounter, model.KindGauge, model.KindDelta, model.KindString} {
+		if _, err := s.Write(&wire.WriteRequest{
+			FieldMeta: []wire.FieldMeta{{Set: "app", Field: fmt.Sprintf("f%d", i), Kind: kind}},
+		}, "", "test"); err != nil {
+			t.Fatalf("kind %q was refused: %v", kind, err)
+		}
+	}
+}

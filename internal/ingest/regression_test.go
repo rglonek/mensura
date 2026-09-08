@@ -1931,3 +1931,131 @@ func TestFollowLagCoversEveryFile(t *testing.T) {
 		t.Fatalf("lag_bytes = %d, want %d: the backlog has to cover every followed file, not the last one visited", got, want)
 	}
 }
+
+// A rewrite in place must be detected even when it lands before the next
+// poll, which means the fingerprint has to cover bytes the moment they
+// are read rather than one poll later.
+//
+// checkRotation runs before read, so the hash covering a poll's bytes did
+// not exist until the poll after it -- and a tailer that had just been
+// opened had no hash at all, because fingerprintWidth(0) is 0. A rewrite
+// landing in that window was invisible from both directions: the size
+// test does not fire when the replacement is at least as long as the old
+// read offset, and there was nothing to compare content against. The
+// widening step then hashed the *new* content and recorded it as the
+// fingerprint of bytes this tailer had never read, so its head was
+// skipped for good.
+func TestFollowFingerprintsWhatItHasReadBeforeTheNextPoll(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 30)
+	f := newTestFollower(t, dir, FollowOptions{Paths: []string{path}})
+
+	tl, err := f.ensure(path)
+	if err != nil || tl == nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	ctx := context.Background()
+	if err := f.read(ctx, tl); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	before := tl.offset
+	if before == 0 {
+		t.Fatal("the first read consumed nothing")
+	}
+	if tl.fingerprintAt == 0 {
+		t.Fatal("the read left no fingerprint, so a rewrite before the next poll has nothing to be compared against")
+	}
+
+	// Replace the contents in place, keeping the file longer than the old
+	// read offset so the size test cannot be what catches it. The inode is
+	// unchanged, so SameFile cannot either: content is the only signal.
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	appendLines(t, path, 1000, 1040)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() < before {
+		t.Fatalf("the fixture rewrite is shorter than the old offset (%d < %d), so the size test would catch it and the fingerprint would not be exercised", info.Size(), before)
+	}
+	if err := f.checkRotation(ctx, tl); err != nil {
+		t.Fatalf("checkRotation: %v", err)
+	}
+	if tl.offset != 0 {
+		t.Fatalf("the rewrite was not detected: offset is %d, so the first %d bytes of the replacement are skipped for good", tl.offset, tl.offset)
+	}
+}
+
+// Cancelling a receiver has to reach the connections it already accepted,
+// and Receive has to wait for them.
+//
+// Closing the listener only stops new connections. The ones already
+// accepted stayed inside a blocking read -- the loop only tests the
+// context between records, and connIdleTimeout is fifteen minutes -- so
+// Receive went on to flushAll and the final Sink.Flush while those
+// goroutines were still turning records into samples behind it. Whatever
+// they read in that window was buffered into a sink that had already
+// flushed for the last time, and a socket has no checkpoint to re-read it
+// from. The UDP drain was joined for exactly this reason; the TCP half
+// was not.
+func TestReceiveClosesTCPConnectionsWhenCancelled(t *testing.T) {
+	rs := newRecordingStore()
+	defer rs.srv.Close()
+	ing, sink := newFollowIngest(t, rs, t.TempDir())
+	defer func() { _ = sink.Close(context.Background()) }()
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ing.Receive(ctx, ReceiveOptions{TCPAddr: addr, Listener: "default"})
+	}()
+
+	var conn net.Conn
+	waitFor(t, 5*time.Second, func() bool {
+		c, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return false
+		}
+		conn = c
+		return true
+	})
+	if conn == nil {
+		t.Fatal("the listener never came up")
+	}
+	defer conn.Close()
+	// One record, so the connection is certainly being served, and then
+	// silence: the handler is now blocked in a read that nothing but the
+	// idle timeout would end.
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	fmt.Fprintf(conn, "%d n=42\n", base)
+	if !waitFor(t, 5*time.Second, func() bool { return rs.counts()[42] > 0 }) {
+		t.Fatal("the record never reached the store")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Receive did not return after its context was cancelled")
+	}
+	// Receive has returned, so every connection it accepted is finished
+	// with: the peer sees the close rather than a socket held open until
+	// connIdleTimeout.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the connection is still open after Receive returned")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("the connection was neither closed nor unblocked after Receive returned; it is held until connIdleTimeout, and records read in that window land in a sink that has already flushed for the last time")
+	}
+}
