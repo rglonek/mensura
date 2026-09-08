@@ -860,3 +860,90 @@ profiles:
 		}
 	}
 }
+
+// A stream that nobody asks HeldFrom kept an entry -- and the aggregation
+// key it retains -- for every window it had ever opened.
+//
+// The hold list exists for a driver that checkpoints byte offsets, and it
+// was pruned only where that driver reads it. The receive path never
+// does: it runs for the life of the process, one stream per peer, with no
+// offsets to hold back. A one-minute `every` over a thousand keys is a
+// million entries a day that nothing would ever look at.
+func TestClosedWindowsDoNotAccumulateHolds(t *testing.T) {
+	s := mustSpec(t, strings.Replace(aggSpec, "%s", "increment", 1))
+	st, err := s.NewStream(s.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	// One record every 11s against a 10s window, so every record closes
+	// the previous window and opens a new one: at most one is ever live.
+	for i := 0; i < 2000; i++ {
+		if _, err := st.Process(fmt.Sprintf("%d ERR boom", base+int64(i)*11_000)); err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+	}
+	if len(st.aggs) != 1 {
+		t.Fatalf("%d open windows, want 1", len(st.aggs))
+	}
+	if len(st.holds) > 2*len(st.aggs)+16 {
+		t.Fatalf("the hold list holds %d entries for %d open window(s); it grows with every window ever opened", len(st.holds), len(st.aggs))
+	}
+}
+
+// A buffered multiline record is flushed by a *later* line, and the
+// aggregation window it opens used to be registered at that later line's
+// mark rather than at its own. HeldFrom then reported a position past the
+// bytes the window was built from, so a driver that checkpoints offsets
+// could acknowledge records whose only copy was the still-open window.
+func TestBufferedMultilineHoldsItsOwnOffset(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    framing:
+      multiline:
+        - start_contains: 'BEGIN'
+          continue_regex: '^\s+at '
+          join: [{regex: '\s+at (.*)', capture: 1}]
+    labels: [class]
+    patterns:
+      - set: errors
+        search: 'BEGIN'
+        extract: ['BEGIN (?P<class>\w+)']
+        aggregate: {every: 1h, on: [class], field: n, mode: increment}
+`
+	s := mustSpec(t, spec)
+	st, err := s.NewStream(s.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	// The record at offset 100 opens a multiline block.
+	st.Mark(100)
+	if _, err := st.Process(fmt.Sprintf("%d BEGIN boom", base)); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	if at, held := st.HeldFrom(); !held || at != 100 {
+		t.Fatalf("HeldFrom() = %d,%v; the open multiline record began at 100", at, held)
+	}
+
+	// A second start marker at offset 500 flushes the first record into
+	// an aggregation window whose `every` keeps it open. The window's
+	// data came from offset 100, not from 500.
+	st.Mark(500)
+	if _, err := st.Process(fmt.Sprintf("%d BEGIN boom", base+1000)); err != nil {
+		t.Fatalf("second record: %v", err)
+	}
+	if len(st.aggs) != 1 {
+		t.Fatalf("%d open windows, want the flushed record to have opened one", len(st.aggs))
+	}
+	if at, held := st.HeldFrom(); !held || at != 100 {
+		t.Fatalf("HeldFrom() = %d,%v; the open window was built from the record at 100, so a checkpoint may not pass it", at, held)
+	}
+}

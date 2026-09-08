@@ -159,6 +159,18 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			if info.Kind == model.KindString && (fe.Modifiers.Delta || fe.Modifiers.PerSecond || fe.Modifiers.Negate || fe.Modifiers.Clamp != nil) {
 				return nil, Diag{"E005", fmt.Sprintf("field %q is a string field; numeric modifiers do not apply", fe.Field)}
 			}
+			// A string field on a line chart is the silent-empty-panel
+			// shape again. The catalogue calls it a table/logs payload,
+			// the render path drops every value that does not read as a
+			// number, and nothing anywhere said so: a panel selecting one
+			// came back blank with at most a W103 about gaps to explain
+			// it. A warning rather than a refusal, because extraction
+			// coerces per value -- a field declared `string` may still
+			// hold numbers on the rows that matter, and refusing would
+			// break a panel that is drawing today.
+			if info.Kind == model.KindString && format == FormatTimeseries {
+				warns = append(warns, Diag{"W104", fmt.Sprintf("field %q is declared as a string field; a timeseries panel plots only values that read as numbers, so the series may draw nothing -- FORMAT table or logs renders it", fe.Field)})
+			}
 			if info.Kind == model.KindCounter && !fe.Modifiers.Delta {
 				warns = append(warns, Diag{"W102", fmt.Sprintf("field %q is a counter and is plotted raw; consider RATE", fe.Field)})
 			}
@@ -312,6 +324,33 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 		return nil
 	}
+	// checkExists validates the name HAS and MISSING address.
+	//
+	// They are not comparisons: 06-query.md section 4.4 says they "map to
+	// the engine's Exists predicate", which reads a *column* off the row,
+	// and a row's columns are its labels and its fields alike. The store
+	// lowers them that way too -- buildExpr adds the name to the
+	// projection and emits engine.Exists -- so a field is a perfectly
+	// good subject. Sending them through the label check refused
+	// `HAS requests_total`, which is the worked example in section 2 of
+	// that same document, with E004 "unknown label". A name that is
+	// neither is still refused, because that is the case the check was
+	// added for: `MISSING nosuchlabel` matched every row.
+	checkExists := func(name string) error {
+		if name == "" {
+			return Diag{"E001", "an existence predicate names nothing; HAS and MISSING need a field or label name"}
+		}
+		if s == nil || q.From == "" {
+			return nil
+		}
+		if s.HasLabel(q.From, name) {
+			return nil
+		}
+		if _, known := s.Field(q.From, name); known {
+			return nil
+		}
+		return Diag{"E004", fmt.Sprintf("unknown field or label %q on set %q", name, q.From)}
+	}
 	// An unsubstituted variable is a configuration error, not a value:
 	// comparing against the literal "$host" matches nothing, so the query
 	// would silently draw an empty panel. Say so instead.
@@ -366,12 +405,9 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 		}
 		return check(m.Label)
 	case e.Has != "":
-		// HAS and MISSING name a label just as the comparisons do, so an
-		// unknown one is the same E004. Exempting them meant `MISSING
-		// nosuchlabel` validated and matched every row.
-		return check(e.Has)
+		return checkExists(e.Has)
 	case e.Missing != "":
-		return check(e.Missing)
+		return checkExists(e.Missing)
 	}
 	return nil
 }
