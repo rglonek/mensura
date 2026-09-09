@@ -271,3 +271,112 @@ func TestHoldListStaysBoundedWithInterleavedKeys(t *testing.T) {
 		t.Fatalf("the hold list holds %d entries for %d open window(s)", len(st.holds), len(st.aggs))
 	}
 }
+
+const replayMultilineSpec = `
+version: 1
+profiles:
+  - name: p
+    select: {}
+    labels: [op]
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    framing:
+      multiline:
+        - start_contains: 'BEGIN'
+          continue_regex: '^\s*\+'
+          join:
+            - regex: '^\s*\+(.*)$'
+              capture: 1
+          idle_timeout: 1h
+    patterns:
+      - set: blocks
+        search: 'BEGIN'
+        extract: ['BEGIN t=(?P<t>\d+)']
+      - set: ops
+        search: 'op='
+        extract: ['op=(?P<op>\w+)']
+        aggregate: {every: 10s, on: [op], field: hits, mode: increment}
+`
+
+// A multiline record that has been assembled and emitted spans several
+// lines, and an aggregation window opened between them used to let the
+// hold floor settle inside that span. A replay from there met each
+// continuation line with no buffer open, so instead of belonging to the
+// record it was judged on its own -- and a continuation that a pattern
+// happens to match becomes a whole sample the source never reported.
+func TestMultilineReplayFromHeldFromIsLossless(t *testing.T) {
+	spec, err := Parse([]byte(replayMultilineSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	h := &replayHarness{t: t, spec: spec, lines: []string{
+		fmt.Sprintf("%d BEGIN t=1", base+0),    // opens the buffered record
+		fmt.Sprintf("%d +one", base+1000),      // continuation
+		fmt.Sprintf("%d op=b", base+2000),      // opens b's window, which stays open
+		fmt.Sprintf("%d +op=c", base+3000),     // continuation a pattern would match
+		fmt.Sprintf("%d BEGIN t=2", base+4000), // flushes the record spanning 0..3
+		fmt.Sprintf("%d +three", base+5000),    //
+	}}
+	full, _, _ := h.run(0, len(h.lines), true)
+	want := map[string]bool{}
+	for _, r := range full {
+		want[resultKey(r)] = true
+	}
+	for _, key := range []string{"blocks@1787918400000 [] [t=1]", "ops@1787918402000 [op=b] [hits=1]"} {
+		if !want[key] {
+			t.Fatalf("the fixture did not produce %s; it produced %v", key, want)
+		}
+	}
+	for k := 1; k <= len(h.lines); k++ {
+		missing, extra := h.crashAt(k, want)
+		if len(missing) > 0 || len(extra) > 0 {
+			t.Errorf("crash after line %d:\n  missing %v\n  extra   %v", k-1, missing, extra)
+		}
+	}
+}
+
+// The same property over randomised streams that mix multiline records,
+// aggregation across several keys and plain records.
+func TestMultilineReplayIsLosslessOverRandomStreams(t *testing.T) {
+	spec, err := Parse([]byte(replayMultilineSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ops := []string{"a", "b", "c"}
+	for seed := int64(0); seed < 60; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			h := &replayHarness{t: t, spec: spec}
+			ts := base
+			for i := 0; i < 24; i++ {
+				ts += int64(rng.Intn(9)) * 1000
+				switch rng.Intn(4) {
+				case 0:
+					h.lines = append(h.lines, fmt.Sprintf("%d BEGIN t=%d", ts, i))
+				case 1:
+					// A continuation that also matches a pattern on its own.
+					h.lines = append(h.lines, fmt.Sprintf("%d +op=%s", ts, ops[rng.Intn(len(ops))]))
+				case 2:
+					h.lines = append(h.lines, fmt.Sprintf("%d +plain%d", ts, i))
+				default:
+					h.lines = append(h.lines, fmt.Sprintf("%d op=%s", ts, ops[rng.Intn(len(ops))]))
+				}
+			}
+			full, _, _ := h.run(0, len(h.lines), true)
+			want := map[string]bool{}
+			for _, r := range full {
+				want[resultKey(r)] = true
+			}
+			for k := 1; k <= len(h.lines); k++ {
+				missing, extra := h.crashAt(k, want)
+				if len(missing) > 0 || len(extra) > 0 {
+					t.Fatalf("crash after line %d of %v:\n  missing %v\n  extra   %v", k-1, h.lines, missing, extra)
+				}
+			}
+		})
+	}
+}

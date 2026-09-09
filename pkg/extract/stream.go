@@ -80,23 +80,42 @@ type Stream struct {
 	maxUnmatchedSamples int
 }
 
-// holdEntry remembers where an aggregation window started. Windows close
-// out of mark order only when a profile mixes several `every` widths,
-// which the scan below tolerates.
+// holdEntry is one span of the stream that a checkpoint may not land in
+// the middle of: an aggregation window, or a multiline record that has
+// already been assembled and emitted.
 //
-// An entry outlives the window it names. A window that has closed and
-// been emitted still bounds where a checkpoint may go: see HeldFrom.
+// An entry outlives what it names. Something that has been emitted still
+// bounds where a checkpoint may go, because a replay starting inside its
+// records does not reproduce it: see HeldFrom.
 type holdEntry struct {
 	mark int64
 	key  string
-	a    *aggregator
+	// a is the window this entry names, and nil for a multiline record,
+	// which has no accumulator and whose span is fixed when it is
+	// flushed.
+	a *aggregator
+	// last is the span's end for an entry with no aggregator. A window's
+	// end is read off the aggregator instead, because it grows while the
+	// window is open.
+	last int64
+}
+
+// endMark is the position of the last record inside this entry's span.
+func (e holdEntry) endMark() int64 {
+	if e.a != nil {
+		return e.a.lastMark
+	}
+	return e.last
 }
 
 // live reports whether a hold entry's window is still open, as opposed to
 // closed and already emitted. The aggregator is compared by identity as
 // well as by key, because a later window under the same key is a
-// different window.
+// different window; an entry that names no window is never live.
 func (st *Stream) live(e holdEntry) bool {
+	if e.a == nil {
+		return false
+	}
 	a, ok := st.aggs[e.key]
 	return ok && a == e.a
 }
@@ -105,8 +124,14 @@ type mlBuffer struct {
 	line string
 	ts   time.Time
 	seen time.Time
-	// mark is where the record that opened this buffer began.
-	mark int64
+	// mark is where the record that opened this buffer began, and
+	// lastMark where the most recent line absorbed into it began. The two
+	// are the record's span in the stream: a replay that started between
+	// them would meet a continuation line with no buffer open and judge
+	// it on its own, which is a different verdict and sometimes a whole
+	// extra sample.
+	mark     int64
+	lastMark int64
 }
 
 type aggregator struct {
@@ -257,7 +282,7 @@ func (st *Stream) holdFloor() (int64, bool) {
 		if e.mark >= oldest || st.live(e) {
 			continue
 		}
-		if e.a.lastMark >= oldest {
+		if e.endMark() >= oldest {
 			oldest = e.mark
 		}
 	}
@@ -276,7 +301,27 @@ func (st *Stream) holdFloor() (int64, bool) {
 // window and let a checkpoint advance past data that exists only inside
 // this struct.
 func (st *Stream) holdWindow(key string, a *aggregator) {
-	e := holdEntry{mark: a.mark, key: key, a: a}
+	st.addHold(holdEntry{mark: a.mark, key: key, a: a})
+}
+
+// holdRecord records the span of a multiline record that has just been
+// assembled and emitted, so the floor cannot later settle between the
+// line that opened it and the last line absorbed into it.
+func (st *Stream) holdRecord(buf *mlBuffer, through int64) {
+	last := buf.lastMark
+	if through > last {
+		last = through
+	}
+	if last <= buf.mark {
+		// A record that absorbed nothing spans a single position, and
+		// nothing can be inside that.
+		return
+	}
+	st.addHold(holdEntry{mark: buf.mark, last: last})
+}
+
+// addHold inserts one entry, keeping the list in mark order.
+func (st *Stream) addHold(e holdEntry) {
 	i := len(st.holds)
 	for i > 0 && st.holds[i-1].mark > e.mark {
 		i--
@@ -324,7 +369,7 @@ func (st *Stream) pruneHolds() {
 			// past the window's own start: a window that absorbed only
 			// the record that opened it spans a single position, which
 			// nothing can be inside.
-			if st.live(e) || (e.a.lastMark >= floor && e.a.lastMark > e.mark) {
+			if st.live(e) || (e.endMark() >= floor && e.endMark() > e.mark) {
 				kept = append(kept, e)
 			}
 		}
@@ -367,6 +412,10 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			var out []Result
 			var err error
 			if buf, ok := st.multiline[m.StartContains]; ok {
+				// The span of the record this line closes is recorded
+				// before it is processed: from here on a replay must not
+				// start between its first and last line.
+				st.holdRecord(buf, 0)
 				// The verdict on the record this line just closed is
 				// returned, not discarded.
 				//
@@ -384,7 +433,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 				// the only one there is to give.
 				out, err = st.processBuffered(buf)
 			}
-			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark}
+			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark, lastMark: st.mark}
 			return out, err
 		}
 		buf, ok := st.multiline[m.StartContains]
@@ -398,6 +447,10 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			// produce routinely -- and reported the loss only as a
 			// counter.
 			delete(st.multiline, m.StartContains)
+			// The line in hand is a continuation, so it belongs to the
+			// span: a replay that met it with no buffer open would judge
+			// it on its own instead of discarding it here.
+			st.holdRecord(buf, st.mark)
 			out, _ := st.processBuffered(buf)
 			return out, fmt.Errorf("extract: multiline record timestamps moved backwards")
 		}
@@ -419,6 +472,9 @@ func (st *Stream) Process(line string) ([]Result, error) {
 					buf.line += g[j.Capture]
 				}
 				buf.seen = time.Now()
+				if st.mark > buf.lastMark {
+					buf.lastMark = st.mark
+				}
 				return nil, nil
 			}
 		}
@@ -427,6 +483,13 @@ func (st *Stream) Process(line string) ([]Result, error) {
 		// nothing to the buffered record and nothing of its own. It used
 		// to vanish from both the samples and the unmatched tally, which
 		// is the one outcome a spec author cannot debug.
+		//
+		// It still belongs to the record's span: its fate depends on a
+		// buffer being open, so a replay that started after it would
+		// judge it as a record of its own.
+		if st.mark > buf.lastMark {
+			buf.lastMark = st.mark
+		}
 		st.Stats.Unjoined++
 		return nil, ErrNoJoin
 	}
@@ -493,6 +556,7 @@ func (st *Stream) FlushIdle(now time.Time) []Result {
 			continue
 		}
 		delete(st.multiline, m.StartContains)
+		st.holdRecord(buf, 0)
 		r, _ := st.processBuffered(buf)
 		out = append(out, r...)
 	}

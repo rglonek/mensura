@@ -175,18 +175,21 @@ Rules:
   aggregation window by at most its own width. They do not stall: every
   path that empties the extractor — the next block marker, the idle flush,
   rotation, shutdown — republishes the offset.
-- It also excludes any offset *inside* a window that has already been
-  emitted. Windows for different aggregation keys interleave, so one can
-  close while another, opened later, is still open — and the offset that
-  second window pins sits in the middle of the first one's records. A
-  resume from there does not rebuild the first window: those records open a
-  new one at the wrong start timestamp, so the store gains a partial row
-  nobody measured and loses the record that should have opened the next
-  real window. The resume point is therefore pulled back to the emitted
-  window's own start, where the replay rebuilds it whole and the duplicate
+- It also excludes any offset *inside* a window or a multiline record that
+  has already been emitted. Windows for different aggregation keys
+  interleave, so one can close while another, opened later, is still open —
+  and the offset that second window pins sits in the middle of the first
+  one's records. A resume from there does not rebuild the first window:
+  those records open a new one at the wrong start timestamp, so the store
+  gains a partial row nobody measured and loses the record that should have
+  opened the next real window. A multiline record fails the same way, one
+  line at a time: a resume between its first and last line meets each
+  continuation with no buffer open, so it is judged as a record of its own.
+  The resume point is therefore pulled back to the start of whatever it
+  landed inside, where the replay rebuilds it whole and the duplicate
   collapses under a content-addressed key. This is what makes the
   "at-least-once delivery, exactly-once observable result" claim below hold
-  for an aggregating profile as well as for a plain one.
+  for a multiline or aggregating profile as well as for a plain one.
 - Spec-change invalidation (`spec_hash` plus an `on_spec_change: reread`
   policy, re-reading the file from 0) is **not implemented**. The fields it
   needed were written into every checkpoint and never read by anything, so
