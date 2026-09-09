@@ -38,6 +38,22 @@ type setMeta struct {
 	Columns  map[string]ColumnSpec
 	Indexed  string // name of the indexed column, empty when unindexed
 	IndexCol uint32 // column id of the indexed column within this set
+
+	// dirty marks a schema whose in-memory form is ahead of the record on
+	// disk. It is not serialised: a reloaded schema is by definition the
+	// one on disk.
+	//
+	// It exists because the persist was conditional on *this* call having
+	// changed something. A meta write that failed -- a full disk, a
+	// transient I/O fault -- returned the error and left the widened
+	// schema in the map, so the next call saw nothing to change, skipped
+	// the write, and handed the caller a set id whose meta record does not
+	// exist. PutBatch then wrote rows under that id happily: after a
+	// restart they belong to no set, so no query, no drop and no retention
+	// sweep can reach them. That is the same silent orphaning the indexed-
+	// column promotion and the timestamp-less row are refused to avoid,
+	// arriving through the one path that had no retry.
+	dirty bool
 }
 
 // indexedColumnID is the column id given to a set's indexed column. It is
@@ -300,10 +316,20 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 		// Persisted before the set that uses it, so a crash between the
 		// two loses the set rather than reissuing its id.
 		if err := d.persistNextID(); err != nil {
+			// The maps go back as they were. Leaving the set behind made
+			// it exist for this process and for no other: the next call
+			// found it, saw nothing to change and never wrote its meta
+			// record, so its rows outlived every reader of them. The id
+			// is not given back -- nextID is a high-water mark and
+			// reissuing one is the thing it exists to prevent.
+			delete(d.sets, name)
+			delete(d.byID, sm.ID)
 			return nil, err
 		}
 	}
-	changed := !ok
+	if created {
+		sm.dirty = true
+	}
 	for _, c := range cols {
 		existing, had := sm.Columns[c.Name]
 		if had && existing.Type == c.Type && existing.Indexed == c.Indexed {
@@ -335,7 +361,7 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 				sm.IndexCol = indexedColumnID
 			}
 			sm.Columns[c.Name] = c
-			changed = true
+			sm.dirty = true
 			continue
 		}
 		// A widening type change is recorded; a narrowing one is ignored so
@@ -343,13 +369,19 @@ func (d *DB) setLocked(name string, cols []ColumnSpec) (*setMeta, error) {
 		if existing.Type == model.TypeInt && c.Type == model.TypeFloat {
 			existing.Type = model.TypeFloat
 			sm.Columns[c.Name] = existing
-			changed = true
+			sm.dirty = true
 		}
 	}
-	if changed {
+	// The flag rather than a "did this call change anything" local: a
+	// write that failed on an earlier call leaves the record on disk
+	// behind the schema in memory, and only a later call can put that
+	// right. It costs one extra small meta write on the call after a
+	// failure, and nothing at all otherwise.
+	if sm.dirty {
 		if err := d.persistSet(sm); err != nil {
 			return nil, err
 		}
+		sm.dirty = false
 	}
 	return sm, nil
 }
@@ -574,20 +606,41 @@ func (d *DB) DropSet(name string) error {
 	delete(d.byID, sm.ID)
 	d.mu.Unlock()
 
+	// A pebble batch applies whole or not at all, so a failure below
+	// leaves every row and the meta record exactly where they were --
+	// and the set has to come back with them. Dropping it from the maps
+	// anyway made a failed delete look like a successful one to
+	// everything except its caller: db.Sets() no longer listed the
+	// shard, so no query scanned it and no later retention sweep tried
+	// again, while the data and its meta record sat on disk until a
+	// restart brought them back. Nothing may hold the maps while this
+	// runs: DropSet owns dropMu exclusively, so no writer can have
+	// re-created the name in the meantime.
+	restore := func(err error) error {
+		d.mu.Lock()
+		d.sets[name] = sm
+		d.byID[sm.ID] = sm
+		d.mu.Unlock()
+		return err
+	}
+
 	b := d.pdb.NewBatch()
 	defer b.Close()
 	dp := dataPrefix(setID)
 	if err := b.DeleteRange(dp, prefixEnd(dp), nil); err != nil {
-		return err
+		return restore(err)
 	}
 	ip := indexPrefix(setID, indexCol)
 	if err := b.DeleteRange(ip, prefixEnd(ip), nil); err != nil {
-		return err
+		return restore(err)
 	}
 	if err := b.Delete(metaKey("set", name), nil); err != nil {
-		return err
+		return restore(err)
 	}
-	return d.pdb.Apply(b, d.metaOpts)
+	if err := d.pdb.Apply(b, d.metaOpts); err != nil {
+		return restore(err)
+	}
+	return nil
 }
 
 // PutDict and GetDict hold the label dictionaries under their own prefix,

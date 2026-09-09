@@ -91,11 +91,19 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 
 	// Series is always a list, never null: a client should not have to
 	// special-case "no results" differently from "no series".
+	//
+	// A predicate no dictionary value can satisfy is answered by the
+	// format's own executor with nothing in it, not by returning here.
+	// Returning here skipped the column declaration that runTabular
+	// builds before it scans, so `FORMAT table WHERE host = "typo"` came
+	// back with no columns at all -- and a response with no columns is
+	// the one thing the plugin renders as Grafana's "No data", which is
+	// exactly the case toFrames was changed to stop reporting: an empty
+	// table with its columns says the query ran and matched nothing,
+	// while "No data" says nothing at all, and telling those two apart is
+	// the whole point of narrowing a filter. scan() is where the work is
+	// skipped instead, so an impossible query still costs no shard reads.
 	resp := &wire.QueryResponse{Warnings: warns, Series: []wire.Series{}}
-	if plan.impossible {
-		resp.Stats.DurationMs = time.Since(started).Milliseconds()
-		return resp, nil
-	}
 
 	switch q.Format {
 	case mql.FormatTable, mql.FormatLogs:
@@ -839,6 +847,13 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 // numbers are part of the query response and used to be left at zero on
 // every query.
 func (s *Store) scan(ctx context.Context, p *queryPlan, req *wire.QueryRequest, stats *wire.QueryStats, visit func(engine.Row) bool) error {
+	// A predicate that no dictionary value can satisfy reads no shards.
+	// The caller still runs, so it still emits the shape its format
+	// promises -- the columns of a table, an empty series list -- rather
+	// than a response a renderer cannot tell from "the query never ran".
+	if p.impossible {
+		return nil
+	}
 	shards := p.shards
 	if p.reverse {
 		// Newest shard first, so a bounded newest-first scan can stop

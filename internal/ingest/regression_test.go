@@ -2118,3 +2118,137 @@ func TestRemoteIdleFlushDeliversUnderTheStreamLock(t *testing.T) {
 	close(release)
 	<-readerRan
 }
+
+const flushSeqSpec = `
+version: 1
+profiles:
+  - name: agg
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    labels: [op]
+    patterns:
+      - set: lines
+        search: 'op='
+        extract: ['op=(?P<op>\w+)']
+        aggregate: {every: 1h, on: [op], field: n, mode: increment}
+`
+
+// hintRecorder records the key hint of every sample the store accepts.
+type hintRecorder struct {
+	mu    sync.Mutex
+	hints []string
+	srv   *httptest.Server
+}
+
+func newHintRecorder() *hintRecorder {
+	h := &hintRecorder{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/write", func(w http.ResponseWriter, r *http.Request) {
+		var req wire.WriteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		n := 0
+		h.mu.Lock()
+		for _, b := range req.Batches {
+			for _, s := range b.Samples {
+				h.hints = append(h.hints, s.KeyHint)
+				n++
+			}
+		}
+		h.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(wire.WriteResponse{Accepted: n})
+	})
+	h.srv = httptest.NewServer(mux)
+	return h
+}
+
+func (h *hintRecorder) all() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.hints...)
+}
+
+// A flush of buffered extractor state has no byte offset of its own, so
+// its key hint is a sequence number -- and that counter used to live on
+// the tailer.
+//
+// A tailer is rebuilt whenever its path is retired and comes back: a
+// rotation, or a sweep in which filepath.Glob missed it, which is what an
+// unreadable directory reports. On the retire-and-resume path the byte
+// offsets carry on from the checkpoint while the flush numbers restarted
+// at one, so two different windows of the same stream were handed the
+// same hint. Under `key: offset` the hint *is* the row's identity, so the
+// second window silently overwrote the first.
+func TestFlushHintsSurviveTailerRecreation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	rec := newHintRecorder()
+	defer rec.srv.Close()
+
+	spec, err := extract.Parse([]byte(flushSeqSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(rec.srv.URL, "")
+	client.Compress = false
+	sinkCfg := DefaultSinkConfig()
+	sinkCfg.FlushEvery = time.Hour // only the explicit flushes below
+	sink := NewSink(client, sinkCfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: filepath.Join(dir, "state"), Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	cps, err := NewCheckpointStore(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("checkpoints: %v", err)
+	}
+	f := &follower{
+		ing: ing, cps: cps,
+		opts:      FollowOptions{Paths: []string{path}},
+		tailers:   map[string]*tailer{},
+		noProfile: map[string]time.Time{},
+	}
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	// Two rounds, each: read a record into an aggregation window whose
+	// `every` keeps it open, then retire the tailer, which drains it.
+	for round := 0; round < 2; round++ {
+		fh, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if ferr != nil {
+			t.Fatalf("open: %v", ferr)
+		}
+		if _, werr := fmt.Fprintf(fh, "%d op=read\n", base+int64(round)*1000); werr != nil {
+			t.Fatalf("write: %v", werr)
+		}
+		_ = fh.Close()
+
+		tl, eerr := f.ensure(path)
+		if eerr != nil || tl == nil {
+			t.Fatalf("ensure: %v", eerr)
+		}
+		if rerr := f.read(ctx, tl); rerr != nil {
+			t.Fatalf("read: %v", rerr)
+		}
+		// The path leaving the followed set: the checkpoint stays, so the
+		// next tailer resumes where this one stopped.
+		f.retireKeepingCheckpoint(ctx, tl)
+	}
+	if err := sink.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	hints := rec.all()
+	if len(hints) != 2 {
+		t.Fatalf("got %d sample(s) with hints %v, want one flushed window per round", len(hints), hints)
+	}
+	if hints[0] == hints[1] {
+		t.Fatalf("both flushed windows carry the key hint %q; under `key: offset` that is one row key for two windows, so the second overwrites the first", hints[0])
+	}
+}

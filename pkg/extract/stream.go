@@ -291,11 +291,27 @@ func (st *Stream) Process(line string) ([]Result, error) {
 	for _, m := range st.profile.Framing.Multiline {
 		if strings.Contains(line, m.StartContains) {
 			var out []Result
+			var err error
 			if buf, ok := st.multiline[m.StartContains]; ok {
-				out, _ = st.processBuffered(buf)
+				// The verdict on the record this line just closed is
+				// returned, not discarded.
+				//
+				// A multiline record is almost always flushed by the next
+				// start marker, and this call used to report success for
+				// every one of them. The drivers turn that verdict into
+				// the pipeline's counters -- Progress.UnmatchedLines,
+				// TSParseErrors, ExtractErrors -- so a profile whose
+				// joined records matched no pattern reported "0
+				// unmatched" on the console, in the progress document and
+				// in the _mensura_ingest set, while the stream's own
+				// Stats (which only `check --sample` reads) counted every
+				// one. The line in hand has been buffered rather than
+				// judged, so it is owed no verdict of its own and this is
+				// the only one there is to give.
+				out, err = st.processBuffered(buf)
 			}
 			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark}
-			return out, nil
+			return out, err
 		}
 		buf, ok := st.multiline[m.StartContains]
 		if !ok || m.continueRe == nil || !m.continueRe.MatchString(line) {
@@ -569,8 +585,29 @@ func (st *Stream) isLabel(pat *Pattern, name string) bool {
 
 func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[string]string, fields map[string]model.Value, line string) error {
 	ag := pat.Aggregate
-	keyParts := make([]string, 0, len(ag.On)+1)
-	keyParts = append(keyParts, set)
+	// The window is identified by what it produces, not only by where it
+	// goes: the destination set, the column the accumulator synthesises,
+	// how it accumulates, and the label values it is keyed on.
+	//
+	// The set and the `on` values used to be the whole of it, so two
+	// aggregating patterns writing one set with the same `on` keys shared
+	// a single window -- and a window keeps the field and mode of
+	// whichever pattern opened it. A profile with
+	//
+	//	patterns: [ {search: COUNT, aggregate: {field: hits, mode: increment, on: [op]}},
+	//	            {search: LAT,   aggregate: {field: lat,  mode: max,       on: [op]}} ]
+	//
+	// emitted one row per key carrying `hits`, whose value was the
+	// latency: the max fold ran against the counter's accumulator, and
+	// `lat` was never written at all. Nothing reported it -- both
+	// patterns matched, both records were counted, and the series that
+	// vanished looks exactly like one the source never emitted.
+	//
+	// Two patterns that really do declare the same column with the same
+	// mode still share a window, which is the one case where merging is
+	// what the spec asks for.
+	keyParts := make([]string, 0, len(ag.On)+3)
+	keyParts = append(keyParts, set, ag.Field, ag.Mode)
 	for _, on := range ag.On {
 		v, ok := labels[on]
 		if !ok {
@@ -639,12 +676,16 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	if !usable {
 		// Nothing to fold. `increment` counts the occurrence regardless;
 		// the value modes leave the window exactly as it was.
-		if ag.Mode == "increment" {
+		//
+		// The window's own mode decides, not the record's. The key above
+		// makes them the same thing, and reading it off the accumulator
+		// is what keeps that true if the key ever changes again.
+		if a.mode == "increment" {
 			a.value++
 		}
 		return nil
 	}
-	switch ag.Mode {
+	switch a.mode {
 	case "increment":
 		a.value++
 	case "sum":

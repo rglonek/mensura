@@ -226,9 +226,8 @@ type peerStream struct {
 	ex *extract.Stream
 	// labels are fixed when the peer is first seen, so a flush that runs
 	// without a record in hand can still label what it emits.
-	labels   map[string]string
-	seen     time.Time
-	flushSeq int
+	labels map[string]string
+	seen   time.Time
 }
 
 type receiver struct {
@@ -243,6 +242,16 @@ type receiver struct {
 	// seq numbers received records, which have no byte offset of their
 	// own to key on.
 	seq atomic.Int64
+	// flushSeq numbers the flushes of buffered peer state, for the same
+	// reason and with the same lifetime as seq: it is half of the key
+	// hint, and it used to live on the peer stream, which is destroyed
+	// when a sender goes quiet for PeerIdle and rebuilt when it comes
+	// back. Two windows of one sender could then be handed the same
+	// hint, and under `key: offset` that is one row key for both. The
+	// local follower's counter was moved off its tailer for exactly this
+	// reason; a listener has no checkpoint to re-read from, so it can
+	// afford the shared shape even less.
+	flushSeq atomic.Int64
 
 	// recordWarns collapses a repeated per-record failure. A listener
 	// that matches no profile fails every record, and a line each was a
@@ -375,11 +384,11 @@ func (r *receiver) emit(ctx context.Context, ps *peerStream, results []extract.R
 	if len(results) == 0 {
 		return
 	}
-	ps.mu.Lock()
-	ps.flushSeq++
-	pos := flushPos(ps.flushSeq)
+	// ps.mu guards the extractor, which this function does not touch:
+	// labels is fixed when the peer is first seen, and the flush number
+	// now comes off the receiver rather than off the peer.
 	labels := ps.labels
-	ps.mu.Unlock()
+	pos := flushPos(int(r.flushSeq.Add(1)))
 	host := labels["host"]
 	r.ing.cfg.Progress.AddSamples(int64(len(results)))
 	for n, res := range results {

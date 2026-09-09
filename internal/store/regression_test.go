@@ -1619,3 +1619,68 @@ func TestWriteRefusesAnUnknownFieldKind(t *testing.T) {
 		}
 	}
 }
+
+// A predicate that no dictionary value can satisfy used to return from
+// Query before the format's own executor ran.
+//
+// runTabular builds the column declaration before it scans, so
+// `FORMAT table WHERE host = "typo"` came back with no columns at all --
+// and a response with no columns is the one thing the plugin renders as
+// Grafana's "No data", which is exactly the case toFrames was changed to
+// stop reporting. An empty table with its columns says the query ran and
+// matched nothing; "No data" says nothing at all, and telling those two
+// apart is the whole point of narrowing a filter.
+func TestImpossiblePredicateStillDeclaresItsColumns(t *testing.T) {
+	s := openTestStore(t)
+	writeSamples(t, s, "app", []model.Sample{{
+		TSMs:   1_700_000_000_000,
+		Labels: map[string]string{"host": "a"},
+		Fields: map[string]model.Value{"cpu": model.Float(1)},
+	}})
+
+	run := func(text string) *wire.QueryResponse {
+		t.Helper()
+		q, err := mql.Parse(text)
+		if err != nil {
+			t.Fatalf("parse %q: %v", text, err)
+		}
+		resp, err := s.Query(context.Background(), &wire.QueryRequest{
+			AST: q, FromMs: 1, ToMs: 1_800_000_000_000, MaxPoints: 100,
+		})
+		if err != nil {
+			t.Fatalf("query %q: %v", text, err)
+		}
+		return resp
+	}
+
+	// The shape a matching-but-empty range answers with is the shape an
+	// impossible predicate has to answer with too.
+	want := run(`FROM app SELECT cpu WHERE host = "a" FORMAT table`)
+	got := run(`FROM app SELECT cpu WHERE host = "nope" FORMAT table`)
+	if len(got.Columns) != len(want.Columns) {
+		t.Fatalf("impossible predicate returned %d column(s), the same query over live labels returns %d; the panel cannot tell it from a query that never ran",
+			len(got.Columns), len(want.Columns))
+	}
+	for i := range want.Columns {
+		if got.Columns[i] != want.Columns[i] {
+			t.Fatalf("column %d = %+v, want %+v", i, got.Columns[i], want.Columns[i])
+		}
+	}
+	if len(got.Rows) != 0 {
+		t.Fatalf("impossible predicate returned %d row(s)", len(got.Rows))
+	}
+	// And it still costs nothing: no shard is opened for a predicate that
+	// cannot match.
+	if got.Stats.ShardsScanned != 0 || got.Stats.RowsScanned != 0 {
+		t.Fatalf("impossible predicate scanned %d shard(s) and %d row(s); it should read nothing",
+			got.Stats.ShardsScanned, got.Stats.RowsScanned)
+	}
+	// The timeseries form is unchanged: a list, never null.
+	ts := run(`FROM app SELECT cpu WHERE host = "nope"`)
+	if ts.Series == nil {
+		t.Fatal("an impossible timeseries query answered \"series\": null")
+	}
+	if len(ts.Series) != 0 {
+		t.Fatalf("an impossible timeseries query returned %d series", len(ts.Series))
+	}
+}

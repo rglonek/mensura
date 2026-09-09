@@ -332,6 +332,16 @@ wall-clock timeout in follow mode), and emit one sample carrying the accumulated
 field plus the labels of the accumulator. `mode: increment` adds one per record
 (the `(repeated: N)` case uses `mode: sum` with the parsed count).
 
+An accumulator is identified by the destination set, the `field` it writes,
+the `mode` it writes it with, and the `on` tuple. Two patterns therefore share
+a window only when they declare the same column with the same semantics —
+which is the case where merging is what the spec asks for. Two patterns
+writing different columns of one set, on the same keys, keep their own
+windows; before they shared one, and a window keeps the field and mode of
+whichever pattern opened it, so one column reported the other's numbers and
+the second column was never written at all
+([12-implementation.md §6.101](12-implementation.md)).
+
 Aggregation is a *lossy* choice, deliberately: individual occurrences are gone.
 `check` prints, for each aggregating pattern, an estimate of the reduction, so
 the trade is visible.

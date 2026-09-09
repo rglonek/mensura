@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rglonek/mensura/pkg/extract"
@@ -114,7 +115,28 @@ type follower struct {
 	tailers map[string]*tailer
 	// noProfile maps a path to the time it may be reconsidered.
 	noProfile map[string]time.Time
+
+	// flushSeq numbers the flushes of buffered extractor state across
+	// every followed path, because such a flush has no byte offset of its
+	// own to key on and the number is half of the key hint.
+	//
+	// It lives here rather than on the tailer. A tailer is recreated
+	// whenever its path is retired and comes back -- a rotation, or the
+	// glob missing it for one sweep, which filepath.Glob reports for an
+	// unreadable directory -- and a per-tailer counter restarts at zero
+	// each time. On the retire-and-resume path the byte offsets carry on
+	// from the checkpoint while the flush numbers repeat, so two different
+	// windows of one stream were handed the same hint: under `key: offset`
+	// that is one row key for both, and the later window silently
+	// overwrote the earlier one. The remote follower keeps its counter for
+	// the life of the path for exactly this reason; one counter here is
+	// the same guarantee without a map to grow.
+	flushSeq atomic.Int64
 }
+
+// nextFlushPos reserves the hint position for one flush of buffered
+// extractor state.
+func (f *follower) nextFlushPos() string { return flushPos(int(f.flushSeq.Add(1))) }
 
 // tailer follows one file.
 //
@@ -134,9 +156,6 @@ type tailer struct {
 	labels        map[string]string
 	ex            *extract.Stream
 	cp            *Checkpoint
-	// flushSeq numbers the flushes of buffered extractor state, which
-	// have no byte offset of their own to key on.
-	flushSeq int
 
 	mu       sync.Mutex
 	pending  int64
@@ -820,8 +839,7 @@ func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 		f.syncPending(t)
 		return
 	}
-	t.flushSeq++
-	pos := flushPos(t.flushSeq)
+	pos := f.nextFlushPos()
 	f.ing.cfg.Progress.AddSamples(int64(len(results)))
 	for n, r := range results {
 		_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
@@ -969,8 +987,7 @@ func (f *follower) flushIdle(ctx context.Context) {
 		if len(results) == 0 {
 			continue
 		}
-		t.flushSeq++
-		pos := flushPos(t.flushSeq)
+		pos := f.nextFlushPos()
 		f.ing.cfg.Progress.AddSamples(int64(len(results)))
 		for n, r := range results {
 			_ = f.ing.cfg.Sink.Add(ctx, r, t.labels, keyHint(t.stream, pos, n))
