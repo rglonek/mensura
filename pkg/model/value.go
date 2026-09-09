@@ -104,6 +104,21 @@ func (v Value) AsFloat() (float64, bool) {
 // or an infinity.
 func isFinite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
 
+// IsFinite is isFinite for callers outside this package.
+//
+// The render walk is arithmetic on values this package has already
+// screened, and arithmetic on finite inputs is not closed over the finite
+// numbers: a DELTA across two values of opposing sign near the float64
+// limit overflows to an infinity, and so does a PER SECOND division by a
+// millisecond interval. Whatever produces one, it must not reach the wire,
+// so the check belongs somewhere both the producer and the encoder can
+// see it.
+func IsFinite(f float64) bool { return isFinite(f) }
+
+// maxIntFloat is 2^63: the first float64 magnitude that an int64 cannot
+// hold. It is exactly representable, so the comparisons below are exact.
+const maxIntFloat = float64(1 << 63)
+
 // AsInt coerces to int64 where that is lossless-enough for indexing.
 //
 // A non-finite float reports false rather than being converted: the
@@ -117,6 +132,16 @@ func (v Value) AsInt() (int64, bool) {
 		return v.I, true
 	case TypeFloat:
 		if !isFinite(v.F) {
+			return 0, false
+		}
+		// Range-checked as well as finite-checked. Converting a float
+		// outside the int64 range is undefined by the Go spec -- amd64
+		// yields the indefinite value and arm64 saturates -- so a
+		// bucket set whose `total_field` capture coerced to 1e300
+		// produced a total nothing measured, and with it a `tail` and a
+		// `<bucket>plus` column derived from it. A number this function
+		// cannot represent is not a number it may guess at.
+		if v.F >= maxIntFloat || v.F < -maxIntFloat {
 			return 0, false
 		}
 		return int64(v.F), true

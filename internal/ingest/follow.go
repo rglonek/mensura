@@ -74,6 +74,17 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 			// gone, which is the normal ordering in a rolling restart.
 			f.closeAll(ctx)
 			return i.cfg.Sink.Flush(context.Background())
+		case <-i.cfg.Sink.GaveUp():
+			// Delivery has been abandoned, so reading on only produces
+			// samples nothing will store. The extractors are drained and
+			// the handles closed exactly as on a cancellation -- the
+			// final flush will not deliver either, but it is what leaves
+			// the checkpoints describing what the store really holds --
+			// and the error travels up so the command exits non-zero and
+			// a supervisor notices.
+			f.closeAll(ctx)
+			_ = i.cfg.Sink.Flush(context.Background())
+			return ErrGaveUp
 		case <-idle.C:
 			f.flushIdle(ctx)
 		case <-ticker.C:

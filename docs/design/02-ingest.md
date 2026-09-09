@@ -356,7 +356,10 @@ The write client is one per process, shared across shards.
   `422` unknown set with `strict_sets` on) are counted, logged with the first
   offending sample, and *dropped* — the batch is not retried, because retrying
   a malformed batch forever is how a pipeline stalls silently. Beyond
-  `--max-fatal-drops` the process exits non-zero so a supervisor notices.
+  `--max-fatal-drops` the sink abandons delivery: `batch` returns the error,
+  and `follow`, SSH follow and `receive` stop reading, drain what they hold
+  and exit non-zero, so a supervisor notices rather than watching a process
+  that is running and storing nothing.
 - **Retry exhaustion is back-pressure, not a verdict.** A store that sheds load
   answers `503` with `Retry-After`, which is a request to slow down; running out
   of client-side retries a few seconds later says nothing about the batch. It

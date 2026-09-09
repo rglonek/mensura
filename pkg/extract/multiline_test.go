@@ -57,3 +57,35 @@ profiles:
 		t.Fatalf("expected an invalid bucket name error, got %v", err)
 	}
 }
+
+// continue_regex is the only test Process applies to a candidate
+// continuation line, so a multiline rule without one joins nothing at all
+// -- while still opening a buffer on every start marker. The record that
+// opened it is then held until the next start marker or the idle timeout,
+// and on a followed file HeldFrom pins the checkpoint to its offset for
+// just as long. A spec that reads as "assemble these lines" silently
+// becoming "delay every one of them" is a compile-time fault.
+func TestMultilineRequiresContinueRegex(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    select: {}
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    framing:
+      multiline:
+        - start_contains: 'BEGIN'
+          join: [{regex: '(.*)', capture: 1}]
+    patterns:
+      - set: lines
+        search: 'n='
+        extract: ['n=(?P<n>\d+)']
+`
+	_, err := Parse([]byte(spec))
+	if err == nil || !strings.Contains(err.Error(), "continue_regex") {
+		t.Fatalf("expected a continue_regex error, got %v", err)
+	}
+}

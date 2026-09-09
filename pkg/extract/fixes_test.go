@@ -456,3 +456,38 @@ profiles:
 		}
 	}
 }
+
+// A bucket set's total_field is an ordinary capture, so model.Coerce may
+// turn it into a float far outside the int64 range. AsInt used to convert
+// it anyway -- a conversion the Go spec leaves undefined -- so `tail` and
+// every `<bucket>plus` column were derived from a total nothing measured.
+// A total this function cannot represent leaves the declared sum in
+// place, which is the honest fallback the code already has for a missing
+// total.
+func TestAnUnrepresentableTotalDoesNotFabricateATail(t *testing.T) {
+	bs := &BucketSet{
+		Name: "h", Parse: "paren_pairs", Buckets: []string{"00", "01"},
+		Edges: "pow2", TotalField: "total", Tail: true, Cumulative: true,
+	}
+	if err := bs.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	fields := map[string]model.Value{"total": model.Coerce("1e300")}
+	if err := bs.expand("(00: 3) (01: 4)", fields); err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	tail, ok := fields[tailField].AsInt()
+	if !ok {
+		t.Fatal("no tail column was written")
+	}
+	if tail != 0 {
+		t.Fatalf("tail is %d; an unrepresentable total must not invent a count", tail)
+	}
+	// The cumulative columns are derived from the same tail.
+	if v, _ := fields["01plus"].AsInt(); v != 4 {
+		t.Fatalf("01plus is %d, want 4", v)
+	}
+	if v, _ := fields["00plus"].AsInt(); v != 7 {
+		t.Fatalf("00plus is %d, want 7", v)
+	}
+}

@@ -95,6 +95,20 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	// this is the same fix on the ingest side.
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The sink abandoning delivery takes the listeners down with it, the
+	// same way one listener's failure does. Without this
+	// `--max-fatal-drops` was inert here: a delivery error on this path
+	// becomes a collapsed per-record warning, so a receiver whose every
+	// batch the store refuses kept accepting connections and storing
+	// nothing for as long as it was left alone.
+	go func() {
+		select {
+		case <-i.cfg.Sink.GaveUp():
+			i.cfg.Log.Printf("ERROR %v; stopping the listeners", ErrGaveUp)
+			cancel()
+		case <-serveCtx.Done():
+		}
+	}()
 
 	type listener struct {
 		name string
@@ -193,6 +207,9 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 	// cancelled one.
 	r.flushAll(context.Background())
 	_ = i.cfg.Sink.Flush(context.Background())
+	if first == nil && i.cfg.Sink.gaveUpNow() {
+		first = ErrGaveUp
+	}
 	return first
 }
 
@@ -721,6 +738,10 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 				refuse(err)
 				continue
 			}
+			if !r.ing.inWindow(s.TSMs) {
+				refuse(fmt.Errorf("sample timestamp is outside the configured --from/--to window"))
+				continue
+			}
 			if err := r.ing.cfg.Sink.AddSample(req.Context(), body.Set, s); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -800,6 +821,24 @@ func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (
 		// store for carrying no hint -- a listener that could never
 		// write to the very sets the scheme exists for.
 		sample.KeyHint = keyHint(peer, r.arrivalPos(), 0)
+		if !r.ing.inWindow(sample.TSMs) {
+			// Outside --from/--to, which is what the extractor does with
+			// a record on every other path: dropped, and reported as a
+			// record the spec read nothing out of so a request/response
+			// listener can put it in its denominator.
+			return true, nil
+		}
+		// Checked here rather than left to the store, exactly as the
+		// sample-posting endpoint checks. A line protocol carries label
+		// keys, field names and a timestamp that this parser does not
+		// look at, so a sample the store will refuse -- a label key
+		// outside the charset, a timestamp in the wrong unit -- was
+		// counted as accepted on the HTTP listener and passed in silence
+		// on the TCP and UDP ones, and the only trace of the loss was
+		// the store's own log on the far side of the sink.
+		if err := sample.Validate(); err != nil {
+			return false, err
+		}
 		r.ing.cfg.Progress.AddSamples(1)
 		return false, r.ing.cfg.Sink.AddSample(ctx, set, sample)
 	}

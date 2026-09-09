@@ -123,3 +123,27 @@ func TestValueRejectsUnknownKeys(t *testing.T) {
 		t.Fatalf("decoded to %+v", v)
 	}
 }
+
+// Converting a float outside the int64 range is undefined by the Go
+// spec: amd64 yields the indefinite value and arm64 saturates. AsInt is
+// how a row's indexed timestamp and a bucket set's declared total are
+// read, so a garbage answer places a row at a fabricated time or derives
+// a histogram tail from a count nothing measured. A value this function
+// cannot represent has to report that it cannot.
+func TestAsIntRefusesAnOutOfRangeFloat(t *testing.T) {
+	for _, f := range []float64{
+		1e300, -1e300, math.MaxFloat64, -math.MaxFloat64,
+		float64(math.MaxInt64), // 2^63 exactly, which int64 cannot hold
+		9.3e18,
+	} {
+		if got, ok := Float(f).AsInt(); ok {
+			t.Errorf("AsInt(%g) reported %d as representable", f, got)
+		}
+	}
+	// The boundary that is representable still is.
+	for _, f := range []float64{0, 1, -1, float64(math.MinInt64), 1 << 52} {
+		if _, ok := Float(f).AsInt(); !ok {
+			t.Errorf("AsInt(%g) refused a representable value", f)
+		}
+	}
+}

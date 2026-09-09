@@ -381,6 +381,24 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 	return nil
 }
 
+// inWindow reports whether a timestamp falls inside --from/--to, with the
+// same bounds extract.Stream applies to a record it parses.
+//
+// The line-protocol path and the sample-posting endpoint never went
+// through the extractor, so those two flags were honoured on every
+// acquisition path but theirs: `receive --mode metrics --from 1h` read
+// the flag, parsed it, and then stored everything the sender offered.
+func (i *Ingest) inWindow(tsMs int64) bool {
+	t := time.UnixMilli(tsMs)
+	if !i.cfg.From.IsZero() && t.Before(i.cfg.From) {
+		return false
+	}
+	if !i.cfg.To.IsZero() && t.After(i.cfg.To) {
+		return false
+	}
+	return true
+}
+
 func (i *Ingest) recordOutcome(err error) {
 	switch err {
 	case nil:

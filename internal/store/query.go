@@ -483,9 +483,26 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 		pts := render.Series(a.points, spec, window)
 		ser := wire.Series{Name: a.name, Labels: a.labels, Meta: a.field.meta}
 		for _, o := range pts {
-			ser.TSMs = append(ser.TSMs, o.TSMs)
-			ser.Values = append(ser.Values, o.Value)
-			ser.IsNull = append(ser.IsNull, o.Null)
+			ts, v, null := o.TSMs, o.Value, o.Null
+			// Screened here, at the wire boundary, and not only on the
+			// way in. model.Value.AsFloat refuses a non-finite *input*,
+			// but the walk is arithmetic and arithmetic on finite
+			// operands is not closed over the finite numbers: a DELTA
+			// across two values of opposing sign near the float64 limit
+			// overflows to an infinity, and a PER SECOND division by a
+			// millisecond interval multiplies by a thousand. One such
+			// point used to make encoding/json fail on the response
+			// *after* the 200 header had been written, so the panel got
+			// a truncated body with no status and no diagnostic -- the
+			// whole query lost to one point. A value that cannot be
+			// plotted reads as an absent one, which is what this array
+			// already means by null.
+			if !null && !model.IsFinite(v) {
+				v, null = 0, true
+			}
+			ser.TSMs = append(ser.TSMs, ts)
+			ser.Values = append(ser.Values, v)
+			ser.IsNull = append(ser.IsNull, null)
 		}
 		resp.Stats.PointsOut += len(pts)
 		resp.Series = append(resp.Series, ser)
@@ -625,9 +642,16 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 			BucketEdges: bs.Edges,
 		}
 		for _, t := range times {
+			// Same screen the timeseries path applies, for the same
+			// reason: a cell is a running sum, and a sum of finite
+			// counts can still reach an infinity.
+			v, null := buckets[t], false
+			if !model.IsFinite(v) {
+				v, null = 0, true
+			}
 			ser.TSMs = append(ser.TSMs, t)
-			ser.Values = append(ser.Values, buckets[t])
-			ser.IsNull = append(ser.IsNull, false)
+			ser.Values = append(ser.Values, v)
+			ser.IsNull = append(ser.IsNull, null)
 		}
 		resp.Stats.PointsOut += len(times)
 		resp.Series = append(resp.Series, ser)
@@ -785,6 +809,11 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		}
 	}
 	resp.Stats.Truncated = truncated
+	// The rows are this format's output, so they are what "points" counts.
+	// Leaving it at zero made a table query that returned a thousand rows
+	// report the same statistics as one that returned none, on the one
+	// field an operator reads to tell those two apart.
+	resp.Stats.PointsOut = len(rows)
 	if truncated {
 		// Truncation used to be recorded in Stats alone, which nothing
 		// renders: a table quietly showed the first rows of a range with

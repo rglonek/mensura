@@ -48,6 +48,21 @@ func DefaultSinkConfig() SinkConfig {
 	}
 }
 
+// ErrGaveUp marks the sink abandoning delivery: MaxFatalDrops unretryable
+// batches have been dropped, so whatever is wrong is not going to be
+// fixed by sending the next one.
+//
+// It exists because the knob it enforces used to do nothing outside batch
+// import. The fatal-drop counter was compared, an error was returned, and
+// the three continuous modes -- follow, SSH follow and receive -- all
+// swallow a delivery error into a log line and carry on, which is
+// correct for every *other* delivery error. So `--max-fatal-drops`, whose
+// documented purpose is "the process gives up, so a supervisor notices a
+// spec the store rejects", was inert in exactly the modes that run under
+// a supervisor: an ingester whose every batch was refused ran for as long
+// as it was left alone, at full rate, storing nothing.
+var ErrGaveUp = errors.New("ingest: too many unretryable batches were dropped; giving up on delivery")
+
 // Sink batches samples per set and ships them to the store.
 type Sink struct {
 	client *wire.Client
@@ -90,6 +105,13 @@ type Sink struct {
 	// credential that will not change for minutes.
 	holdMu    sync.Mutex
 	holdUntil time.Time
+	// gaveUp is closed once MaxFatalDrops is reached. It is a channel
+	// rather than a flag because the acquisition loops are already
+	// selecting on something, and the moment delivery is abandoned is the
+	// moment they should stop reading rather than the next tick.
+	gaveUp     chan struct{}
+	gaveUpOnce sync.Once
+
 	// now is the clock, overridable through setClock.
 	//
 	// It is guarded by holdMu, which is not ceremony: the only reader is
@@ -192,11 +214,33 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 		buffers:  map[string][]model.Sample{},
 		metaSent: map[string]struct{}{},
 		stopCh:   make(chan struct{}),
+		gaveUp:   make(chan struct{}),
 		now:      time.Now,
 	}
 	s.wg.Add(1)
 	go s.flushLoop()
 	return s
+}
+
+// GaveUp is closed when the sink has abandoned delivery. An acquisition
+// loop selects on it so the process stops reading rather than producing
+// samples nothing will ever store.
+func (s *Sink) GaveUp() <-chan struct{} { return s.gaveUp }
+
+// giveUp records that delivery has been abandoned. It is idempotent.
+func (s *Sink) giveUp() { s.gaveUpOnce.Do(func() { close(s.gaveUp) }) }
+
+// gaveUpNow reports, without blocking, whether the sink has given up. It
+// is what an acquisition loop checks on the way out, so a shutdown that
+// was caused by the give-up is reported as one rather than as a clean
+// stop.
+func (s *Sink) gaveUpNow() bool {
+	select {
+	case <-s.gaveUp:
+		return true
+	default:
+		return false
+	}
 }
 
 // DeliveryObserver is how a driver that tracks byte offsets learns which
@@ -517,7 +561,9 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 			s.reportLost(obs, partial)
 			s.discardMeta(meta, sets, fatal)
 			if s.cfg.MaxFatalDrops > 0 && drops >= int64(s.cfg.MaxFatalDrops) {
-				return false, err
+				s.giveUp()
+				s.log.Printf("ERROR %d unretryable batches have been dropped, which is the limit of %d; giving up on delivery", drops, s.cfg.MaxFatalDrops)
+				return false, fmt.Errorf("%w after %d dropped batches: %w", ErrGaveUp, drops, err)
 			}
 			// No further rounds: the loss has been announced, so the
 			// observers are frozen until a later flush thaws them, and
