@@ -164,7 +164,14 @@ func toFrames(resp *wire.QueryResponse, executed string) data.Frames {
 		}
 		frames = append(frames, frame)
 	}
-	if len(resp.Rows) > 0 {
+	// Keyed on the columns, not on the rows. Only the tabular and
+	// auxiliary forms declare columns, so this still emits nothing for a
+	// timeseries; but a table or logs query that matched nothing used to
+	// return no frame at all, so Grafana drew "No data" where the honest
+	// answer is the table the query describes with no rows in it. The
+	// difference matters while a filter is being narrowed: an empty table
+	// with its columns says the query ran, and "No data" says nothing.
+	if len(resp.Columns) > 0 {
 		frames = append(frames, tableFrame(resp, executed))
 	}
 	return frames

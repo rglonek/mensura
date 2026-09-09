@@ -133,6 +133,14 @@ start line, a timestamp regression, stream close, or `idle_timeout` flushes it.
 Timestamp regression inside a multiline record is an error for that record,
 not a silent join.
 
+Both keys are required, and the compiler refuses a rule missing either.
+`continue_regex` is the only test applied to a candidate continuation, so
+a rule without one joins nothing while still opening a buffer on every
+start marker: the record that opened it waits for the next start marker
+or the idle timeout, and in follow mode the checkpoint waits with it. An
+empty `start_contains` is the mirror image — it matches every line, so
+every record opens a buffer and none is ever joined.
+
 `record: json` would decode each line as a JSON object, with captures
 addressed by JSON pointer (`/http/status`) rather than by regex group. It
 is **not implemented**: every record is framed by line, and the compiler

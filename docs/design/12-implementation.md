@@ -1888,6 +1888,93 @@ the sink. The flush and the delivery now happen as one step under the
 stream lock, which is what `remoteStream.process` already does for the
 reader's own records and for the same reason.
 
+### 6.95 A value the render walk overflowed is not a value
+
+`model.Value.AsFloat` refuses a non-finite *input*, which is what stops a
+log line spelling a field `NaN` from reaching a response (§6.23, §6.67).
+The walk itself is arithmetic, and arithmetic over the finite floats is
+not closed: `DELTA` across two values of opposing sign near the float64
+limit overflows to an infinity, `PER SECOND` divides by a raw interval
+that may be a single millisecond, and a heatmap cell is a running sum.
+One such point used to travel into `wire.Series.Values`, where
+`encoding/json` refuses it — on a response whose `200` header has already
+been written, so the panel received a truncated body with no status and
+no diagnostic, and the whole query was lost to one point.
+`runTimeseries` and `runHeatmap` now screen at the wire boundary: a value
+that cannot be plotted is emitted as a null, which is what that parallel
+array already means by absence.
+
+### 6.96 `AsInt` refuses a float it cannot represent
+
+Converting a float outside the int64 range is undefined by the Go spec —
+amd64 yields the indefinite value, arm64 saturates — and `AsInt` is how a
+row's indexed timestamp and a bucket set's `total_field` are read. That
+field is an ordinary capture, so `model.Coerce` turns `1e300` in a log
+line into a float far past the range, and the `tail` and `<bucket>plus`
+columns derived from it were then counts nothing had measured.
+`aggregator.emit` already range-checked before narrowing; `AsInt` now
+does too, and an unrepresentable total falls back to the declared bucket
+sum, which is the same answer an absent total gives.
+
+### 6.97 `--max-fatal-drops` reaches the modes it is for
+
+The flag is documented as "unretryable batches dropped before the process
+gives up, so a supervisor notices a spec the store rejects". It was
+enforced by returning an error from `Sink.Flush`, and only batch import
+propagates one: follow, SSH follow and receive all fold a delivery error
+into a log line, which is correct for every *other* delivery error and
+wrong for this one. So an ingester whose every batch the store refuses
+ran at full rate, storing nothing, for as long as it was left alone — in
+exactly the three modes that run unattended. The sink now closes a
+`GaveUp()` channel when the limit is reached, each continuous mode
+selects on it, drains and returns `ingest.ErrGaveUp`, and the command
+exits non-zero.
+
+### 6.98 A multiline rule needs both halves of its contract
+
+[03](03-extraction.md) §4 pairs `start_contains` with `continue_regex`:
+lines matching the second have the nominated capture appended to the
+record the first opened. `continue_regex` is the only test `Process`
+applies to a candidate continuation, so a rule without one joins nothing
+at all — while still opening a buffer on every start marker. The record
+that opened it is then held until the next start marker or the idle
+timeout, and on a followed file `HeldFrom` pins the checkpoint to its
+offset for just as long. A spec that reads as "assemble these lines"
+silently became "delay every one of them", with no join, no error and no
+counter anywhere. It is refused at compile time now, on the same
+principle as the empty `start_contains` beside it.
+
+### 6.99 The metrics listener validates what it accepts
+
+A line-protocol record carries label keys, field names and a timestamp
+that `ParseLineProtocol` does not look at, and nothing else did either:
+a sample the store will refuse — a label key outside the charset, epoch
+nanoseconds declared as milliseconds — was reported to an HTTP sender as
+accepted and passed in silence on TCP and UDP, with the only trace of the
+loss in the store's own log on the far side of the sink. It now runs
+`Sample.Validate` where `POST /ingest/v1/samples` already did (§6.30).
+`--from` and `--to` reach it as well: both flags are honoured on every
+path that goes through the extractor, and the line-protocol path and the
+sample-posting endpoint are the two that do not, so they read the flags
+and stored everything anyway.
+
+### 6.100 Smaller corrections
+
+- **A table query reports its rows as points.** `runTabular` never set
+  `Stats.PointsOut`, so a table that returned a thousand rows carried the
+  same statistics as one that returned none, on the field an operator
+  reads to tell those two apart.
+- **`LABELS` of an unknown key is an empty list.** `Store.LabelValues`
+  returned nil for a key the store has never seen, and
+  `wire.LabelValues.Values` carries no `omitempty`, so `/v1/labels`
+  answered `"values": null` there and `[]` everywhere else — the same
+  wart `QueryResponse.Series` was fixed for (§6.17).
+- **An empty table still draws its columns.** `toFrames` emitted a table
+  frame only when rows came back, so a `FORMAT table` or `FORMAT logs`
+  query that matched nothing produced no frame at all and Grafana drew
+  "No data". It is keyed on the declared columns now: an empty table says
+  the query ran, and "No data" says nothing.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

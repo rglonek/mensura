@@ -512,10 +512,23 @@ func (p *Profile) compile(s *Spec) error {
 		if m.StartContains == "" {
 			return fmt.Errorf("multiline needs a non-empty start_contains")
 		}
-		if m.ContinueRegex != "" {
-			if m.continueRe, err = regexp.Compile(m.ContinueRegex); err != nil {
-				return fmt.Errorf("multiline continue_regex: %w", err)
-			}
+		// And a continue_regex, for the same reason. It is the only test
+		// Process applies to a candidate continuation line, so a rule
+		// without one joins nothing at all -- while still opening a
+		// buffer on every start marker. The record that opened it is then
+		// held until the next start marker or the idle timeout, and on a
+		// followed file HeldFrom pins the checkpoint to its offset for
+		// just as long: a spec that reads as "assemble these lines"
+		// silently becomes "delay every one of them", with no join, no
+		// error and no counter anywhere. 03-extraction.md section 4 makes
+		// the pairing explicit -- lines matching continue_regex have the
+		// nominated capture appended -- so half of it is not a
+		// configuration, it is a typo.
+		if m.ContinueRegex == "" {
+			return fmt.Errorf("multiline %q needs a continue_regex: without one no line is ever joined, so the rule only delays every record that opens it", m.StartContains)
+		}
+		if m.continueRe, err = regexp.Compile(m.ContinueRegex); err != nil {
+			return fmt.Errorf("multiline continue_regex: %w", err)
 		}
 		for i := range m.Join {
 			if m.Join[i].re, err = regexp.Compile(m.Join[i].Regex); err != nil {

@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -660,5 +661,121 @@ func TestRestartingAtZeroClearsTheStoredFingerprint(t *testing.T) {
 	}
 	if cp.Fingerprint == stale.Fingerprint || cp.FingerprintBytes == stale.FingerprintBytes {
 		t.Fatalf("the rejected file's fingerprint survived onto the new offsets: %+v", cp)
+	}
+}
+
+// --max-fatal-drops is documented as "unretryable batches dropped before
+// the process gives up, so a supervisor notices a spec the store
+// rejects". It was inert in every continuous mode: a delivery error on
+// the follow, SSH-follow and receive paths becomes a log line, which is
+// right for every other delivery error and wrong for this one. An
+// ingester whose every batch the store refuses ran at full rate, storing
+// nothing, for as long as it was left alone.
+func TestFollowStopsWhenTheSinkGivesUp(t *testing.T) {
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 400 is fatal to the write client, so the sink drops the batch
+		// rather than retrying it.
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(wire.APIError{Error: "this store will never take these"})
+	}))
+	defer refusing.Close()
+
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(refusing.URL, "")
+	client.Compress = false
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize = 1
+	cfg.FlushEvery = 10 * time.Millisecond
+	cfg.MaxFatalDrops = 1
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, StateDir: t.TempDir(), Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	appendLines(t, path, 0, 4)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ing.Follow(ctx, FollowOptions{Paths: []string{path}, PollInterval: 10 * time.Millisecond})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrGaveUp) {
+			t.Fatalf("Follow returned %v, want ErrGaveUp so the command exits non-zero", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Follow kept reading after the sink had abandoned delivery")
+	}
+}
+
+// The same for the receive path, whose per-record failures collapse into
+// a counted warning.
+func TestReceiveStopsWhenTheSinkGivesUp(t *testing.T) {
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(wire.APIError{Error: "this store will never take these"})
+	}))
+	defer refusing.Close()
+
+	spec, err := extract.Parse([]byte(followSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	client := wire.NewClient(refusing.URL, "")
+	client.Compress = false
+	cfg := DefaultSinkConfig()
+	cfg.BatchSize = 1
+	cfg.FlushEvery = 10 * time.Millisecond
+	cfg.MaxFatalDrops = 1
+	sink := NewSink(client, cfg, testLogger{t})
+	defer func() { _ = sink.Close(context.Background()) }()
+	ing, err := New(Config{Spec: spec, Sink: sink, Log: testLogger{t}})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick a port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ing.Receive(ctx, ReceiveOptions{TCPAddr: addr, Listener: "default"}) }()
+
+	// Feed it until the sink gives up or the deadline passes.
+	go func() {
+		base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+		for i := 0; ctx.Err() == nil; i++ {
+			conn, derr := net.Dial("tcp", addr)
+			if derr != nil {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			_, _ = fmt.Fprintf(conn, "%d n=%d\n", base+int64(i)*1000, i)
+			time.Sleep(20 * time.Millisecond)
+			_ = conn.Close()
+		}
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrGaveUp) {
+			t.Fatalf("Receive returned %v, want ErrGaveUp", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Receive kept listening after the sink had abandoned delivery")
 	}
 }

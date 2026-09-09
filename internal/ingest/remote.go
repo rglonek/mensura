@@ -82,6 +82,19 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 	// the other tails running against a sink the caller is about to close.
 	tailCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The sink abandoning delivery stops every tail, the same way one
+	// tail's error does. Without this `--max-fatal-drops` was inert here:
+	// a delivery failure on this path is logged and reconnected from, so
+	// an ingester whose every batch the store refuses reconnected forever
+	// and stored nothing, which is the condition the flag exists to make
+	// a supervisor notice.
+	go func() {
+		select {
+		case <-i.cfg.Sink.GaveUp():
+			cancel()
+		case <-tailCtx.Done():
+		}
+	}()
 	errCh := make(chan error, len(opts.Paths))
 	for _, path := range opts.Paths {
 		go func(p string) { errCh <- i.followRemotePath(tailCtx, opts, cps, p) }(path)
@@ -92,6 +105,9 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 			first = err
 			cancel()
 		}
+	}
+	if first == nil && i.cfg.Sink.gaveUpNow() {
+		first = ErrGaveUp
 	}
 	return first
 }

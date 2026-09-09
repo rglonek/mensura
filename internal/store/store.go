@@ -769,7 +769,14 @@ func (s *Store) LabelValues(key string) []string {
 	defer s.dictMu.RUnlock()
 	d, ok := s.dict[key]
 	if !ok {
-		return nil
+		// An empty list, never nil: this travels straight into
+		// wire.LabelValues.Values, whose JSON tag carries no omitempty,
+		// so a key the store has never seen answered `"values": null`
+		// while a key it has answered `[]`. Every other list in this API
+		// is a list -- QueryResponse.Series was changed for the same
+		// reason -- and a dashboard variable should not have to
+		// special-case "no such key" differently from "no values".
+		return []string{}
 	}
 	// Deduplicated: a value an older build placed at two positions is one
 	// value, and listing it twice put a repeated option in every
