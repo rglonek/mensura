@@ -380,3 +380,43 @@ func TestMultilineReplayIsLosslessOverRandomStreams(t *testing.T) {
 		})
 	}
 }
+
+// Holding an emitted record's span must not stall the checkpoint. The
+// floor lags by the span of the oldest window whose records still reach
+// it -- the same order as the window width the design already promises --
+// and not by the whole stream.
+func TestHoldFloorStillAdvances(t *testing.T) {
+	spec, err := Parse([]byte(replayMultilineSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	st, err := spec.NewStream(spec.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC).UnixMilli()
+	// Five keys sharing a 10s window at a record every 250ms, so every
+	// window holds many records and their spans overlap heavily.
+	ops := []string{"a", "b", "c", "d", "e"}
+	const records = 3000
+	worst := int64(0)
+	for i := 0; i < records; i++ {
+		mark := int64(i) * 100
+		st.Mark(mark)
+		if _, err := st.Process(fmt.Sprintf("%d op=%s", base+int64(i)*250, ops[i%len(ops)])); err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		at, held := st.HeldFrom()
+		if !held {
+			continue
+		}
+		if lag := mark - at; lag > worst {
+			worst = lag
+		}
+	}
+	// One window is 40 records wide per key here; a few of those is the
+	// expected shape, the whole stream is a stall.
+	if worst > 100*400 {
+		t.Errorf("the hold floor lagged %d records behind the read head; it is not advancing", worst/100)
+	}
+}

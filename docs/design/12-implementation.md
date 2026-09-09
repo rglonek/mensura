@@ -145,7 +145,8 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Every acquisition path reports its backlog and its unmatched lines | `internal/ingest/review_test.go:TestRemoteFollowPublishesLag`, `…:TestFollowReportsUnmatchedLines`, `…:TestMergeStreamIsIdempotent` |
 | `follow` skips a binary file, as `batch` does | `…:TestFollowSkipsBinaryFiles` |
 | A framing bound that would remove itself is refused | `pkg/extract/review_test.go:TestFramingBoundsAreValidated` |
-| A replay from `HeldFrom` reproduces exactly the undelivered windows | `…:TestAggregationReplayFromHeldFromIsLossless`, `…:TestAggregationReplayIsLosslessOverRandomStreams`, `…:TestHoldListStaysBoundedWithInterleavedKeys` |
+| A replay from `HeldFrom` reproduces exactly the undelivered results | `…:TestAggregationReplayFromHeldFromIsLossless`, `…:TestAggregationReplayIsLosslessOverRandomStreams`, `…:TestMultilineReplayFromHeldFromIsLossless`, `…:TestMultilineReplayIsLosslessOverRandomStreams` |
+| Holding a span keeps the list bounded and the floor advancing | `…:TestHoldListStaysBoundedWithInterleavedKeys`, `…:TestHoldFloorStillAdvances` |
 
 ## 5. Implementation status
 
@@ -2154,7 +2155,7 @@ a declaration repeated on every ingest start still costs nothing — and
 logs rather than fails, because a metadata write that could not land is
 no reason to make the ingester resend data the store is about to hold.
 
-### 6.110 A checkpoint may not land inside a window that has been emitted
+### 6.110 A checkpoint may not land inside a record that has been emitted
 
 `HeldFrom` names the oldest position the stream still needs a replay to
 start at, and it named the oldest *open* multiline buffer or aggregation
@@ -2191,11 +2192,29 @@ absorbed only the record that opened it spans a single position and can
 never contain anything, which is every window on a driver that does not
 mark its records at all.
 
+A multiline record has the same shape and needed the same treatment. It
+spans the line that opened it and every line joined into it, and an
+aggregation window opened between two of them pins the floor there. A
+replay from inside the span meets each continuation with no buffer open,
+so instead of belonging to the record it is judged on its own — and a
+continuation a pattern happens to match becomes a whole sample the source
+never reported, while the record it should have joined comes back
+shorter. A record's span is held the same way once it has been emitted,
+including the line that flushed it when that line was itself a
+continuation (the timestamp-regression path) and a continuation that
+matched no join rule, because both of those have a different fate
+depending on whether a buffer is open.
+
 `pkg/extract/review_test.go` checks the property directly: for every crash
 point in a stream, what was delivered plus what a replay from `HeldFrom`
 produces has to be exactly what an uninterrupted run produced — a missing
-result is data loss and an extra one is a row nobody measured — over the
-worked interleaving above and over sixty randomised streams.
+result is data loss and an extra one is a row nobody measured — over two
+worked interleavings and a hundred and twenty randomised streams, half of
+them mixing multiline records with aggregation across several keys. The
+trade is only worth making if the floor still moves, so
+`TestHoldFloorStillAdvances` drives five keys sharing one window with
+heavily overlapping spans and asserts the lag stays in the order of a
+window width.
 
 ### 6.111 Smaller corrections
 
