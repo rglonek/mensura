@@ -468,3 +468,109 @@ func TestGetReportsAMissingIndexedRowAsAbsent(t *testing.T) {
 		t.Fatalf("a dangling pointer read as a found row with %d column(s)", len(row))
 	}
 }
+
+// A set whose id could not be persisted must not be left in the schema
+// map.
+//
+// setLocked persists the id high-water mark before the set that uses it,
+// and returned the error without undoing the map insertion: the set then
+// existed for this process and for no other. The next call found it, saw
+// nothing to change, never wrote its meta record -- and PutBatch wrote
+// rows under an id that no restart can resolve.
+//
+// The failure is forced the only way this package can force one: pebble
+// refuses a synced write outright when the WAL is off, which is the
+// posture `durability: batch` runs in.
+func TestUnpersistedSetIdIsNotLeftBehind(t *testing.T) {
+	db := openTestDB(t)
+	cols := []ColumnSpec{{Name: model.TimestampField, Type: model.TypeInt, Indexed: true}}
+	db.metaOpts = pebble.Sync
+	if err := db.RegisterSet("ghost", cols); err == nil {
+		t.Skip("this build accepts a synced write with the WAL off, so the failure cannot be forced here")
+	}
+	for _, n := range db.Sets() {
+		if n == "ghost" {
+			t.Fatal("a set whose id could not be persisted is still in the schema map, so its rows would outlive every reader of them")
+		}
+	}
+}
+
+// A meta write that failed used to be forgotten.
+//
+// setLocked persisted only when *that call* had changed something, so a
+// failed write returned its error and left the widened schema in the map:
+// the next call saw nothing to change, skipped the write, and handed the
+// caller a set id whose meta record describes a narrower schema than the
+// rows written under it. After a restart the widened column belongs to no
+// schema at all.
+func TestSchemaWriteIsRetriedAfterItFails(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{Path: dir, CacheBytes: NoBlockCache, MemTableSizeBytes: 1 << 20}
+	db, err := Open(opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	base := []ColumnSpec{{Name: model.TimestampField, Type: model.TypeInt, Indexed: true}}
+	wide := append(append([]ColumnSpec(nil), base...), ColumnSpec{Name: "cpu", Type: model.TypeFloat})
+	if err := db.RegisterSet("app", base); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	healthy := db.metaOpts
+	db.metaOpts = pebble.Sync
+	if err := db.RegisterSet("app", wide); err == nil {
+		t.Skip("this build accepts a synced write with the WAL off, so the failure cannot be forced here")
+	}
+	db.metaOpts = healthy
+
+	// A later call that changes nothing has to put it right anyway.
+	if err := db.RegisterSet("app", wide); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := Open(opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	cols, _, ok := reopened.Schema("app")
+	if !ok {
+		t.Fatal("the set did not survive the restart")
+	}
+	for _, c := range cols {
+		if c.Name == "cpu" {
+			return
+		}
+	}
+	t.Fatal("the widened column did not survive the restart: rows carrying it belong to a schema nothing on disk describes")
+}
+
+// A failed drop must not look like a successful one.
+//
+// DropSet removed the set from the maps before applying its range
+// deletes. A pebble batch applies whole or not at all, so a failure left
+// every row and the meta record on disk while db.Sets() no longer listed
+// the shard: no query scanned it and no later retention sweep tried
+// again, until a restart brought it all back.
+func TestFailedDropSetRestoresTheSet(t *testing.T) {
+	db := openTestDB(t)
+	cols := []ColumnSpec{{Name: model.TimestampField, Type: model.TypeInt, Indexed: true}}
+	if err := db.RegisterSet("app", cols); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	before := db.Sets()
+
+	db.metaOpts = pebble.Sync
+	if err := db.DropSet("app"); err == nil {
+		t.Skip("this build accepts a synced write with the WAL off, so the failure cannot be forced here")
+	}
+	if got := db.Sets(); len(got) != len(before) {
+		t.Fatalf("after a failed drop the store lists %v, want %v; the data is still on disk and nothing can reach it", got, before)
+	}
+	if _, _, ok := db.Schema("app"); !ok {
+		t.Fatal("a failed drop still removed the set from the schema map")
+	}
+}

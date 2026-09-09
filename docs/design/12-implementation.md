@@ -1975,6 +1975,95 @@ and stored everything anyway.
   "No data". It is keyed on the declared columns now: an empty table says
   the query ran, and "No data" says nothing.
 
+### 6.101 An aggregation window is identified by what it produces
+
+`extract.Stream.aggregate` keyed a window on the destination set plus the
+`aggregate.on` label values and nothing else, and a window keeps the
+field name and the mode of whichever pattern opened it. So a profile with
+two aggregating patterns writing one set on the same keys —
+
+```yaml
+patterns:
+  - {set: s, search: COUNT, aggregate: {every: 1m, on: [op], field: hits, mode: increment}}
+  - {set: s, search: LAT,   aggregate: {every: 1m, on: [op], field: lat,  mode: max}}
+```
+
+— folded the second pattern's records into the first pattern's
+accumulator. The emitted row carried `hits`, whose value was a latency,
+and `lat` never appeared at all. Both patterns matched, both records were
+counted, and the series that vanished looks exactly like one the source
+never emitted. The key now carries the set, the synthesised column, the
+mode and the `on` values, so two patterns share a window only when they
+really do declare the same column with the same semantics; the fold reads
+its mode off the accumulator rather than off the record, so the two
+cannot drift apart again.
+
+### 6.102 A flushed multiline record reports its verdict
+
+`Process` returns `(results, err)`, and the drivers turn that error into
+the pipeline's counters — `Progress.UnmatchedLines`, `TSParseErrors`,
+`ExtractErrors`. A buffered multiline record is almost always flushed by
+the next start marker, and that branch discarded the flushed record's
+error and reported success. A profile whose *joined* records matched no
+pattern therefore reported "0 unmatched" on the console, in the progress
+document and in the `_mensura_ingest` set, while `extract.Stats` — which
+only `check --sample` reads — counted every one of them. The line in hand
+has been buffered rather than judged, so it is owed no verdict of its
+own, and the flushed record's is the only one there is to give.
+
+### 6.103 A flush hint outlives the tailer that produced it
+
+A flush of buffered extractor state has no byte offset to key on, so its
+key hint is a sequence number — and under `key: offset` that hint *is*
+the row's identity. The counter lived on the tailer, and a tailer is
+rebuilt whenever its path is retired and comes back: a rotation, or a
+sweep in which `filepath.Glob` missed it, which is what an unreadable
+directory reports (§6.83). On the retire-and-resume path the byte offsets
+carry on from the checkpoint while the flush numbers restarted at one, so
+two different windows of one stream were handed the same hint and the
+later silently overwrote the earlier. The remote follower keeps its
+counter for the life of the path for exactly this reason (§6.87); the
+local follower and the receiver now hold one counter each, which is the
+same guarantee without a map that grows with every path ever seen.
+
+### 6.104 A schema write that failed is retried, and a failed drop is undone
+
+Two halves of one rule: the in-memory maps may not get ahead of the
+records on disk.
+
+`setLocked` persisted only when *that call* had changed something, so a
+failed meta write returned its error and left the widened schema in the
+map — the next call saw nothing to change, skipped the write, and handed
+`PutBatch` a set id whose record on disk does not describe it. Rows
+written under that id belong, after a restart, to no set at all:
+unreachable by any query, any drop and any retention sweep, which is the
+silent orphaning the indexed-column promotion (§6.66) and the
+timestamp-less row are refused to avoid. A `dirty` flag now marks a
+schema that is ahead of disk and the next call rewrites it; a set whose
+id could not be persisted is removed from the maps rather than left
+behind.
+
+`DropSet` had the mirror shape: it removed the set from the maps before
+applying its range deletes. A pebble batch applies whole or not at all,
+so a failure left every row and the meta record on disk while
+`db.Sets()` no longer listed the shard — no query scanned it and no later
+retention sweep tried again, until a restart brought it all back. The
+maps are restored on every failure path; nothing can race the restore,
+because `DropSet` owns `dropMu` exclusively for its whole duration
+(§6.44).
+
+### 6.105 Smaller corrections
+
+- **An impossible predicate still declares its columns.** `Query`
+  returned before the format's own executor ran when the planner folded
+  the predicate to constant-false, and `runTabular` builds its column
+  declaration before it scans. So `FORMAT table WHERE host = "typo"` came
+  back with no columns — and a response with no columns is exactly what
+  the plugin renders as Grafana's "No data", which is the case §6.100
+  was changed to stop reporting. The work is skipped in `scan` instead,
+  so an impossible query still opens no shard, and every format answers
+  with the shape it promises.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

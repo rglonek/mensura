@@ -947,3 +947,120 @@ profiles:
 		t.Fatalf("HeldFrom() = %d,%v; the open window was built from the record at 100, so a checkpoint may not pass it", at, held)
 	}
 }
+
+// Two aggregating patterns writing one set with the same `on` keys used
+// to share a single window, because the key was the set plus the label
+// values and nothing else.
+//
+// A window keeps the field and the mode of whichever pattern opened it,
+// so the second pattern's records were folded into the first pattern's
+// accumulator: the emitted row carried the *first* pattern's column name
+// with the *second* pattern's numbers, and the second pattern's series
+// never appeared at all. Both patterns matched and both records were
+// counted, so nothing anywhere reported it.
+func TestAggregatingPatternsDoNotShareOneWindow(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    labels: [op]
+    fields:
+      hits: {kind: counter}
+      lat: {kind: gauge}
+    patterns:
+      - set: s
+        search: 'COUNT'
+        extract: ['COUNT (?P<op>\w+)']
+        aggregate: {every: 1m, on: [op], field: hits, mode: increment}
+      - set: s
+        search: 'LAT'
+        extract: ['LAT (?P<op>\w+) (?P<lat>[0-9.]+)']
+        aggregate: {every: 1m, on: [op], field: lat, mode: max}
+`
+	s := mustSpec(t, spec)
+	st, err := s.NewStream(s.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	for _, line := range []string{
+		fmt.Sprintf("%d COUNT read", base),
+		fmt.Sprintf("%d LAT read 42", base+1),
+		fmt.Sprintf("%d COUNT read", base+2),
+	} {
+		if _, err := st.Process(line); err != nil {
+			t.Fatalf("process %q: %v", line, err)
+		}
+	}
+	got := map[string]model.Value{}
+	for _, r := range st.Flush() {
+		for k, v := range r.Fields {
+			if _, dup := got[k]; dup {
+				t.Fatalf("field %q was emitted by more than one window", k)
+			}
+			got[k] = v
+		}
+	}
+	hits, ok := got["hits"]
+	if !ok {
+		t.Fatal("the counting pattern produced no `hits` column")
+	}
+	if n, _ := hits.AsInt(); n != 2 {
+		t.Errorf("hits = %v, want 2: the counter took the other pattern's value", hits)
+	}
+	lat, ok := got["lat"]
+	if !ok {
+		t.Fatal("the max pattern produced no `lat` column; its records were folded into the counter's window")
+	}
+	if f, _ := lat.AsFloat(); f != 42 {
+		t.Errorf("lat = %v, want 42", lat)
+	}
+}
+
+// A multiline record is almost always flushed by the next start marker,
+// and Process used to report success for every one of those calls. The
+// drivers turn that verdict into the pipeline's counters, so a profile
+// whose joined records match no pattern reported "0 unmatched" on the
+// console, in the progress document and in the ingest-progress set --
+// while the stream's own Stats, which only `check --sample` reads,
+// counted every one of them.
+func TestFlushedMultilineRecordReportsItsVerdict(t *testing.T) {
+	const spec = `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+      anchor: prefix
+      strip: true
+    framing:
+      multiline:
+        - start_contains: 'BEGIN'
+          continue_regex: '^\s+at '
+          join: [{regex: '\s+at (.*)', capture: 1}]
+    patterns:
+      - set: errors
+        search: 'NEVER'
+        extract: ['NEVER (?P<n>\d+)']
+`
+	s := mustSpec(t, spec)
+	st, err := s.NewStream(s.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	if _, err := st.Process(fmt.Sprintf("%d BEGIN boom", base)); err != nil {
+		t.Fatalf("the first start marker buffers and is owed no verdict: %v", err)
+	}
+	_, err = st.Process(fmt.Sprintf("%d BEGIN boom", base+1000))
+	if err != ErrNoMatch {
+		t.Fatalf("flushing an unmatched multiline record reported %v; the drivers count Progress from this verdict, so the unmatched line was invisible everywhere but Stats", err)
+	}
+	if st.Stats.Unmatched != 1 {
+		t.Fatalf("Stats.Unmatched = %d, want 1", st.Stats.Unmatched)
+	}
+}
