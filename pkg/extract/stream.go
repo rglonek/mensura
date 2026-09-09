@@ -67,10 +67,12 @@ type Stream struct {
 	// copied onto every buffer this stream opens so HeldFrom can say which
 	// bytes are still only in memory.
 	mark int64
-	// holds lists the open aggregation windows in the order they were
-	// opened. Marks only ever increase, so append order is mark order and
-	// the oldest live window is at the front: no heap is needed, only a
-	// lazy pop of entries whose window has since closed.
+	// holds lists the open aggregation windows in mark order, so the
+	// oldest live window is at the front: no heap is needed, only a lazy
+	// pop of entries whose window has since closed. Marks handed in by
+	// the driver only ever increase, so holdWindow normally appends; the
+	// one case that does not is a buffered multiline record, which is
+	// processed under the mark of the line that opened it.
 	holds []holdEntry
 
 	Stats Stats
@@ -205,10 +207,46 @@ func (st *Stream) HeldFrom() (int64, bool) {
 		st.holds = st.holds[1:]
 	}
 	// Stale entries *behind* a live one are not reached by the pop above.
-	// Windows close in roughly the order they opened, so that is normally
-	// nothing; a profile mixing a one-hour `every` with a one-minute one
-	// is the case where it is not, and left alone the list would grow by
-	// an entry per closed window for as long as the long one is open.
+	st.pruneHolds()
+	return oldest, held
+}
+
+// holdWindow records where an open aggregation window started, keeping
+// the list in mark order.
+//
+// The insertion scan normally does nothing: Mark's own contract is that
+// positions do not decrease, so a window opened by the record in hand
+// belongs at the end. A buffered multiline record is the exception --
+// it is processed under the mark of the line that opened it, which is
+// behind the line that flushed it -- and HeldFrom reads only the first
+// live entry, so an out-of-order append there would hide the older
+// window and let a checkpoint advance past data that exists only inside
+// this struct.
+func (st *Stream) holdWindow(key string, a *aggregator) {
+	e := holdEntry{mark: a.mark, key: key, a: a}
+	i := len(st.holds)
+	for i > 0 && st.holds[i-1].mark > e.mark {
+		i--
+	}
+	st.holds = append(st.holds, holdEntry{})
+	copy(st.holds[i+1:], st.holds[i:])
+	st.holds[i] = e
+	st.pruneHolds()
+}
+
+// pruneHolds drops entries whose window has closed.
+//
+// It is called where holds grow as well as where they are read, because
+// only some drivers read them: HeldFrom exists for a caller that
+// checkpoints byte offsets, and the receive path -- which runs for the
+// life of the process, with one stream per peer -- never calls it. There
+// the list grew by one entry, plus the aggregation key it retains, for
+// every window ever opened: a one-minute `every` over a thousand keys is
+// a million entries a day that nothing would ever look at.
+//
+// The threshold leaves room for the live windows plus a little slack, so
+// the compaction is amortised rather than run on every window.
+func (st *Stream) pruneHolds() {
 	if len(st.holds) > 2*len(st.aggs)+16 {
 		live := st.holds[:0]
 		for _, e := range st.holds {
@@ -221,7 +259,6 @@ func (st *Stream) HeldFrom() (int64, bool) {
 	if len(st.holds) == 0 {
 		st.holds = nil // let the backing array go
 	}
-	return oldest, held
 }
 
 // Process handles one record. It returns zero or more samples: zero is
@@ -255,7 +292,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 		if strings.Contains(line, m.StartContains) {
 			var out []Result
 			if buf, ok := st.multiline[m.StartContains]; ok {
-				out, _ = st.process(buf.line, buf.ts)
+				out, _ = st.processBuffered(buf)
 			}
 			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark}
 			return out, nil
@@ -271,7 +308,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			// produce routinely -- and reported the loss only as a
 			// counter.
 			delete(st.multiline, m.StartContains)
-			out, _ := st.process(buf.line, buf.ts)
+			out, _ := st.processBuffered(buf)
 			return out, fmt.Errorf("extract: multiline record timestamps moved backwards")
 		}
 		for i := range m.Join {
@@ -315,7 +352,7 @@ func (st *Stream) Flush() []Result {
 		delete(st.multiline, k)
 		// Partial results are kept even when process reports an error:
 		// it returns the windows it closed alongside the failure.
-		r, _ := st.process(buf.line, buf.ts)
+		r, _ := st.processBuffered(buf)
 		out = append(out, r...)
 	}
 	// Only these are counted here. process() already counted everything
@@ -366,7 +403,7 @@ func (st *Stream) FlushIdle(now time.Time) []Result {
 			continue
 		}
 		delete(st.multiline, m.StartContains)
-		r, _ := st.process(buf.line, buf.ts)
+		r, _ := st.processBuffered(buf)
 		out = append(out, r...)
 	}
 	// closeExpiredAggregators is called directly here, so its results are
@@ -392,6 +429,26 @@ func (st *Stream) aggregationHorizon(now time.Time) time.Time {
 		elapsed = 0
 	}
 	return st.lastTS.Add(elapsed)
+}
+
+// processBuffered runs a completed multiline record through the pattern
+// stage under the mark of the line that *opened* it, not the mark of
+// whatever record happened to flush it.
+//
+// st.mark is the position the driver last handed in, and an aggregation
+// window records it so HeldFrom can hold a checkpoint back to the bytes
+// the window was built from. A buffered record is flushed by a later
+// line -- the next start marker, an idle timeout, a rotation -- so
+// processing it under the live mark registered the window at a position
+// past its own data: the checkpoint could then be acknowledged over
+// bytes whose only copy was the still-open window, and a crash or a
+// rewind lost them with nothing saying so.
+func (st *Stream) processBuffered(buf *mlBuffer) ([]Result, error) {
+	saved := st.mark
+	st.mark = buf.mark
+	out, err := st.process(buf.line, buf.ts)
+	st.mark = saved
+	return out, err
 }
 
 func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
@@ -560,7 +617,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 		}
 		st.aggs[key] = a
 		heap.Push(&st.aggQ, aggEntry{key: key, end: a.end, a: a})
-		st.holds = append(st.holds, holdEntry{mark: a.mark, key: key, a: a})
+		st.holdWindow(key, a)
 		switch ag.Mode {
 		case "increment":
 			// One occurrence, counted. Seeding with the captured value

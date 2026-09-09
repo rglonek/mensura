@@ -218,8 +218,28 @@ func TestVariablesFindsRegexReferences(t *testing.T) {
 	}
 }
 
-// HAS and MISSING name a label just as the comparisons do. Exempting them
-// from the unknown-label check meant `MISSING nosuchlabel` validated and
+// HAS and MISSING address a column, and a row's columns are its labels
+// *and* its fields: 06-query.md section 4.4 says both map to the engine's
+// Exists predicate, and the worked example in section 2 of that same
+// document is `HAS requests_total` -- a field. Sending them through the
+// label check refused it with E004 "unknown label", so a query the design
+// document itself prints could not be run.
+func TestHasAndMissingAcceptAFieldName(t *testing.T) {
+	sc := testSchema{}
+	for _, src := range []string{
+		`FROM http SELECT inflight WHERE HAS requests_total`,
+		`FROM http SELECT inflight WHERE MISSING requests_total`,
+		`FROM http SELECT requests_total RATE WHERE host = "web1" AND HAS requests_total`,
+	} {
+		q := mustParse(t, src)
+		if _, err := Validate(q, sc, 0, 0); err != nil {
+			t.Errorf("%s was refused: %v", src, err)
+		}
+	}
+}
+
+// HAS and MISSING still name something the set carries. Exempting them
+// from the check entirely meant `MISSING nosuchlabel` validated and
 // matched every row.
 func TestHasAndMissingCheckTheLabelName(t *testing.T) {
 	sc := testSchema{}
@@ -401,4 +421,40 @@ func TestEmptyPredicateArmIsRefused(t *testing.T) {
 	if _, err := Validate(&q, nil, 0, 0); err != nil {
 		t.Fatalf("an absent predicate was refused: %v", err)
 	}
+}
+
+// A `string`-kind field selected on a line chart is the silent-empty-panel
+// shape: the catalogue calls it a table/logs payload, the render path drops
+// every value that does not read as a number, and nothing anywhere said so.
+func TestStringFieldOnATimeseriesIsWarnedAbout(t *testing.T) {
+	sc := testSchema{}
+	warns, err := Validate(mustParse(t, `FROM http SELECT note`), sc, 0, 0)
+	if err != nil {
+		t.Fatalf("plotting a string field should warn, not fail: %v", err)
+	}
+	if !hasDiag(warns, "W104") {
+		t.Fatalf("no W104 among %v: an empty panel that nothing explains is what this validator is for", warns)
+	}
+	// Under the formats that render it, there is nothing to warn about.
+	for _, src := range []string{
+		`FROM http SELECT note FORMAT table`,
+		`FROM http SELECT note FORMAT logs`,
+	} {
+		warns, err := Validate(mustParse(t, src), sc, 0, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		if hasDiag(warns, "W104") {
+			t.Errorf("%s warned W104, but that format renders a string column", src)
+		}
+	}
+}
+
+func hasDiag(ds []Diag, code string) bool {
+	for _, d := range ds {
+		if d.Code == code {
+			return true
+		}
+	}
+	return false
 }

@@ -1839,6 +1839,55 @@ first attempt rather than retried at full rate.
   heatmap's two ceilings were added to stop, one map along from where they
   were put.
 
+### 6.91 `HAS` and `MISSING` name a field or a label
+
+Both lower to the engine's `Exists` predicate, which reads a column off
+the row, and a row's columns are its labels *and* its fields — which is
+what [06](06-query.md) §4.4 says and what `buildExpr` has always done.
+The validator sent them through the label check instead, so `HAS
+requests_total` came back `E004: unknown label "requests_total"` — the
+worked example in §2 of that same document, refused by the tool that is
+supposed to explain it, on a query the executor would have run correctly.
+A name that is neither a field nor a label is still `E004`: that check
+exists because `MISSING nosuchlabel` otherwise matched every row.
+
+### 6.92 A stream's hold list is pruned where it grows
+
+`extract.Stream.holds` records where each open aggregation window began,
+so `HeldFrom` can keep a checkpoint behind bytes whose only copy is
+inside the extractor. It was pruned only inside `HeldFrom` — and only a
+driver that checkpoints byte offsets ever calls that. The receive path
+does not: it has no offsets, it runs for the life of the process, and it
+holds one stream per peer. There the list grew by one entry, plus the
+aggregation key string it retains, for every window ever opened. A
+one-minute `every` over a thousand keys is a million entries a day that
+nothing would ever read. Pruning now happens where the entries are added
+as well, on the same amortised threshold.
+
+### 6.93 A buffered multiline record holds its own offset
+
+A multiline block is flushed by a *later* line — the next start marker,
+the idle timeout, a rotation — and it was then processed under `st.mark`,
+which by that point names the flushing line. An aggregation window the
+flushed record opens records that mark, so `HeldFrom` reported a position
+past the bytes the window was actually built from: a checkpoint could be
+acknowledged over records whose only copy was the still-open window, and
+a crash or a rewind lost them silently. `processBuffered` restores the
+opening line's mark for the duration, and `holdWindow` keeps the hold
+list in mark order, because `HeldFrom` reads only its first live entry.
+
+### 6.94 The remote idle flush queues before it releases
+
+Emptying the extractor raises the held offset to the read head.
+`remoteStream.flushIdle` used to return its results and let the caller
+queue them afterwards, and on the SSH path the reader is a different
+goroutine: between the two it could process the next record and publish a
+position covering the flushed window's bytes, and a sink flush landing
+there acknowledged them while their samples were still on their way to
+the sink. The flush and the delivery now happen as one step under the
+stream lock, which is what `remoteStream.process` already does for the
+reader's own records and for the same reason.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

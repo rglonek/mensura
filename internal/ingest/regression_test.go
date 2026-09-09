@@ -1836,7 +1836,11 @@ func TestRemoteStreamIdleFlushReleasesHeldBytes(t *testing.T) {
 
 	// Past the profile's idle timeout the record is emitted and the bytes
 	// it was holding are released.
-	results, pos, at := rs.flushIdle(time.Now().Add(time.Hour))
+	var results []extract.Result
+	var pos string
+	at := rs.flushIdle(time.Now().Add(time.Hour), func(r []extract.Result, p string) {
+		results, pos = r, p
+	})
 	if len(results) == 0 {
 		t.Fatal("the idle flush emitted nothing, so a quiet remote stream never releases its last record")
 	}
@@ -2058,4 +2062,59 @@ func TestReceiveClosesTCPConnectionsWhenCancelled(t *testing.T) {
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("the connection was neither closed nor unblocked after Receive returned; it is held until connIdleTimeout, and records read in that window land in a sink that has already flushed for the last time")
 	}
+}
+
+// The remote idle flush queues what it emitted before it releases the
+// offset those bytes came from, and it does both without letting go of
+// the stream lock.
+//
+// Emptying the extractor raises the held offset to the read head. The old
+// shape returned the results and let the caller queue them afterwards, so
+// between the two the reader goroutine -- which is a separate goroutine
+// here, unlike the local follower's idle flush -- could process the next
+// record and publish a position covering the flushed window's bytes. A
+// sink flush landing in that window acknowledged them while their samples
+// were still on their way to the sink, and a crash then lost records the
+// checkpoint said were stored.
+func TestRemoteIdleFlushDeliversUnderTheStreamLock(t *testing.T) {
+	spec, err := extract.Parse([]byte(holdSpec))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	ex, err := spec.NewStream(spec.Profiles[0], extract.StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	rs := &remoteStream{}
+	rs.open(ex, 0)
+	if _, aerr := rs.process(0, "1700000000000 BEGIN n=1", func([]extract.Result) error { return nil }, 40); aerr != nil {
+		t.Fatalf("process: %v", aerr)
+	}
+
+	delivering := make(chan struct{})
+	release := make(chan struct{})
+	readerRan := make(chan struct{})
+	go func() {
+		rs.flushIdle(time.Now().Add(time.Hour), func(res []extract.Result, _ string) {
+			if len(res) == 0 {
+				t.Error("the idle flush emitted nothing")
+			}
+			close(delivering)
+			<-release
+		})
+	}()
+	<-delivering
+	go func() {
+		// The reader must not be able to move the read head while the
+		// flushed samples are still being queued.
+		_, _ = rs.process(40, "1700000001000 BEGIN n=2", func([]extract.Result) error { return nil }, 80)
+		close(readerRan)
+	}()
+	select {
+	case <-readerRan:
+		t.Fatal("the reader advanced the stream while the idle flush was still queueing its results")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-readerRan
 }

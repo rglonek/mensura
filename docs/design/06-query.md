@@ -165,7 +165,9 @@ Predicates address **labels** (interned strings) and field presence.
   `false`, which is propagated: `host = "typo"` returns an empty result with the
   warning `W201: no values match host = "typo"`. The alternative — dropping the
   clause and returning everything — turns a typo into a wrong graph at 03:00.
-- `HAS field` / `MISSING field` map to the engine's `Exists` predicate.
+- `HAS field` / `MISSING field` map to the engine's `Exists` predicate, which
+  reads a column off the row. A row's columns are its labels and its fields
+  alike, so either may be named; a name that is neither is `E004`.
 - Everything is pushed down to the engine's filter evaluator; nothing is
   filtered in the render layer.
 
@@ -408,7 +410,7 @@ in tests. Warnings never fail a query; errors always do.
 | `E001` | error | Parse error (position and expected-token set included); also a hand-built AST the grammar cannot express — an empty predicate arm, or an empty field, `BY` or comparison name |
 | `E002` | error | Unknown set |
 | `E003` | error | Unknown field on set, and the field is `REQUIRED` |
-| `E004` | error | Unknown label key referenced in `WHERE` or `BY` |
+| `E004` | error | Unknown label key referenced in `WHERE` or `BY` (for `HAS`/`MISSING`, a name that is neither a field nor a label) |
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
 | `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
 | `E007` | error | `LIMIT` above the datasource maximum |
@@ -417,6 +419,7 @@ in tests. Warnings never fail a query; errors always do.
 | `W101` | warning | Modifiers written in non-canonical order; canonical order applies |
 | `W102` | warning | Counter-kind field selected without `RATE`/`DELTA` |
 | `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |
+| `W104` | warning | A `string`-kind field selected under `FORMAT timeseries`: only values that read as numbers are plotted, so the series may draw nothing |
 | `W201` | warning | A comparison matches no dictionary value; result will be empty |
 | `W202` | warning | Regex matches every value of the label; clause folded away |
 | `W203` | warning | Field is `stale` in the catalogue (not seen recently) |

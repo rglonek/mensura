@@ -335,18 +335,27 @@ func (rs *remoteStream) heldLocked() int64 {
 }
 
 // flushIdle emits whatever has been waiting longer than the profile's own
-// idle timeout, and reports the offset that releases.
-func (rs *remoteStream) flushIdle(now time.Time) ([]extract.Result, string, int64) {
+// idle timeout, hands it to deliver, and reports the offset that releases.
+//
+// The delivery happens under the lock, exactly as process's does, and for
+// the same reason. Emptying the extractor raises the held offset to the
+// read head; returning the results to be queued afterwards left a window
+// in which the reader -- which runs on its own goroutine here, unlike the
+// local follower's idle flush -- could process the next record and
+// publish a position covering these bytes, and a flush landing in that
+// window would acknowledge them while their samples were still on their
+// way to the sink. Flushing and queueing as one step is what keeps the
+// published offset behind everything the sink has been handed.
+func (rs *remoteStream) flushIdle(now time.Time, deliver func(results []extract.Result, pos string)) int64 {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if rs.ex == nil {
-		return nil, "", rs.consumed
+		return rs.consumed
 	}
-	results := rs.ex.FlushIdle(now)
-	if len(results) == 0 {
-		return nil, "", rs.heldLocked()
+	if results := rs.ex.FlushIdle(now); len(results) > 0 {
+		deliver(results, rs.nextFlushPosLocked())
 	}
-	return results, rs.nextFlushPosLocked(), rs.heldLocked()
+	return rs.heldLocked()
 }
 
 // flushAll drains the extractor at the end of a connection.
@@ -856,13 +865,12 @@ func remoteIdleTick(idle time.Duration) time.Duration {
 // remoteFlushIdle emits whatever the extractor has held past the
 // profile's idle timeout and republishes the offset that releases.
 func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target string, labels map[string]string, progress *remoteProgress, now time.Time) {
-	results, pos, at := rs.flushIdle(now)
-	if len(results) > 0 {
+	at := rs.flushIdle(now, func(results []extract.Result, pos string) {
 		i.cfg.Progress.AddSamples(int64(len(results)))
 		for n, r := range results {
 			_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
 		}
-	}
+	})
 	// Published even when the flush emitted nothing: the extractor may
 	// have been holding the offset for a window that has since closed on
 	// its own, and this is the only clock a quiet tail has.
