@@ -118,7 +118,11 @@ than moved and nothing is deleted, for bind-mounted or shared source trees.
 
 Every file is classified as **text-log**, **structured** (JSON lines, CSV/TSV
 with a declared header, or a spec-declared custom shape), or **ignored**
-(binary — detected by content sniffing, not extension).
+(binary — detected by content sniffing, not extension). The classification does
+not depend on how the file was opened: `follow` applies the same sniff to a
+path the glob returned that `batch` applies to a source, counts it on the same
+counter, and reconsiders the path on the same slow retry the no-profile case
+uses, because a file that is binary now may not be after a rotation.
 
 Stream identity is then resolved in this order, first match wins:
 

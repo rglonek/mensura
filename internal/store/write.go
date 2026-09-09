@@ -124,6 +124,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 	if s.idem.seen(idempotencyKey) {
 		return &wire.WriteResponse{Duplicate: true, CatalogueVersion: s.catVer.Load()}, nil
 	}
+	declaredAt := s.catVer.Load()
 	if len(req.FieldMeta) > 0 {
 		if err := s.applyFieldMeta(req.FieldMeta); err != nil {
 			return nil, err
@@ -131,6 +132,27 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 	}
 	if err := s.applySetMeta(req.SetMeta); err != nil {
 		return nil, err
+	}
+	// A declaration that changed the catalogue is persisted now, not on
+	// the next thirty-second tick.
+	//
+	// Everything else in the catalogue is rediscovered by the next write:
+	// observeSet re-learns a set's labels, fields and time range from the
+	// samples themselves. A declaration is not. It travels once per ingest
+	// process (Sink.DeclareFields and DeclareSets mark it sent and never
+	// repeat it), so an unclean stop inside the save window lost it for
+	// good -- and for `sets:` that means the retention and shard width
+	// SetRetentionFor exists to persist, so the set was routed to the
+	// unsharded shard the sweep skips and then kept forever, silently.
+	// That is the exact failure its own comment describes preventing.
+	//
+	// Logged rather than returned: the batch below is still accepted, and
+	// a metadata write that failed is not a reason to make the ingester
+	// resend data the store is about to hold.
+	if s.catVer.Load() != declaredAt {
+		if err := s.saveCatalogue(); err != nil {
+			s.cfg.Logger.Printf("ERROR saving catalogue after a declaration changed it: %v", err)
+		}
 	}
 
 	resp := &wire.WriteResponse{}

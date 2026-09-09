@@ -65,14 +65,6 @@ func indexBound(setID, colID uint32, val int64) []byte {
 	return append(k, v[:]...)
 }
 
-// indexKeyValue extracts the indexed value back out of an index key.
-func indexKeyValue(key []byte) (int64, bool) {
-	if len(key) < 1+4+4+8 {
-		return 0, false
-	}
-	return unbiasInt(binary.BigEndian.Uint64(key[9:17])), true
-}
-
 func indexKeyPK(key []byte) ([16]byte, bool) {
 	var pk [16]byte
 	if len(key) != 1+4+4+8+16 {

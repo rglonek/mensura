@@ -498,6 +498,16 @@ func (p *Profile) compile(s *Spec) error {
 	default:
 		return fmt.Errorf("framing record %q: expected line", p.Framing.Record)
 	}
+	// Zero is "unset, take the default"; a negative value is a typo, and
+	// it is the one number in a framing block that silently removes a
+	// bound rather than tightening one. Every test that reads it is
+	// written `n > 0`, so `max_record_bytes: -1` compiled cleanly and then
+	// let a single newline-free record grow without limit -- which is the
+	// failure the cap exists to prevent, reached by declaring the cap.
+	// identity.scan_lines is refused on the same grounds.
+	if p.Framing.MaxRecordBytes < 0 {
+		return fmt.Errorf("framing max_record_bytes %d must not be negative", p.Framing.MaxRecordBytes)
+	}
 	if p.Framing.MaxRecordBytes == 0 {
 		p.Framing.MaxRecordBytes = 1 << 20
 	}
@@ -538,6 +548,14 @@ func (p *Profile) compile(s *Spec) error {
 		if m.IdleTimeout != "" {
 			if m.idleTimeout, err = time.ParseDuration(m.IdleTimeout); err != nil {
 				return fmt.Errorf("multiline idle_timeout: %w", err)
+			}
+			// ParseDuration accepts a leading sign, and FlushIdle tests
+			// `now.Sub(seen) < idleTimeout`, so a negative timeout is
+			// never *not* elapsed: every buffered record is flushed on
+			// the very next idle tick, so a multiline rule declared with
+			// one joins nothing and reads as if the rule were absent.
+			if m.idleTimeout <= 0 {
+				return fmt.Errorf("multiline %q idle_timeout %q must be positive", m.StartContains, m.IdleTimeout)
 			}
 		} else {
 			m.idleTimeout = 30 * time.Second
