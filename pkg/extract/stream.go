@@ -80,13 +80,25 @@ type Stream struct {
 	maxUnmatchedSamples int
 }
 
-// holdEntry remembers where an open aggregation window started. Windows
-// close out of mark order only when a profile mixes several `every`
-// widths, which the lazy scan below tolerates.
+// holdEntry remembers where an aggregation window started. Windows close
+// out of mark order only when a profile mixes several `every` widths,
+// which the scan below tolerates.
+//
+// An entry outlives the window it names. A window that has closed and
+// been emitted still bounds where a checkpoint may go: see HeldFrom.
 type holdEntry struct {
 	mark int64
 	key  string
 	a    *aggregator
+}
+
+// live reports whether a hold entry's window is still open, as opposed to
+// closed and already emitted. The aggregator is compared by identity as
+// well as by key, because a later window under the same key is a
+// different window.
+func (st *Stream) live(e holdEntry) bool {
+	a, ok := st.aggs[e.key]
+	return ok && a == e.a
 }
 
 type mlBuffer struct {
@@ -115,6 +127,11 @@ type aggregator struct {
 	hasValue bool
 	// mark is where the record that opened this window began.
 	mark int64
+	// lastMark is where the most recent record folded into this window
+	// began. Together with mark it is the window's span in the stream,
+	// which is what tells HeldFrom whether a checkpoint would land inside
+	// it.
+	lastMark int64
 }
 
 // StreamOptions configure a new stream.
@@ -188,27 +205,63 @@ func (st *Stream) Mark(pos int64) { st.mark = pos }
 // nothing saying so, and a rewind threw away the part of an open window
 // that came from bytes already acknowledged.
 func (st *Stream) HeldFrom() (int64, bool) {
+	oldest, held := st.holdFloor()
+	st.pruneHolds()
+	return oldest, held
+}
+
+// holdFloor is the oldest position this stream still needs a replay to
+// start at, and whether it needs one at all.
+//
+// It is the oldest open multiline buffer or aggregation window -- and
+// then, crucially, it is pulled back past any *emitted* window whose span
+// contains that position.
+//
+// The pull-back is not belt and braces. Windows for different aggregation
+// keys interleave: key `a`'s window can close while key `b`'s, opened
+// later, is still open. Without the pull-back the floor rises to `b`'s
+// mark, which sits in the middle of the records that fed `a` -- correctly
+// as far as `a` goes, whose sample has already been handed to the sink.
+// But a replay from there does not rebuild `a`: those records open a *new*
+// window at the wrong start timestamp, so the store gains a row nobody
+// measured, and the record that should have opened the next real window is
+// swallowed into it instead. A partial count appears and a real one
+// disappears, both in silence, on every restart and every hole rewind.
+//
+// Pulling back to the emitted window's own start makes the replay rebuild
+// it whole, so the duplicate collapses under a content-addressed key and
+// the following window opens where it did the first time.
+//
+// One backward pass suffices: the list is in mark order, the floor only
+// falls, and an entry whose mark is at or past the floor cannot contain
+// it. The floor never falls *between* calls either -- a window's span only
+// grows while it is open, and while it is open it pins the floor to its
+// own mark -- which is what lets pruneHolds drop anything behind it.
+func (st *Stream) holdFloor() (int64, bool) {
 	oldest, held := int64(0), false
 	for _, b := range st.multiline {
 		if !held || b.mark < oldest {
 			oldest, held = b.mark, true
 		}
 	}
-	// Entries whose window has closed are dropped from the front; the
-	// first live one is the oldest, because marks only increase.
-	for len(st.holds) > 0 {
-		e := st.holds[0]
-		if a, ok := st.aggs[e.key]; ok && a == e.a {
-			if !held || e.mark < oldest {
-				oldest, held = e.mark, true
-			}
-			break
+	for _, e := range st.holds {
+		if st.live(e) && (!held || e.mark < oldest) {
+			oldest, held = e.mark, true
 		}
-		st.holds = st.holds[1:]
 	}
-	// Stale entries *behind* a live one are not reached by the pop above.
-	st.pruneHolds()
-	return oldest, held
+	if !held {
+		return 0, false
+	}
+	for i := len(st.holds) - 1; i >= 0; i-- {
+		e := st.holds[i]
+		if e.mark >= oldest || st.live(e) {
+			continue
+		}
+		if e.a.lastMark >= oldest {
+			oldest = e.mark
+		}
+	}
+	return oldest, true
 }
 
 // holdWindow records where an open aggregation window started, keeping
@@ -234,7 +287,16 @@ func (st *Stream) holdWindow(key string, a *aggregator) {
 	st.pruneHolds()
 }
 
-// pruneHolds drops entries whose window has closed.
+// pruneHolds drops entries that can no longer constrain a checkpoint.
+//
+// The floor never falls between calls, so an emitted window matters again
+// only if a position at or past the current floor -- and past the
+// window's own start -- can still fall inside its span. A window that
+// absorbed only the record that opened it spans a single position and can
+// never contain anything, which is every window on a driver that does not
+// mark its records at all. When nothing is open the list goes entirely,
+// since the driver may then acknowledge its read head, which is past
+// every span there is.
 //
 // It is called where holds grow as well as where they are read, because
 // only some drivers read them: HeldFrom exists for a caller that
@@ -244,17 +306,29 @@ func (st *Stream) holdWindow(key string, a *aggregator) {
 // every window ever opened: a one-minute `every` over a thousand keys is
 // a million entries a day that nothing would ever look at.
 //
-// The threshold leaves room for the live windows plus a little slack, so
-// the compaction is amortised rather than run on every window.
+// What survives is bounded by the windows whose spans reach the floor,
+// which is the same order as the open set, so the threshold below still
+// amortises the compaction rather than running it per window.
 func (st *Stream) pruneHolds() {
 	if len(st.holds) > 2*len(st.aggs)+16 {
-		live := st.holds[:0]
+		floor, held := st.holdFloor()
+		if !held {
+			st.holds = nil
+			return
+		}
+		kept := st.holds[:0]
 		for _, e := range st.holds {
-			if a, ok := st.aggs[e.key]; ok && a == e.a {
-				live = append(live, e)
+			// An emitted window matters again only if some future floor
+			// can land strictly inside its span. Floors never fall, so
+			// that needs a position at or past the current one *and*
+			// past the window's own start: a window that absorbed only
+			// the record that opened it spans a single position, which
+			// nothing can be inside.
+			if st.live(e) || (e.a.lastMark >= floor && e.a.lastMark > e.mark) {
+				kept = append(kept, e)
 			}
 		}
-		st.holds = live
+		st.holds = kept
 	}
 	if len(st.holds) == 0 {
 		st.holds = nil // let the backing array go
@@ -650,7 +724,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			start: ts, end: ts.Add(ag.every),
 			labels: copyLabels(labels), fields: copyFields(fields),
 			set: set, line: line, field: ag.Field, mode: ag.Mode,
-			mark: st.mark,
+			mark: st.mark, lastMark: st.mark,
 		}
 		st.aggs[key] = a
 		heap.Push(&st.aggQ, aggEntry{key: key, end: a.end, a: a})
@@ -672,6 +746,13 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			}
 		}
 		return nil
+	}
+	// Every record that reaches an open window extends its span, whether
+	// or not it moves the value: a replay that started inside the span
+	// would absorb it into a different window, so the span is what
+	// HeldFrom has to see.
+	if st.mark > a.lastMark {
+		a.lastMark = st.mark
 	}
 	if !usable {
 		// Nothing to fold. `increment` counts the occurrence regardless;

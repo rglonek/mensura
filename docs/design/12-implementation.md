@@ -145,6 +145,7 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Every acquisition path reports its backlog and its unmatched lines | `internal/ingest/review_test.go:TestRemoteFollowPublishesLag`, `…:TestFollowReportsUnmatchedLines`, `…:TestMergeStreamIsIdempotent` |
 | `follow` skips a binary file, as `batch` does | `…:TestFollowSkipsBinaryFiles` |
 | A framing bound that would remove itself is refused | `pkg/extract/review_test.go:TestFramingBoundsAreValidated` |
+| A replay from `HeldFrom` reproduces exactly the undelivered windows | `…:TestAggregationReplayFromHeldFromIsLossless`, `…:TestAggregationReplayIsLosslessOverRandomStreams`, `…:TestHoldListStaysBoundedWithInterleavedKeys` |
 
 ## 5. Implementation status
 
@@ -2153,7 +2154,50 @@ a declaration repeated on every ingest start still costs nothing — and
 logs rather than fails, because a metadata write that could not land is
 no reason to make the ingester resend data the store is about to hold.
 
-### 6.110 Smaller corrections
+### 6.110 A checkpoint may not land inside a window that has been emitted
+
+`HeldFrom` names the oldest position the stream still needs a replay to
+start at, and it named the oldest *open* multiline buffer or aggregation
+window. For a profile with one aggregation key that is the whole answer.
+With several it is not, and several is the ordinary case: `on: [op]` opens
+one window per value of `op`, and those windows interleave.
+
+Key `a`'s window closes while key `b`'s, opened later, is still open. The
+floor rises to `b`'s mark — correctly as far as `a` goes, whose sample has
+already been handed to the sink — but `b`'s mark sits in the middle of the
+records that fed `a`. A restart, or the rewind that a delivery hole
+performs, re-reads from there. Those records do not rebuild `a`'s window:
+they open a *new* one, starting at the timestamp of whichever record came
+first after the resume point, and the record that in the original run
+opened the *next* real window is absorbed into it instead. So the store
+gains a row nobody measured and loses one that was, both in silence, and
+`mode: increment` counters are exactly what this is for.
+
+An aggregator now remembers the position of the last record folded into
+it, so a window has a span rather than a point, and the hold list keeps an
+entry after its window closes. The floor is pulled back past any emitted
+window whose span contains it, to that window's own start, where the
+replay rebuilds it whole and the duplicate collapses under a
+content-addressed key. One backward pass does it: the list is in mark
+order, the floor only falls, and an entry at or past the floor cannot
+contain it.
+
+The floor never falls between calls either — a window's span only grows
+while it is open, and while it is open it pins the floor to its own mark —
+which is what lets the list be pruned without losing a constraint that
+matters later: an emitted window goes once a position at or past the
+current floor can no longer land strictly inside its span. A window that
+absorbed only the record that opened it spans a single position and can
+never contain anything, which is every window on a driver that does not
+mark its records at all.
+
+`pkg/extract/review_test.go` checks the property directly: for every crash
+point in a stream, what was delivered plus what a replay from `HeldFrom`
+produces has to be exactly what an uninterrupted run produced — a missing
+result is data loss and an extra one is a row nobody measured — over the
+worked interleaving above and over sixty randomised streams.
+
+### 6.111 Smaller corrections
 
 - **`lag_bytes` on an SSH follow.** The remote follower learns the file's
   size on every probe and knows its own read position, and published
