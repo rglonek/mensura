@@ -34,6 +34,30 @@ type Stats struct {
 	// nothing.
 	Unjoined       int64
 	FirstUnmatched []string
+
+	// Aggregates is one entry per aggregating pattern, in pattern order:
+	// how many records it absorbed and how many rows those became.
+	//
+	// Aggregation is a lossy choice, and 03-extraction.md section 9 says
+	// `check` reports how lossy -- so does the Aggregate type's own doc
+	// comment. Nothing measured it, so the one number that makes the
+	// trade visible was never printed.
+	Aggregates []AggregateStat
+
+	// WindowsForcedClosed counts windows emitted before their `every` had
+	// elapsed because the open-window cap was reached. A window that
+	// closes early is a shorter window, not a lost one, but it is not
+	// what the spec asked for, so it is counted rather than silent.
+	WindowsForcedClosed int64
+}
+
+// AggregateStat is one aggregating pattern's reduction.
+type AggregateStat struct {
+	Set     string
+	Field   string
+	Mode    string
+	Records int64
+	Windows int64
 }
 
 // Stream is the per-source extraction state: one log file, one connection,
@@ -77,8 +101,28 @@ type Stream struct {
 
 	Stats Stats
 
+	// aggSlot maps a pattern index onto its entry in Stats.Aggregates, or
+	// -1 for a pattern that does not aggregate.
+	aggSlot []int
+
 	maxUnmatchedSamples int
 }
+
+// maxOpenWindows bounds how many aggregation windows one stream may hold
+// open at once.
+//
+// A window is one accumulator plus a copy of the opening record's labels
+// and fields, and there is one per distinct `on` tuple per window period.
+// Nothing bounded that: `on: [request_id]` -- or any key whose
+// cardinality the spec author misjudged -- grew the ingester's memory for
+// as long as `every` lasted, with no cap, no counter and no diagnostic,
+// on a process that is otherwise careful to bound every buffer it holds
+// (the store's max_label_cardinality, the receiver's max_peers, the
+// sink's max_buffered_samples). Past the cap the oldest-ending windows
+// are emitted early and counted: a shorter window is a visible loss of
+// resolution, and an out-of-memory kill is an invisible loss of
+// everything.
+const maxOpenWindows = 100_000
 
 // holdEntry is one span of the stream that a checkpoint may not land in
 // the middle of: an aggregation window, or a multiline record that has
@@ -157,6 +201,9 @@ type aggregator struct {
 	// which is what tells HeldFrom whether a checkpoint would land inside
 	// it.
 	lastMark int64
+	// slot is the pattern's entry in Stats.Aggregates, so a window can be
+	// counted against the pattern that opened it wherever it is emitted.
+	slot int
 }
 
 // StreamOptions configure a new stream.
@@ -196,11 +243,27 @@ func (s *Spec) NewStream(p *Profile, opts StreamOptions) (*Stream, error) {
 		}
 		year = n
 	}
+	// One Stats.Aggregates entry per aggregating pattern, in pattern
+	// order, so `check` can report the reduction each one buys.
+	slots := make([]int, len(p.Patterns))
+	var aggs []AggregateStat
+	for i, pat := range p.Patterns {
+		slots[i] = -1
+		if pat.Aggregate == nil {
+			continue
+		}
+		slots[i] = len(aggs)
+		aggs = append(aggs, AggregateStat{
+			Set: pat.Set, Field: pat.Aggregate.Field, Mode: pat.Aggregate.Mode,
+		})
+	}
 	return &Stream{
 		spec: s, profile: p, loc: loc, assumeYear: year, tsIdx: -1,
 		from: opts.From, to: opts.To,
 		multiline:           map[string]*mlBuffer{},
 		aggs:                map[string]*aggregator{},
+		aggSlot:             slots,
+		Stats:               Stats{Aggregates: aggs},
 		maxUnmatchedSamples: 5,
 	}, nil
 }
@@ -499,14 +562,37 @@ func (st *Stream) Process(line string) ([]Result, error) {
 // Flush closes every open multiline buffer and aggregation window. Follow
 // mode also calls FlushIdle so a quiet stream does not hold a partial
 // record or a half-filled window indefinitely.
-func (st *Stream) Flush() []Result {
+//
+// The verdict on every record it flushes is returned alongside the
+// samples, for the reason Process returns the one it flushes: the drivers
+// turn a verdict into the pipeline's counters -- Progress.UnmatchedLines,
+// TSParseErrors, ExtractErrors -- and a record judged here was judged
+// nowhere else. Process was given this back for the flush a start marker
+// performs; the other three (a rotation, a retirement, a shutdown) went
+// on discarding it, which on a low-traffic multiline source is most of
+// them.
+//
+// The buffers are walked in the profile's declared rule order rather than
+// in map order, so the samples one flush produces are handed to the sink
+// in the same sequence every time: their key hint is a flush sequence
+// number plus a position in the batch, so a replay that emitted them in a
+// different order would key them differently under `key: offset`.
+func (st *Stream) Flush() ([]Result, []error) {
 	var out []Result
-	for k, buf := range st.multiline {
-		delete(st.multiline, k)
+	var errs []error
+	for _, m := range st.profile.Framing.Multiline {
+		buf, ok := st.multiline[m.StartContains]
+		if !ok {
+			continue
+		}
+		delete(st.multiline, m.StartContains)
 		// Partial results are kept even when process reports an error:
 		// it returns the windows it closed alongside the failure.
-		r, _ := st.processBuffered(buf)
+		r, err := st.processBuffered(buf)
 		out = append(out, r...)
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 	// Only these are counted here. process() already counted everything
 	// it returned, so adding len(out) on top double-counted every
@@ -515,11 +601,21 @@ func (st *Stream) Flush() []Result {
 		a := st.aggs[k]
 		delete(st.aggs, k)
 		out = append(out, a.emit())
+		st.countWindow(a)
 		st.Stats.Samples++
 	}
 	st.aggQ = nil
 	st.holds = nil
-	return out
+	return out, errs
+}
+
+// countWindow records one emitted window against the pattern that opened
+// it, which is what makes the reduction `check` reports a measurement
+// rather than an estimate.
+func (st *Stream) countWindow(a *aggregator) {
+	if a.slot >= 0 && a.slot < len(st.Stats.Aggregates) {
+		st.Stats.Aggregates[a.slot].Windows++
+	}
 }
 
 // aggKeysInEndOrder lists the open windows oldest end first, which is the
@@ -548,8 +644,9 @@ func (st *Stream) aggKeysInEndOrder() []string {
 // Aggregation windows are closed here too, not only when a fresh matching
 // record arrives: a stream that goes quiet would otherwise hold its last
 // half-filled window until shutdown.
-func (st *Stream) FlushIdle(now time.Time) []Result {
+func (st *Stream) FlushIdle(now time.Time) ([]Result, []error) {
 	var out []Result
+	var errs []error
 	for _, m := range st.profile.Framing.Multiline {
 		buf, ok := st.multiline[m.StartContains]
 		if !ok || now.Sub(buf.seen) < m.idleTimeout {
@@ -557,15 +654,21 @@ func (st *Stream) FlushIdle(now time.Time) []Result {
 		}
 		delete(st.multiline, m.StartContains)
 		st.holdRecord(buf, 0)
-		r, _ := st.processBuffered(buf)
+		// The verdict travels, exactly as Flush's does: on a stream quiet
+		// enough to need an idle flush, this is the only judgement that
+		// record ever receives.
+		r, err := st.processBuffered(buf)
 		out = append(out, r...)
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 	// closeExpiredAggregators is called directly here, so its results are
 	// the only ones this function counts; process() counts its own.
 	closed := st.closeExpiredAggregators(st.aggregationHorizon(now))
 	out = append(out, closed...)
 	st.Stats.Samples += int64(len(closed))
-	return out
+	return out, errs
 }
 
 // aggregationHorizon converts wall-clock idleness into the record-time
@@ -700,12 +803,10 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 		// windows in out have already been removed from st.aggs, so a
 		// caller that dropped them on the error lost every window that
 		// happened to expire on the same record as a spec fault.
-		if err := st.aggregate(pat, set, ts, labels, fields, line); err != nil {
-			st.Stats.Samples += int64(len(out))
-			return out, err
-		}
+		shed, err := st.aggregate(pat, idx, set, ts, labels, fields, line)
+		out = append(out, shed...)
 		st.Stats.Samples += int64(len(out))
-		return out, nil
+		return out, err
 	}
 
 	out = append(out, Result{Set: set, TSMs: ts.UnixMilli(), Labels: labels, Fields: fields, Line: line})
@@ -721,7 +822,7 @@ func (st *Stream) isLabel(pat *Pattern, name string) bool {
 	return ok
 }
 
-func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[string]string, fields map[string]model.Value, line string) error {
+func (st *Stream) aggregate(pat *Pattern, patIdx int, set string, ts time.Time, labels map[string]string, fields map[string]model.Value, line string) ([]Result, error) {
 	ag := pat.Aggregate
 	// The window is identified by what it produces, not only by where it
 	// goes: the destination set, the column the accumulator synthesises,
@@ -749,7 +850,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	for _, on := range ag.On {
 		v, ok := labels[on]
 		if !ok {
-			return fmt.Errorf("extract: aggregation key %q is not a declared label", on)
+			return nil, fmt.Errorf("extract: aggregation key %q is not a declared label", on)
 		}
 		keyParts = append(keyParts, on+"="+v)
 	}
@@ -776,9 +877,16 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 	var usable bool
 	if v, ok := fields[ag.Field]; ok {
 		if incoming, usable = v.AsFloat(); !usable && ag.Mode != "increment" {
-			return fmt.Errorf("extract: aggregate field %q is %s, which is not a finite number, so it cannot be %s into a window",
+			return nil, fmt.Errorf("extract: aggregate field %q is %s, which is not a finite number, so it cannot be %s into a window",
 				ag.Field, v.String(), ag.Mode)
 		}
+	}
+	slot := -1
+	if patIdx >= 0 && patIdx < len(st.aggSlot) {
+		slot = st.aggSlot[patIdx]
+	}
+	if slot >= 0 && slot < len(st.Stats.Aggregates) {
+		st.Stats.Aggregates[slot].Records++
 	}
 	a, ok := st.aggs[key]
 	if !ok {
@@ -788,7 +896,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 			start: ts, end: ts.Add(ag.every),
 			labels: copyLabels(labels), fields: copyFields(fields),
 			set: set, line: line, field: ag.Field, mode: ag.Mode,
-			mark: st.mark, lastMark: st.mark,
+			mark: st.mark, lastMark: st.mark, slot: slot,
 		}
 		st.aggs[key] = a
 		heap.Push(&st.aggQ, aggEntry{key: key, end: a.end, a: a})
@@ -809,7 +917,10 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 				a.value, a.hasValue = incoming, true
 			}
 		}
-		return nil
+		// The cap is enforced where a window is added, which is the only
+		// place the open set grows. What comes back has already left
+		// st.aggs, so the caller has to deliver it.
+		return st.shedOldestWindows(), nil
 	}
 	// Every record that reaches an open window extends its span, whether
 	// or not it moves the value: a replay that started inside the span
@@ -828,7 +939,7 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 		if a.mode == "increment" {
 			a.value++
 		}
-		return nil
+		return nil, nil
 	}
 	switch a.mode {
 	case "increment":
@@ -843,7 +954,40 @@ func (st *Stream) aggregate(pat *Pattern, set string, ts time.Time, labels map[s
 		a.value = incoming
 	}
 	a.hasValue = true
-	return nil
+	return nil, nil
+}
+
+// shedOldestWindows emits and removes the oldest-ending open windows once
+// the open set is over its cap, and reports what it emitted so the caller
+// can deliver it.
+//
+// Emitting early is the least-lossy answer available: the row still
+// reaches the store, carrying a window shorter than the spec declared,
+// and Stats.WindowsForcedClosed says how often that happened. Refusing
+// the record instead would drop measurements outright, and holding on is
+// how the process dies.
+func (st *Stream) shedOldestWindows() []Result {
+	over := len(st.aggs) - maxOpenWindows
+	if over <= 0 {
+		return nil
+	}
+	var out []Result
+	for over > 0 && len(st.aggQ) > 0 {
+		e := st.aggQ[0]
+		heap.Pop(&st.aggQ)
+		// A queue entry whose window is already gone costs nothing and
+		// frees nothing, so it does not count against the shortfall.
+		a, ok := st.aggs[e.key]
+		if !ok || a != e.a {
+			continue
+		}
+		out = append(out, a.emit())
+		delete(st.aggs, e.key)
+		st.countWindow(a)
+		st.Stats.WindowsForcedClosed++
+		over--
+	}
+	return out
 }
 
 // closeExpiredAggregators emits and removes every window that has ended by
@@ -873,6 +1017,7 @@ func (st *Stream) closeExpiredAggregators(now time.Time) []Result {
 		}
 		out = append(out, a.emit())
 		delete(st.aggs, e.key)
+		st.countWindow(a)
 	}
 	return out
 }

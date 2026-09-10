@@ -118,7 +118,7 @@ func TestAggregationWindow(t *testing.T) {
 		}
 	}
 	// Nothing is emitted until the window closes.
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 {
 		t.Fatalf("expected one aggregated sample, got %d", len(out))
 	}
@@ -226,7 +226,7 @@ func TestMultilineJoin(t *testing.T) {
 	if out, err := st.Process(`1756400000001 cont 2`); err != nil || len(out) != 0 {
 		t.Fatalf("continuation should buffer: %v %v", out, err)
 	}
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 {
 		t.Fatalf("expected the joined record on flush, got %d", len(out))
 	}

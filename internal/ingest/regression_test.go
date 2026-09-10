@@ -1838,7 +1838,7 @@ func TestRemoteStreamIdleFlushReleasesHeldBytes(t *testing.T) {
 	// it was holding are released.
 	var results []extract.Result
 	var pos string
-	at := rs.flushIdle(time.Now().Add(time.Hour), func(r []extract.Result, p string) {
+	at, _ := rs.flushIdle(time.Now().Add(time.Hour), func(r []extract.Result, p string) {
 		results, pos = r, p
 	})
 	if len(results) == 0 {

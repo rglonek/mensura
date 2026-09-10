@@ -246,7 +246,11 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		}
 		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity(), lag)
 		rs.mergeStats(i.cfg.Progress)
-		if flushed, pos := rs.flushAll(); len(flushed) > 0 {
+		flushed, pos, verdicts := rs.flushAll()
+		for _, verr := range verdicts {
+			i.recordOutcome(verr)
+		}
+		if len(flushed) > 0 {
 			i.cfg.Progress.AddSamples(int64(len(flushed)))
 			for n, r := range flushed {
 				_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
@@ -371,16 +375,21 @@ func (rs *remoteStream) heldLocked() int64 {
 // window would acknowledge them while their samples were still on their
 // way to the sink. Flushing and queueing as one step is what keeps the
 // published offset behind everything the sink has been handed.
-func (rs *remoteStream) flushIdle(now time.Time, deliver func(results []extract.Result, pos string)) int64 {
+//
+// The verdicts come back with the offset rather than being dropped: a
+// record flushed on an idle tick is judged nowhere else, and the drivers
+// are what turn a verdict into the pipeline's counters.
+func (rs *remoteStream) flushIdle(now time.Time, deliver func(results []extract.Result, pos string)) (int64, []error) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if rs.ex == nil {
-		return rs.consumed
+		return rs.consumed, nil
 	}
-	if results := rs.ex.FlushIdle(now); len(results) > 0 {
+	results, verdicts := rs.ex.FlushIdle(now)
+	if len(results) > 0 {
 		deliver(results, rs.nextFlushPosLocked())
 	}
-	return rs.heldLocked()
+	return rs.heldLocked(), verdicts
 }
 
 // mergeStats folds the extractor's sample of unmatched lines into the
@@ -394,17 +403,17 @@ func (rs *remoteStream) mergeStats(p *Progress) {
 }
 
 // flushAll drains the extractor at the end of a connection.
-func (rs *remoteStream) flushAll() ([]extract.Result, string) {
+func (rs *remoteStream) flushAll() ([]extract.Result, string, []error) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if rs.ex == nil {
-		return nil, ""
+		return nil, "", nil
 	}
-	results := rs.ex.Flush()
+	results, verdicts := rs.ex.Flush()
 	if len(results) == 0 {
-		return nil, ""
+		return nil, "", verdicts
 	}
-	return results, rs.nextFlushPosLocked()
+	return results, rs.nextFlushPosLocked(), verdicts
 }
 
 // checkpointBox owns one remote path's Checkpoint. Every read hands back
@@ -943,12 +952,15 @@ func remoteIdleTick(idle time.Duration) time.Duration {
 // remoteFlushIdle emits whatever the extractor has held past the
 // profile's idle timeout and republishes the offset that releases.
 func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target string, labels map[string]string, progress *remoteProgress, now time.Time) {
-	at := rs.flushIdle(now, func(results []extract.Result, pos string) {
+	at, verdicts := rs.flushIdle(now, func(results []extract.Result, pos string) {
 		i.cfg.Progress.AddSamples(int64(len(results)))
 		for n, r := range results {
 			_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
 		}
 	})
+	for _, err := range verdicts {
+		i.recordOutcome(err)
+	}
 	// The idle tick is this path's only regular clock, so it is where the
 	// unmatched-line sample reaches the progress document. Nothing
 	// collected it before, and a connection can stay up for days.

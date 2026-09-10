@@ -678,6 +678,33 @@ func (p *Profile) compile(s *Spec) error {
 		if len(pat.extract) == 0 && len(pat.Route) == 0 {
 			return fmt.Errorf("pattern for set %q has neither extract nor route", pat.Set)
 		}
+		// Every name a pattern can put on a row is held to the rule the
+		// store holds it to, here rather than per sample.
+		//
+		// The regex group names were the visible half and were never
+		// checked; the two that a spec author writes as plain text --
+		// `aggregate.field`, which the accumulator synthesises, and the
+		// keys of `default_values`, which are columns like any other --
+		// were not checked either. A name the store refuses is refused
+		// once per sample for the life of the process, and the rejection
+		// reaches the operator as a line in the store's log with nothing
+		// pointing back at the spec. This is the check `route:` targets,
+		// `kind:` and bucket columns were each given, on the last set of
+		// names that had none.
+		for _, name := range patternCaptureNames(pat) {
+			if name == "" || name == "buckets" || name == "histogram" {
+				continue // payloads consumed by expand(), never columns
+			}
+			if isDeclaredLabel(p, pat, name) {
+				if err := model.ValidateLabelKey(name); err != nil {
+					return fmt.Errorf("pattern for set %q: %w", pat.Set, err)
+				}
+				continue
+			}
+			if err := model.ValidateFieldName(name); err != nil {
+				return fmt.Errorf("pattern for set %q: %w", pat.Set, err)
+			}
+		}
 		if pat.StoreStreamLabel != "" {
 			// The key is accepted by the YAML decoder but nothing acts on
 			// it. Failing is better than letting an operator believe a
@@ -757,6 +784,16 @@ func (p *Profile) compile(s *Spec) error {
 	}
 	p.matcher = newACMatcher(searches)
 	return nil
+}
+
+// isDeclaredLabel reports whether a captured name is classified as a
+// label, which is the same test Stream.isLabel applies at run time.
+func isDeclaredLabel(p *Profile, pat *Pattern, name string) bool {
+	if _, ok := p.labelSet[name]; ok {
+		return true
+	}
+	_, ok := pat.labelSet[name]
+	return ok
 }
 
 // capturesAny reports whether a pattern extracts any of the given names

@@ -712,7 +712,7 @@ func (f *follower) applyRewind(t *tailer) {
 	if !ok {
 		return
 	}
-	_ = t.ex.Flush()
+	_, _ = t.ex.Flush()
 	// reset, not a bare offset assignment: the read loop may have pushed
 	// pending forward between the hole clearing and this seek, and a
 	// pending that sits past the rewind point is exactly what would let a
@@ -856,7 +856,12 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 // drainExtractor flushes whatever the extractor still holds -- an open
 // multiline record, a half-filled aggregation window -- into the sink.
 func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
-	results := t.ex.Flush()
+	results, verdicts := t.ex.Flush()
+	// A record judged by this flush is judged nowhere else, so its
+	// verdict reaches the counters here or not at all.
+	for _, err := range verdicts {
+		f.ing.recordOutcome(err)
+	}
 	if len(results) == 0 {
 		// Still worth republishing: the flush emptied the extractor, so
 		// the bytes it was holding the checkpoint back for are now the
@@ -1011,7 +1016,10 @@ func (f *follower) flushIdle(ctx context.Context) {
 	tailers := f.snapshotTailers()
 	now := time.Now()
 	for _, t := range tailers {
-		results := t.ex.FlushIdle(now)
+		results, verdicts := t.ex.FlushIdle(now)
+		for _, err := range verdicts {
+			f.ing.recordOutcome(err)
+		}
 		if len(results) == 0 {
 			continue
 		}

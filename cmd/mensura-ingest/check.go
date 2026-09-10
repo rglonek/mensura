@@ -82,7 +82,8 @@ func checkSample(spec *extract.Spec, path string, labels map[string]string, maxR
 			return rerr
 		}
 	}
-	for _, r := range stream.Flush() {
+	flushed, _ := stream.Flush()
+	for _, r := range flushed {
 		perSet[r.Set]++
 	}
 
@@ -103,6 +104,31 @@ func checkSample(spec *extract.Spec, path string, labels map[string]string, maxR
 	}
 	if st.Unjoined > 0 {
 		fmt.Printf("  unjoined continuations: %d (matched continue_regex but no join rule)\n", st.Unjoined)
+	}
+	if st.WindowsForcedClosed > 0 {
+		fmt.Printf("  windows closed early:   %d (the open-window cap was reached; `aggregate.on` is higher-cardinality than the spec expects)\n",
+			st.WindowsForcedClosed)
+	}
+	// The reduction each aggregating pattern buys. 03-extraction.md
+	// section 9 says aggregation is lossy on purpose and that `check`
+	// reports how lossy; nothing measured it, so the one number that
+	// makes the trade visible was never printed and an operator had to
+	// guess whether `every` was worth what it discards.
+	reported := false
+	for _, a := range st.Aggregates {
+		if a.Records == 0 && a.Windows == 0 {
+			continue
+		}
+		if !reported {
+			fmt.Println("\naggregation reduction (records absorbed -> rows written):")
+			reported = true
+		}
+		ratio := "n/a"
+		if a.Windows > 0 {
+			ratio = fmt.Sprintf("%.1fx", float64(a.Records)/float64(a.Windows))
+		}
+		fmt.Printf("  set %-20s %s (mode %s): %d record(s) -> %d row(s), %s reduction\n",
+			a.Set, a.Field, a.Mode, a.Records, a.Windows, ratio)
 	}
 	for i, l := range st.FirstUnmatched {
 		if i == 0 {

@@ -77,9 +77,30 @@ func (p *Progress) SkipBinary() { p.mu.Lock(); p.c.BinarySkipped++; p.mu.Unlock(
 func (p *Progress) SkipArchive(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.c.ArchivesSkipped) < 20 {
-		p.c.ArchivesSkipped = append(p.c.ArchivesSkipped, path)
+	p.c.ArchivesSkipped = appendPathOnce(p.c.ArchivesSkipped, path)
+}
+
+// maxNamedPaths bounds the two path lists in the progress document.
+const maxNamedPaths = 20
+
+// appendPathOnce records a path in a bounded list, once.
+//
+// Both lists are read as "which inputs were declined", and both are fed
+// by a caller that revisits the same input. The follower reconsiders a
+// path that matched no profile every noProfileRetry, forever, so the
+// twenty slots filled with twenty copies of the first such path within
+// twenty minutes -- and every other unmatched path, which is what an
+// operator is looking at the list to find, could then never appear.
+func appendPathOnce(list []string, path string) []string {
+	for _, have := range list {
+		if have == path {
+			return list
+		}
 	}
+	if len(list) >= maxNamedPaths {
+		return list
+	}
+	return append(list, path)
 }
 
 // OversizeRecord counts a record longer than the configured cap, whose
@@ -92,9 +113,7 @@ func (p *Progress) UDPDrop()        { p.mu.Lock(); p.c.UDPDropped++; p.mu.Unlock
 func (p *Progress) NoProfile(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.c.NoProfileFiles) < 20 {
-		p.c.NoProfileFiles = append(p.c.NoProfileFiles, path)
-	}
+	p.c.NoProfileFiles = appendPathOnce(p.c.NoProfileFiles, path)
 }
 
 // AddSamples counts extraction results handed to the sink.

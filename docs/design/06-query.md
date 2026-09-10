@@ -430,7 +430,7 @@ in tests. Warnings never fail a query; errors always do.
 | `E008` | error | an unknown `FORMAT`, `SSE` mode or `CLAMP ELSE`; `FORMAT logs`/`table` combined with a timeseries-only modifier; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |
 | `W101` | warning | Modifiers written in non-canonical order; canonical order applies. Raised by `ParseDiags`, not by validation: the written order does not survive into the AST |
-| `W102` | warning | Counter-kind field selected without `RATE`/`DELTA` |
+| `W102` | warning | Counter-kind field selected without `RATE`/`DELTA`, under a format where those apply — never under `FORMAT table`/`logs`, where `E008` refuses them |
 | `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |
 | `W104` | warning | A `string`-kind field selected under `FORMAT timeseries`: only values that read as numbers are plotted, so the series may draw nothing |
 | `W201` | warning | A comparison matches no dictionary value; result will be empty |

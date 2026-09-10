@@ -383,7 +383,7 @@ profiles:
 			t.Fatalf("process: %v", err)
 		}
 	}
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 {
 		t.Fatalf("flush produced %d results, want 1", len(out))
 	}
@@ -542,7 +542,7 @@ profiles:
 			t.Fatalf("continuation %d: %v", i, err)
 		}
 	}
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 {
 		t.Fatalf("expected one joined record, got %d", len(out))
 	}
@@ -997,7 +997,8 @@ profiles:
 		}
 	}
 	got := map[string]model.Value{}
-	for _, r := range st.Flush() {
+	flushed, _ := st.Flush()
+	for _, r := range flushed {
 		for k, v := range r.Fields {
 			if _, dup := got[k]; dup {
 				t.Fatalf("field %q was emitted by more than one window", k)
