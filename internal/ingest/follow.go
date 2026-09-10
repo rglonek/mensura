@@ -498,6 +498,24 @@ func (f *follower) ensure(path string) (*tailer, error) {
 
 	full := make([]byte, 64<<10)
 	hn, _ := fh.ReadAt(full, 0)
+	// The same content sniff batch import applies, on the same rule:
+	// 02-ingest.md section 4.2 classifies a file with a NUL byte in its
+	// first block as binary and ignores it, and says nothing about that
+	// depending on how the file was opened. Only processFile did it, so a
+	// glob like `/var/log/*` -- which matches wtmp, lastlog and every
+	// journal fragment -- fed those bytes to the profile's regexes on
+	// every poll, forever, and any pattern loose enough to match invented
+	// samples out of them. The backoff is the one no-profile uses: a file
+	// that is binary now may not be after a rotation.
+	if isBinary(full[:hn]) {
+		_ = fh.Close()
+		f.ing.cfg.Progress.SkipBinary()
+		f.ing.cfg.Log.Printf("WARNING %s holds a NUL byte in its first block, so it is treated as binary and not followed (retrying in %s)", path, noProfileRetry)
+		f.mu.Lock()
+		f.noProfile[path] = time.Now().Add(noProfileRetry)
+		f.mu.Unlock()
+		return nil, nil
+	}
 	profile := f.ing.cfg.Spec.SelectProfile(path, full[:hn], f.ing.cfg.Labels, "")
 	if profile == nil {
 		_ = fh.Close()
@@ -726,6 +744,13 @@ func (f *follower) atEOF(t *tailer) error {
 	// bytes the moment they are consumed leaves no interval to lose them
 	// in.
 	f.widenFingerprint(t)
+	// The extractor's sample of unmatched lines reaches the progress
+	// document here, once per sweep per tailer, rather than only when a
+	// batch import finishes a file. It is what tells an operator *why* a
+	// followed file is producing nothing, and on this path nothing ever
+	// collected it: `first_unmatched` was empty for the whole life of a
+	// follow. MergeStream is idempotent, so repeating it is free.
+	f.ing.cfg.Progress.MergeStream(&t.ex.Stats)
 	if info, serr := t.file.Stat(); serr == nil {
 		if lag := info.Size() - t.offset; lag > 0 {
 			t.setLag(lag)
@@ -873,6 +898,9 @@ func (f *follower) retireKeepingCheckpoint(ctx context.Context, t *tailer) {
 
 func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
 	f.drainExtractor(ctx, t)
+	// Last chance: this extractor is about to be dropped, and whatever it
+	// could not match is the most useful thing it holds.
+	f.ing.cfg.Progress.MergeStream(&t.ex.Stats)
 	_ = t.file.Close()
 	// Clearing the handle is what makes the retired tailer inert. poll
 	// calls read() again right after checkRotation returns, and a closed

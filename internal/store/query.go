@@ -477,6 +477,14 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 	// Sorting by name keeps colour assignment stable across reloads.
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 
+	// How many samples the walk's duplicate-timestamp rule threw away.
+	// Two rows cannot occupy one instant in one series, so the second is
+	// dropped -- silently, until now. With no BY clause that is the
+	// interleaving hazard 06-query.md section 8 describes: rows from
+	// every stream land in one series and whichever one the scan reaches
+	// first wins each millisecond, which is a plausible-looking graph of
+	// numbers no single source ever reported.
+	collapsed := 0
 	for _, a := range out {
 		spec := a.field.spec
 		// The end of the range, so a series that stops mid-range draws a
@@ -489,6 +497,15 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 			spec.EndMs = 0
 		}
 		pts := render.Series(a.points, spec, window)
+		// Counted after the walk, which sorts the input slice in place:
+		// adjacent equal timestamps in the sorted input are exactly the
+		// samples stage 2 dropped, so this is the number itself rather
+		// than an estimate that depends on scan order.
+		for i := 1; i < len(a.points); i++ {
+			if a.points[i].TSMs == a.points[i-1].TSMs {
+				collapsed++
+			}
+		}
 		ser := wire.Series{Name: a.name, Labels: a.labels, Meta: a.field.meta}
 		for _, o := range pts {
 			ts, v, null := o.TSMs, o.Value, o.Null
@@ -516,12 +533,40 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 		resp.Series = append(resp.Series, ser)
 	}
 	resp.Stats.SeriesCount = len(resp.Series)
+	if collapsed > 0 {
+		resp.Warnings = append(resp.Warnings, s.interleaveWarning(q, collapsed))
+	}
 	if gateErr != "" {
 		resp.Error = gateErr
 		resp.Stats.Truncated = true
 		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
 	}
 	return nil
+}
+
+// interleaveWarning is W301: the walk dropped samples because two rows
+// landed on one instant in one series.
+//
+// The code is documented in 06-query.md section 12 and was named in
+// section 8 as the only mitigation for the no-BY aggregation caveat --
+// and nothing ever emitted it, so the caveat's whole failure mode
+// happened in silence. It is worth saying even when a BY clause is
+// present, because "these two rows became one point" is a loss either
+// way; the suggestion is what differs.
+func (s *Store) interleaveWarning(q *mql.Query, collapsed int) mql.Diag {
+	if len(q.By) > 0 {
+		return mql.Diag{Code: "W301", Msg: fmt.Sprintf(
+			"%d sample(s) shared a timestamp with another row in the same group and were dropped; a series holds one point per instant -- group by a label that separates them",
+			collapsed)}
+	}
+	msg := fmt.Sprintf("%d sample(s) shared a timestamp with another row and were dropped; with no BY clause every stream lands in one series, so the value drawn at those instants is whichever row was read first", collapsed)
+	if keys := s.LabelKeys(q.From); len(keys) > 0 {
+		if len(keys) > 5 {
+			keys = keys[:5]
+		}
+		msg += " -- add BY " + strings.Join(keys, " or BY ")
+	}
+	return mql.Diag{Code: "W301", Msg: msg}
 }
 
 // runHeatmap sums bucket counts per window. Extremes are the right summary

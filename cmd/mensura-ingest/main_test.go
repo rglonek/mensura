@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,7 @@ func TestInvalidOperatorLabelsAreRefusedAtStartup(t *testing.T) {
 			common := commonFlags{spec: spec, storeURL: "http://127.0.0.1:1", labels: c.labels}
 			_, sink, err := common.setup()
 			if sink != nil {
-				t.Cleanup(func() { _ = sink.Close(nil) })
+				t.Cleanup(func() { _ = sink.Close(context.Background()) })
 			}
 			if c.ok && err != nil {
 				t.Fatalf("a valid label was refused: %v", err)

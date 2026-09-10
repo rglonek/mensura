@@ -95,9 +95,16 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 		case <-tailCtx.Done():
 		}
 	}()
+	// One backlog figure per followed path, summed into the progress
+	// document. The local follower publishes lag_bytes for every tailer
+	// it sweeps; this path published none at all, so `lag_bytes` read 0
+	// for the whole life of an SSH follow -- which is exactly what a
+	// caught-up tail reads like, on the one number an operator watches to
+	// find out that it is not.
+	lag := newRemoteLag(i.cfg.Progress)
 	errCh := make(chan error, len(opts.Paths))
 	for _, path := range opts.Paths {
-		go func(p string) { errCh <- i.followRemotePath(tailCtx, opts, cps, p) }(path)
+		go func(p string) { errCh <- i.followRemotePath(tailCtx, opts, cps, p, lag) }(path)
 	}
 	var first error
 	for range opts.Paths {
@@ -112,7 +119,7 @@ func (i *Ingest) FollowRemote(ctx context.Context, opts RemoteOptions) error {
 	return first
 }
 
-func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *CheckpointStore, path string) error {
+func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *CheckpointStore, path string, lag *remoteLag) error {
 	target := opts.Host + ":" + path
 	stream := StreamID(target)
 	cp, hadCheckpoint := cps.Load(stream)
@@ -229,6 +236,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 			if ident != "" && ident != known {
 				saveIdentity(ident)
 			}
+			lag.set(path, size-progress.pendingOffset())
 		}
 		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
 			RefTime: time.Now(), From: i.cfg.From, To: i.cfg.To,
@@ -236,7 +244,8 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity())
+		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity(), lag)
+		rs.mergeStats(i.cfg.Progress)
 		if flushed, pos := rs.flushAll(); len(flushed) > 0 {
 			i.cfg.Progress.AddSamples(int64(len(flushed)))
 			for n, r := range flushed {
@@ -372,6 +381,16 @@ func (rs *remoteStream) flushIdle(now time.Time, deliver func(results []extract.
 		deliver(results, rs.nextFlushPosLocked())
 	}
 	return rs.heldLocked()
+}
+
+// mergeStats folds the extractor's sample of unmatched lines into the
+// progress document, under the lock that guards the extractor.
+func (rs *remoteStream) mergeStats(p *Progress) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.ex != nil {
+		p.MergeStream(&rs.ex.Stats)
+	}
 }
 
 // flushAll drains the extractor at the end of a connection.
@@ -598,6 +617,44 @@ func (p *remoteProgress) ackedOffset() int64 {
 	return p.acked
 }
 
+// remoteLag is the backlog of every followed remote path, summed into
+// one figure for the progress document.
+//
+// Progress.SetLag overwrites rather than accumulates, so a per-path
+// publish would report whichever path probed last -- the mistake the
+// local follower's publishLag was changed to stop making. The sum is
+// taken here instead, and a path that has not been probed yet simply
+// contributes nothing.
+type remoteLag struct {
+	mu sync.Mutex
+	by map[string]int64
+	p  *Progress
+}
+
+func newRemoteLag(p *Progress) *remoteLag {
+	return &remoteLag{by: map[string]int64{}, p: p}
+}
+
+// set records one path's backlog and republishes the total. A negative
+// figure -- the read head is past the size the last probe saw, which a
+// file growing between the two makes ordinary -- is nothing owed.
+func (l *remoteLag) set(path string, n int64) {
+	if l == nil {
+		return
+	}
+	if n < 0 {
+		n = 0
+	}
+	l.mu.Lock()
+	l.by[path] = n
+	total := int64(0)
+	for _, v := range l.by {
+		total += v
+	}
+	l.mu.Unlock()
+	l.p.SetLag(total)
+}
+
 // remoteObserver turns one remote tail's delivery outcomes into
 // checkpoints. One is registered per followed path.
 type remoteObserver struct {
@@ -711,7 +768,7 @@ func (i *Ingest) remoteStat(ctx context.Context, opts RemoteOptions, path string
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, rs *remoteStream, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string) (int64, error) {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, rs *remoteStream, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string, lag *remoteLag) (int64, error) {
 	args := sshArgs(opts)
 	dest := sshDest(opts)
 	start := progress.startFrom()
@@ -776,6 +833,11 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 				if serr != nil {
 					continue
 				}
+				// The probe already has both halves of the backlog, and
+				// this is the only clock a live connection has: without
+				// it lag_bytes would only move between connections, which
+				// on a tail that stays up for days is never.
+				lag.set(path, size-progress.pendingOffset())
 				switch {
 				case now != "" && ident != "" && now != ident:
 					// tail -F is already following the replacement while
@@ -887,6 +949,10 @@ func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target s
 			_ = i.cfg.Sink.Add(ctx, r, labels, keyHint(target, pos, n))
 		}
 	})
+	// The idle tick is this path's only regular clock, so it is where the
+	// unmatched-line sample reaches the progress document. Nothing
+	// collected it before, and a connection can stay up for days.
+	rs.mergeStats(i.cfg.Progress)
 	// Published even when the flush emitted nothing: the extractor may
 	// have been holding the offset for a window that has since closed on
 	// its own, and this is the only clock a quiet tail has.

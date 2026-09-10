@@ -219,8 +219,22 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		if l == "" {
 			return warns, Diag{"E001", "BY names an empty label; every grouping slot needs a label key"}
 		}
+		// E004, as 06-query.md section 12 says of an unknown label key
+		// "referenced in WHERE or BY" -- not a warning, and not W203,
+		// whose documented meaning is a field the catalogue has not seen
+		// recently.
+		//
+		// The catalogue is a superset of what the rows carry: observeSet
+		// records every label of every accepted sample, so a key it does
+		// not hold is a key no row in the set has. Grouping by one
+		// therefore does not group at all -- every row falls into the
+		// single slot whose value is absent, and a dashboard that asked
+		// for a line per host draws one line over all of them. That is
+		// the same silently-widened query the WHERE check refuses, and
+		// refusing it here costs a mistyped BY a red panel that names the
+		// label instead of a plausible graph of the wrong thing.
 		if s != nil && !s.HasLabel(q.From, l) {
-			warns = append(warns, Diag{"W203", fmt.Sprintf("label %q is not present on set %q; every series will share one group", l, q.From)})
+			return warns, Diag{"E004", fmt.Sprintf("unknown label %q on set %q; no row carries it, so grouping by it would put every row in one series", l, q.From)}
 		}
 	}
 	// A limit is checked at both ends. Only the upper end used to be, and

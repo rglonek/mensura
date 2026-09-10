@@ -7,25 +7,43 @@ import (
 )
 
 type parser struct {
-	toks []token
-	i    int
+	toks  []token
+	i     int
+	diags []Diag
 }
 
 // Parse turns MQL text into the canonical AST.
 func Parse(src string) (*Query, error) {
+	q, _, err := ParseDiags(src)
+	return q, err
+}
+
+// ParseDiags is Parse plus the diagnostics that only the *text* carries.
+//
+// Almost every MQL diagnostic is a property of the AST and belongs to
+// Validate, which is why Parse returned none for so long. W101 is the
+// exception: modifiers are a set, so the order they were written in does
+// not survive into the AST at all, and by the time anything else can look
+// at the query the evidence is gone. 06-query.md section 4.3 promises the
+// lint and section 12 lists the code; nothing ever produced it, so a
+// query written as `x PER SECOND DELTA` -- which reads as "a per-second
+// value, then a difference of it", and is executed as neither -- came
+// back from the editor's parse endpoint with no comment at all and then
+// silently printed as `x RATE`.
+func ParseDiags(src string) (*Query, []Diag, error) {
 	toks, err := lex(src)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	p := &parser{toks: toks}
 	q, err := p.parseQuery()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if p.cur().kind != tokEOF {
-		return nil, p.errf("unexpected %s after end of query", p.describe(p.cur()))
+		return nil, nil, p.errf("unexpected %s after end of query", p.describe(p.cur()))
 	}
-	return q, nil
+	return q, p.diags, nil
 }
 
 func (p *parser) cur() token  { return p.toks[p.i] }
@@ -274,22 +292,39 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 	}
 
 	seen := map[string]bool{}
-	mark := func(k string) error {
+	// rank is the modifier's position in the canonical order Print emits,
+	// so a written sequence whose ranks do not increase is one the printer
+	// will reorder. Recorded rather than acted on: the order is a lint, not
+	// a semantic (06-query.md section 4.3), so the flags below are set the
+	// same way whichever order they arrived in.
+	lastRank, outOfOrder := 0, false
+	mark := func(k string, rank int) error {
 		if seen[k] {
 			return &ParseError{p.cur().pos, "E006: modifier " + k + " given twice"}
 		}
 		seen[k] = true
+		if rank < lastRank {
+			outOfOrder = true
+		}
+		lastRank = rank
 		return nil
 	}
+	defer func() {
+		if outOfOrder {
+			p.diags = append(p.diags, Diag{Code: "W101", Msg: fmt.Sprintf(
+				"modifiers on %q are written out of canonical order; they are applied in the order DELTA/PER SECOND, NEGATE, CLAMP, GAP, SSE, REQUIRED whatever order they are written in, and that is the order this query prints back as",
+				fe.Name())})
+		}
+	}()
 	for {
 		switch {
 		case p.acceptKeyword("RATE"):
-			if err := mark("RATE"); err != nil {
+			if err := mark("RATE", 1); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Delta, fe.Modifiers.PerSecond = true, true
 		case p.acceptKeyword("DELTA"):
-			if err := mark("DELTA"); err != nil {
+			if err := mark("DELTA", 1); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Delta = true
@@ -297,22 +332,22 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			if err := p.expectKeyword("SECOND"); err != nil {
 				return fe, err
 			}
-			if err := mark("PER SECOND"); err != nil {
+			if err := mark("PER SECOND", 2); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.PerSecond = true
 		case p.acceptKeyword("NEGATE"):
-			if err := mark("NEGATE"); err != nil {
+			if err := mark("NEGATE", 3); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Negate = true
 		case p.acceptKeyword("REQUIRED"):
-			if err := mark("REQUIRED"); err != nil {
+			if err := mark("REQUIRED", 7); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Required = true
 		case p.acceptKeyword("GAP"):
-			if err := mark("GAP"); err != nil {
+			if err := mark("GAP", 5); err != nil {
 				return fe, err
 			}
 			d, err := p.duration()
@@ -321,7 +356,7 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			}
 			fe.Modifiers.GapMs = &d
 		case p.acceptKeyword("SSE"):
-			if err := mark("SSE"); err != nil {
+			if err := mark("SSE", 6); err != nil {
 				return fe, err
 			}
 			s, err := p.sse()
@@ -330,7 +365,7 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			}
 			fe.Modifiers.SSE = s
 		case p.acceptKeyword("CLAMP"):
-			if err := mark("CLAMP"); err != nil {
+			if err := mark("CLAMP", 4); err != nil {
 				return fe, err
 			}
 			c, err := p.clamp()

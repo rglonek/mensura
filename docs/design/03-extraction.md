@@ -130,6 +130,14 @@ Multiline semantics: a line containing
 `start_contains` opens (or replaces) a buffered record; subsequent lines
 matching `continue_regex` have the nominated capture group appended; a new
 start line, a timestamp regression, stream close, or `idle_timeout` flushes it.
+
+Both numbers are validated at compile time, because both fail *open* rather
+than closed. `max_record_bytes` is read everywhere as `n > 0`, so a negative
+value removes the bound instead of setting one; an `idle_timeout` that is
+negative or zero is never *not* elapsed, so every buffered record is flushed on
+the next tick and the rule joins nothing. A declaration that quietly does the
+opposite of what it says is refused, the way `identity.scan_lines` and a
+negative `sets:` retention are.
 Timestamp regression inside a multiline record is an error for that record,
 not a silent join.
 

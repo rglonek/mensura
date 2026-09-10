@@ -437,7 +437,10 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	q, err := mql.Parse(body.Text)
+	// ParseDiags, not Parse: W101 is a property of the text and is gone
+	// once the AST exists, so the endpoint the editor calls on every
+	// keystroke is the only place it can be reported.
+	q, lints, err := mql.ParseDiags(body.Text)
 	if err != nil {
 		var pe *mql.ParseError
 		if asParseError(err, &pe) {
@@ -448,6 +451,7 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	warns, verr := mql.Validate(q, a.store.Schema(), a.store.cfg.MaxSeriesPerGraph, a.store.cfg.MaxDataPointsReceived)
+	warns = append(lints, warns...)
 	out := map[string]any{"ast": q, "warnings": warns}
 	if verr != nil {
 		out["error"] = verr.Error()

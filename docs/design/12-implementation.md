@@ -139,6 +139,14 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | An epoch unit that cannot describe the value is a timestamp failure | `pkg/extract/fixes_test.go:TestEpochSecondsRefusesAValueThatCannotBeSeconds` |
 | An excluded sender is refused before its body is read | `internal/ingest/fixes_test.go:TestReceiveHTTPSamplesRefusesTheSenderBeforeReadingTheBody` |
 | An out-of-range `bucket_index` is named, and the version still moves | `internal/store/fixes_test.go:TestFieldMetaRefusesAnOutOfRangeBucketIndex`, `…:TestFieldMetaVersionTracksRealChanges` |
+| Interleaved streams with no `BY` are reported, not merged in silence | `internal/store/review_test.go:TestNoByInterleaveWarns` |
+| A declaration is on disk before the next catalogue tick | `…:TestDeclarationsArePersistedImmediately`, `…:TestRepeatedDeclarationDoesNotResave` |
+| Modifiers written out of canonical order are linted, not reinterpreted | `pkg/mql/review_test.go:TestModifierOrderLint`, `…:TestModifierOrderLintNamesTheField` |
+| Every acquisition path reports its backlog and its unmatched lines | `internal/ingest/review_test.go:TestRemoteFollowPublishesLag`, `…:TestFollowReportsUnmatchedLines`, `…:TestMergeStreamIsIdempotent` |
+| `follow` skips a binary file, as `batch` does | `…:TestFollowSkipsBinaryFiles` |
+| A framing bound that would remove itself is refused | `pkg/extract/review_test.go:TestFramingBoundsAreValidated` |
+| A replay from `HeldFrom` reproduces exactly the undelivered results | `…:TestAggregationReplayFromHeldFromIsLossless`, `…:TestAggregationReplayIsLosslessOverRandomStreams`, `…:TestMultilineReplayFromHeldFromIsLossless`, `…:TestMultilineReplayIsLosslessOverRandomStreams` |
+| Holding a span keeps the list bounded and the floor advancing | `…:TestHoldListStaysBoundedWithInterleavedKeys`, `…:TestHoldFloorStillAdvances` |
 
 ## 5. Implementation status
 
@@ -2064,6 +2072,192 @@ because `DropSet` owns `dropMu` exclusively for its whole duration
   so an impossible query still opens no shard, and every format answers
   with the shape it promises.
 
+### 6.106 The interleaving warning the aggregation caveat depends on
+
+Section 8 of [06](06-query.md) states the caveat plainly: with no `BY`,
+rows from many streams land in one series, and where two of them report in
+the same millisecond the walk's duplicate-timestamp rule (stage 2) keeps
+the first and drops the rest. It names `W301` as the mitigation — "until
+then the language tells the truth about what it does" — and section 7 of
+this document called `W301` the only mitigation there is. Nothing ever
+emitted it. A panel selecting `cpu` with no `BY` over ten hosts reporting
+on the same second drew five points out of fifty, each one whichever
+host's row the scan reached first, with no diagnostic anywhere: the
+plausible-looking wrong graph the whole diagnostics table exists to
+prevent.
+
+`runTimeseries` now counts what the walk actually dropped. The count is
+taken after `render.Series`, which sorts the input slice in place, so
+adjacent equal timestamps in that slice *are* the dropped samples rather
+than an estimate that depends on scan order. It is worth saying with a
+`BY` clause too — two rows becoming one point is a loss either way — so
+the code is emitted whenever collapsing happened and only the suggestion
+differs: with no `BY`, the warning names the set's own label keys.
+
+### 6.107 The modifier-order lint has to be raised where the text is
+
+`W101` is documented in [06](06-query.md) §4.3 and listed in §12, and
+nothing produced it either. It could not have: modifiers are a *set*, so
+the order they were written in does not survive into the AST, and
+`Validate` — which sees only the AST — has no evidence left to look at.
+
+`mql.ParseDiags` is `Parse` plus the diagnostics that belong to the text
+alone. The parser ranks each modifier by its position in the order `Print`
+emits, and a written sequence whose ranks do not increase raises `W101`
+naming the field. Nothing about execution changes: the flags are set the
+same way whichever order they arrive in, which is the property §4.3
+promises. `Parse` keeps its signature; the parse endpoints —
+`/v1/parse`, and the plugin's `parse` resource in both embedded and proxy
+mode — merge the lint into the warnings they already return, which is
+where the query editor reads them.
+
+The canonical order the lint measures against is the printer's:
+`DELTA`/`PER SECOND`, `NEGATE`, `CLAMP`, `GAP`, `SSE`, `REQUIRED`. §4.3's
+parenthetical named the *execution* stage order instead, which is a
+different sequence and not the one the canonical text uses; it has been
+corrected there.
+
+### 6.108 An unknown `BY` label is an error, as the table always said
+
+§12 of [06](06-query.md) lists `E004` as "unknown label key referenced in
+`WHERE` **or `BY`**". The `WHERE` half was enforced; the `BY` half
+produced a `W203` — a code whose documented meaning is a field the
+catalogue has not seen recently — and carried on.
+
+The catalogue is a superset of what the rows carry: `observeSet` records
+every label of every accepted sample, so a key it does not hold is a key
+no row in the set has. Grouping by one therefore does not group at all.
+Every row falls into the single slot whose value is absent, and a
+dashboard that asked for a line per host draws one line over all of them —
+the same silently widened query the `WHERE` check refuses. It is now
+`E004`, and the message says why. `W203`'s entry has been widened to
+cover the other thing it is used for, a field that is not in the
+catalogue at all.
+
+### 6.109 A declaration is persisted when it arrives
+
+Everything else in the catalogue is rediscovered by the next write:
+`observeSet` re-learns a set's labels, its fields and its time range from
+the samples themselves, so losing the last interval of it to an unclean
+stop costs nothing. A *declaration* is not rediscovered. `Sink.DeclareFields`
+and `DeclareSets` mark it sent and never repeat it, so it travels once per
+ingest process — and it was only ever persisted by the thirty-second
+catalogue timer.
+
+An unclean stop inside that window therefore lost it for good, with the
+ingester still running and never sending it again. For a `sets:` block
+that means exactly the failure `SetRetentionFor`'s own comment describes
+preventing: the set comes back with no retention and no shard width, is
+routed to the unsharded `@all` shard that the sweep skips, and is then
+kept forever with nothing saying so. `Write` now saves the catalogue as
+soon as a declaration has changed it — measured by `CatalogueVersion`, so
+a declaration repeated on every ingest start still costs nothing — and
+logs rather than fails, because a metadata write that could not land is
+no reason to make the ingester resend data the store is about to hold.
+
+### 6.110 A checkpoint may not land inside a record that has been emitted
+
+`HeldFrom` names the oldest position the stream still needs a replay to
+start at, and it named the oldest *open* multiline buffer or aggregation
+window. For a profile with one aggregation key that is the whole answer.
+With several it is not, and several is the ordinary case: `on: [op]` opens
+one window per value of `op`, and those windows interleave.
+
+Key `a`'s window closes while key `b`'s, opened later, is still open. The
+floor rises to `b`'s mark — correctly as far as `a` goes, whose sample has
+already been handed to the sink — but `b`'s mark sits in the middle of the
+records that fed `a`. A restart, or the rewind that a delivery hole
+performs, re-reads from there. Those records do not rebuild `a`'s window:
+they open a *new* one, starting at the timestamp of whichever record came
+first after the resume point, and the record that in the original run
+opened the *next* real window is absorbed into it instead. So the store
+gains a row nobody measured and loses one that was, both in silence, and
+`mode: increment` counters are exactly what this is for.
+
+An aggregator now remembers the position of the last record folded into
+it, so a window has a span rather than a point, and the hold list keeps an
+entry after its window closes. The floor is pulled back past any emitted
+window whose span contains it, to that window's own start, where the
+replay rebuilds it whole and the duplicate collapses under a
+content-addressed key. One backward pass does it: the list is in mark
+order, the floor only falls, and an entry at or past the floor cannot
+contain it.
+
+The floor never falls between calls either — a window's span only grows
+while it is open, and while it is open it pins the floor to its own mark —
+which is what lets the list be pruned without losing a constraint that
+matters later: an emitted window goes once a position at or past the
+current floor can no longer land strictly inside its span. A window that
+absorbed only the record that opened it spans a single position and can
+never contain anything, which is every window on a driver that does not
+mark its records at all.
+
+A multiline record has the same shape and needed the same treatment. It
+spans the line that opened it and every line joined into it, and an
+aggregation window opened between two of them pins the floor there. A
+replay from inside the span meets each continuation with no buffer open,
+so instead of belonging to the record it is judged on its own — and a
+continuation a pattern happens to match becomes a whole sample the source
+never reported, while the record it should have joined comes back
+shorter. A record's span is held the same way once it has been emitted,
+including the line that flushed it when that line was itself a
+continuation (the timestamp-regression path) and a continuation that
+matched no join rule, because both of those have a different fate
+depending on whether a buffer is open.
+
+`pkg/extract/review_test.go` checks the property directly: for every crash
+point in a stream, what was delivered plus what a replay from `HeldFrom`
+produces has to be exactly what an uninterrupted run produced — a missing
+result is data loss and an extra one is a row nobody measured — over two
+worked interleavings and a hundred and twenty randomised streams, half of
+them mixing multiline records with aggregation across several keys. The
+trade is only worth making if the floor still moves, so
+`TestHoldFloorStillAdvances` drives five keys sharing one window with
+heavily overlapping spans and asserts the lag stays in the order of a
+window width.
+
+### 6.111 Smaller corrections
+
+- **`lag_bytes` on an SSH follow.** The remote follower learns the file's
+  size on every probe and knows its own read position, and published
+  neither, so `lag_bytes` read 0 for the whole life of a remote follow —
+  which is exactly what a caught-up tail reads like, on the one number an
+  operator watches to find out that it is not. Both the between-connection
+  probe and the in-connection watcher now publish it. The figure is summed
+  across paths first, for the reason `publishLag` sums across tailers:
+  `Progress.SetLag` overwrites, so a per-path publish would report
+  whichever path probed last.
+- **`first_unmatched` on the continuous modes.** `Progress.MergeStream`
+  was called from `processFile` and nowhere else, so the single most
+  useful spec-debugging output there is was empty forever on follow, SSH
+  follow and receive — the three modes that run unattended, where "the
+  spec matches nothing" is hardest to notice. It could not be called from
+  them as it stood: `extract.Stats` keeps its sample for the life of the
+  stream, and a stream that lives for the life of the process can only be
+  merged repeatedly, which appended ten copies of one line. It merges by
+  value now, so it is idempotent, and the follower (per sweep and on
+  retirement), the receiver (per idle tick and per drained peer) and the
+  remote follower (per idle tick and per connection) all call it.
+- **`follow` skips a binary file, as `batch` does.** §4.2 of
+  [02](02-ingest.md) classifies a file holding a NUL byte in its first
+  block as binary and ignores it, and says nothing about that depending on
+  how the file was opened. Only `processFile` did it, so a glob like
+  `/var/log/*` — which matches `wtmp`, `lastlog` and every journal
+  fragment — handed those bytes to the profile's regexes on every poll,
+  and any pattern loose enough to match invented samples out of them. The
+  sniff is now in `ensure` too, counted on the same counter, and the path
+  goes on the same slow retry the no-profile case uses.
+- **A framing bound that is declared may not be ignored.** Every reader of
+  `framing.max_record_bytes` tests `n > 0`, so a negative value *removed*
+  the cap the operator was trying to set — the failure the cap exists to
+  prevent, reached by declaring the cap. A `multiline.idle_timeout` that
+  is negative or zero is never *not* elapsed, so every buffered record was
+  flushed on the next idle tick and the rule joined nothing. Both are
+  refused at compile time now, on the same grounds as
+  `identity.scan_lines` (§6.51) and a negative `sets:` retention.
+- **`engine.indexKeyValue` is gone.** It recovered the indexed value from
+  an index key and nothing has ever called it.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
@@ -2077,6 +2271,27 @@ because `DropSet` owns `dropMu` exclusively for its whole duration
   fails, on the same principle as `tls.client_ca`: a declaration that does
   nothing is worse than one that is rejected.
 - **Sub-millisecond timestamps are truncated**, per open question 1.
+- **The unsharded shard is never swept.** A set written before any
+  retention was declared for it lands in `@all`, and `RunRetention` skips
+  that shard by name because it carries no time range to compare against a
+  horizon. In the ordinary case there is nothing there: `Write` applies a
+  request's `set_meta` before its batches, so the first batch of the first
+  ingester is already sharded, and §6.109 keeps the declaration across a
+  restart. A second ingester declaring retention for a set an earlier one
+  had already filled without it leaves those rows immortal; emptying them
+  needs a row-wise sweep of `@all`, which is not built.
+- **`NOT label = "v"` and `label != "v"` are not the same predicate.** The
+  inequality requires the row to carry the label (§4.4 of
+  [06](06-query.md)); the negation is a logical complement, so it also
+  matches every row that does not. Both readings are defensible and the
+  grammar offers both; the asymmetry is recorded here rather than resolved,
+  because changing either one silently changes what a stored panel draws.
+- **Documented CLI surface that does not exist.** `mensura-store
+  convert-dashboard`, `mensura-ingest --label-from-path`,
+  `--read-only-input`, and the config file with several `inputs:` entries
+  are described in [02](02-ingest.md) and [06](06-query.md) and are not
+  built. The subcommands that are built cover the single-input case each
+  of them is sugar for.
 - **Retention does not reclaim label dictionary entries.** There is one
   dictionary per label key for the whole store ([05](05-storage.md) §8,
   ADR-004) and every stored row holds an index into it, so a value dropped

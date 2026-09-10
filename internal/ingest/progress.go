@@ -113,12 +113,24 @@ func (p *Progress) AddSamples(n int64) {
 	p.mu.Unlock()
 }
 
-// MergeStream folds a finished stream's sample of unmatched lines in,
-// which is the single most useful spec-debugging output there is.
+// MergeStream folds a stream's sample of unmatched lines in, which is the
+// single most useful spec-debugging output there is.
 //
 // The stream's own sample count is deliberately not merged: AddSamples
 // counts results as they are handed to the sink, on every path, and adding
 // both would double every batch-imported sample.
+//
+// It is idempotent, which is what lets the continuous acquisition paths
+// call it. extract.Stats keeps its samples for the life of the stream, and
+// a stream that lives for the life of the process -- a tailer, a peer, an
+// SSH connection -- can only be merged repeatedly. Appending
+// unconditionally then filled the document with ten copies of the same
+// line, so the only path that called this at all was batch import, and
+// `first_unmatched` was empty forever on follow, SSH follow and receive:
+// the one output that says *why* a spec matched nothing, missing from the
+// three modes that run unattended. Merging by value also collapses the
+// same line arriving from several streams, which is the right summary
+// when the field holds examples rather than a census.
 func (p *Progress) MergeStream(s *extract.Stats) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -126,7 +138,16 @@ func (p *Progress) MergeStream(s *extract.Stats) {
 		if len(p.c.FirstUnmatched) >= 10 {
 			break
 		}
-		p.c.FirstUnmatched = append(p.c.FirstUnmatched, l)
+		dup := false
+		for _, have := range p.c.FirstUnmatched {
+			if have == l {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			p.c.FirstUnmatched = append(p.c.FirstUnmatched, l)
+		}
 	}
 }
 

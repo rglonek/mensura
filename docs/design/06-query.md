@@ -146,8 +146,16 @@ whitepaper's Appendix B, given a syntax.
 Order independence is enforced by the parser: modifiers are collected into a
 set, duplicates are an error, and the printer emits them in canonical order, so
 `x PER SECOND DELTA` prints back as `x RATE`. A query written in a misleading
-order produces the lint `W101: modifiers are applied in canonical order
-(DELTA → NEGATE → CLAMP → PER SECOND); written order is ignored`.
+order produces the lint `W101`, naming the field: modifiers are applied in the
+canonical order `DELTA`/`PER SECOND` → `NEGATE` → `CLAMP` → `GAP` → `SSE` →
+`REQUIRED` whatever order they are written in, and that is the order the query
+prints back as. (The order above is the printer's, which is what makes the
+canonical *text*; the execution stages it corresponds to are in
+[07-downsampling.md](07-downsampling.md) §3, and `PER SECOND` runs after
+`CLAMP` there.) The lint is a property of the text rather than of the AST —
+modifiers are a set, so the written order does not survive parsing — so it
+comes from `mql.ParseDiags` rather than from validation, and reaches the
+editor through the `parse` endpoint's warnings.
 
 ### 4.4 `WHERE`
 
@@ -173,7 +181,9 @@ Predicates address **labels** (interned strings) and field presence.
 
 ### 4.5 `BY`
 
-Group-by labels. The series identity is the ordered tuple of `BY` values plus
+Group-by labels. A key the set's catalogue does not carry is `E004`, not a
+silently merged series: no row holds it, so grouping by it would put every
+row in one slot. The series identity is the ordered tuple of `BY` values plus
 the field's display name, hashed to a stable group hash. Labels with an empty
 value are omitted from the legend but still distinguish series.
 
@@ -336,10 +346,13 @@ Aggregation caveat, stated rather than hidden: with no `BY`, rows from many
 streams land in one series, and where two streams report at the same
 millisecond the duplicate-timestamp rule (stage 2) keeps the first and drops
 the rest. This is correct for a single-stream series and misleading for a
-multi-stream one, so validation emits `W301: no BY clause with multiple
-streams in range; series will interleave, consider BY host`. A future
-`AGGREGATE sum|avg|max BY …` clause (roadmap M5) is the real fix; until then
-the language tells the truth about what it does.
+multi-stream one, so the executor emits `W301` whenever the walk actually
+dropped a sample that way, saying how many and — with no `BY` clause — naming
+the set's own label keys to group by. It is the loss itself that is reported,
+not a guess from the shape of the query: the count is taken after the walk has
+sorted the series, so it is the number of samples that really did collapse. A
+future `AGGREGATE sum|avg|max BY …` clause (roadmap M5) is the real fix; until
+then the language tells the truth about what it does.
 
 ## 9. Safety gates
 
@@ -410,20 +423,20 @@ in tests. Warnings never fail a query; errors always do.
 | `E001` | error | Parse error (position and expected-token set included); also a hand-built AST the grammar cannot express — an empty predicate arm, or an empty field, `BY` or comparison name |
 | `E002` | error | Unknown set |
 | `E003` | error | Unknown field on set, and the field is `REQUIRED` |
-| `E004` | error | Unknown label key referenced in `WHERE` or `BY` (for `HAS`/`MISSING`, a name that is neither a field nor a label) |
+| `E004` | error | Unknown label key referenced in `WHERE` or `BY` (for `HAS`/`MISSING`, a name that is neither a field nor a label). The catalogue holds every label any accepted sample carried, so a key it does not hold is one no row has: the comparison could never match, and the grouping would put every row in one series |
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
 | `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
 | `E007` | error | `LIMIT` above the datasource maximum |
 | `E008` | error | an unknown `FORMAT`, `SSE` mode or `CLAMP ELSE`; `FORMAT logs`/`table` combined with a timeseries-only modifier; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |
-| `W101` | warning | Modifiers written in non-canonical order; canonical order applies |
+| `W101` | warning | Modifiers written in non-canonical order; canonical order applies. Raised by `ParseDiags`, not by validation: the written order does not survive into the AST |
 | `W102` | warning | Counter-kind field selected without `RATE`/`DELTA` |
 | `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |
 | `W104` | warning | A `string`-kind field selected under `FORMAT timeseries`: only values that read as numbers are plotted, so the series may draw nothing |
 | `W201` | warning | A comparison matches no dictionary value; result will be empty |
 | `W202` | warning | Regex matches every value of the label; clause folded away |
-| `W203` | warning | Field is `stale` in the catalogue (not seen recently) |
-| `W301` | warning | No `BY` clause while multiple streams are in range; series will interleave |
+| `W203` | warning | Field is not in the catalogue for the set, or is `stale` in it (not seen recently) |
+| `W301` | warning | The walk dropped samples that shared a timestamp inside one series; with no `BY` clause that is streams interleaving |
 | `W302` | warning | Query used in an alert rule without `EVERY` |
 | `W401` | warning | Safety gate tripped; results are partial (accompanies the response error) |
 

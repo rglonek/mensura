@@ -39,13 +39,16 @@ func (l *localService) Hello(context.Context) (wire.Hello, error) {
 }
 
 func (l *localService) Parse(_ context.Context, text string) (*mql.Query, []mql.Diag, error) {
-	q, err := mql.Parse(text)
+	// ParseDiags carries the diagnostics that only the text has: the
+	// modifier-order lint cannot be recovered from the AST, because
+	// modifiers are a set.
+	q, lints, err := mql.ParseDiags(text)
 	if err != nil {
 		return nil, nil, err
 	}
 	cfg := l.store.Config()
 	warns, verr := mql.Validate(q, l.store.Schema(), cfg.MaxSeriesPerGraph, cfg.MaxDataPointsReceived)
-	return q, warns, verr
+	return q, append(lints, warns...), verr
 }
 
 // remoteService forwards to a store that owns the data directory. Same
@@ -83,7 +86,7 @@ func (r *remoteService) Hello(ctx context.Context) (wire.Hello, error) {
 // and a round trip per keystroke in the editor would be wasteful. The
 // catalogue-dependent validation still comes from the store.
 func (r *remoteService) Parse(ctx context.Context, text string) (*mql.Query, []mql.Diag, error) {
-	q, err := mql.Parse(text)
+	q, lints, err := mql.ParseDiags(text)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -93,7 +96,7 @@ func (r *remoteService) Parse(ctx context.Context, text string) (*mql.Query, []m
 		// never ran, and answering with no diagnostics reports a query as
 		// valid when nothing checked it. An unreachable store is the
 		// answer here.
-		return q, nil, fmt.Errorf("the query could not be validated: the store's catalogue is unreachable: %w", err)
+		return q, lints, fmt.Errorf("the query could not be validated: the store's catalogue is unreachable: %w", err)
 	}
 	// The upstream store's ceilings, so proxy mode validates a LIMIT the
 	// same way embedded mode does rather than accepting anything.
@@ -102,7 +105,7 @@ func (r *remoteService) Parse(ctx context.Context, text string) (*mql.Query, []m
 		maxSeries, maxPoints = h.MaxSeriesPerGraph, h.MaxDataPointsReceived
 	}
 	warns, verr := mql.Validate(q, catalogueSchema{cat}, maxSeries, maxPoints)
-	return q, warns, verr
+	return q, append(lints, warns...), verr
 }
 
 // catalogueSchema adapts a fetched catalogue to the MQL validator.

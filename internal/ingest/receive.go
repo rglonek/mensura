@@ -316,6 +316,7 @@ func (r *receiver) drain(ctx context.Context, peers []*peerStream) {
 	for _, ps := range peers {
 		ps.mu.Lock()
 		results := ps.ex.Flush()
+		r.ing.cfg.Progress.MergeStream(&ps.ex.Stats)
 		ps.mu.Unlock()
 		r.emit(ctx, ps, results)
 	}
@@ -409,6 +410,12 @@ func (r *receiver) flushIdle(ctx context.Context, now time.Time) {
 	for _, ps := range r.peers() {
 		ps.mu.Lock()
 		results := ps.ex.FlushIdle(now)
+		// Under the peer's own lock, because extract.Stats belongs to the
+		// extractor this lock guards. This is the only place a receiving
+		// ingest collects the unmatched lines that say why a listener is
+		// storing nothing; without it `first_unmatched` stayed empty for
+		// the life of the process.
+		r.ing.cfg.Progress.MergeStream(&ps.ex.Stats)
 		ps.mu.Unlock()
 		r.emit(ctx, ps, results)
 	}
