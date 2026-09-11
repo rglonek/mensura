@@ -2476,7 +2476,39 @@ resolution short of an explicit `EVERY`. `render.SingleWindow` is the
 undoubled width; `runHeatmap` and `Explain` both read the heatmap's width
 from one place, so the plan and the executor cannot disagree.
 
-### 6.123 Smaller corrections
+### 6.123 A checkpoint is fsynced on a timer, as it always said
+
+[02](02-ingest.md) §5 describes a resume record as "written atomically
+(temp + rename) and fsynced on a timer and on clean shutdown". The timer
+was not there: `EndFlush` persisted every acked commit, and a commit
+happens whenever the batch fills or the 50 ms flush tick finds samples.
+Each one is a write, an fsync, a rename and an fsync of the directory,
+serialised on `CheckpointStore`'s own mutex, on the goroutine that also
+holds the sink's delivery lock -- so a busy follow of fifty files was
+thousands of fsync pairs a second and the state directory became the
+pipeline's throughput ceiling. On a network-mounted one it is a hard stop.
+
+`checkpointSaveInterval` (one second) is now the floor between writes for
+one stream, in both followers -- `tailer` for local files, `checkpointBox`
+for SSH paths. The in-memory acked offset still advances on every commit,
+because that is what `BeginFlush` and `EndFlush` reason about; only the
+disk copy is coalesced, and a deferred record is *owed* rather than
+dropped, so the latest offset is what eventually lands. It is written by
+whatever clock the path has -- the poll sweep locally, the probe and idle
+ticks over SSH -- and forced where deferring it would lose it: a
+retirement that removes the tailer from the map, the end of an SSH
+connection, and both shutdown exits, after the final flush.
+
+Two writes are never deferred, because the offsets on disk stop describing
+the file the moment they happen: the rewind a rotation performs, and the
+record that carries a new remote file identity.
+
+What it costs is that an unclean stop resumes from a record up to an
+interval behind, so at most a second of records is re-read. That is the
+guarantee this pipeline already offers everywhere else -- at-least-once,
+made exactly-once by content-addressed row keys (§6.5).
+
+### 6.124 Smaller corrections
 
 - **An aggregation key is length-prefixed.** The window key joined its
   components with `\x00` and paired each `on` key to its value with `=`,
