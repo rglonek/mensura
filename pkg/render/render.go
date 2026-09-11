@@ -79,6 +79,20 @@ const ssePadMs = 500
 // density. w == 0 is not special-cased; the strict boundary test below
 // degenerates gracefully to "no downsampling".
 func Window(rangeMs int64, maxDataPoints int, intervalMs int64) int64 {
+	return SingleWindow(rangeMs, maxDataPoints, intervalMs) * 2
+}
+
+// SingleWindow is the same width without the doubling, for a reduction
+// that emits one point per window instead of a min/max pair.
+//
+// The doubling in Window is not a general property of the window, it is
+// bookkeeping for the walk: two points come out of each one, so the
+// window is sized to two points' worth of the render budget and the
+// output still lands on what the panel asked for. A heatmap column is a
+// single summed value, so charging it the doubled width spends the whole
+// budget on half the columns -- the panel asked for n and drew n/2, with
+// nothing saying so and no way to ask for the rest short of EVERY.
+func SingleWindow(rangeMs int64, maxDataPoints int, intervalMs int64) int64 {
 	if maxDataPoints <= 0 {
 		maxDataPoints = 1
 	}
@@ -89,7 +103,7 @@ func Window(rangeMs int64, maxDataPoints int, intervalMs int64) int64 {
 	if w < 0 {
 		w = 0
 	}
-	return w * 2
+	return w
 }
 
 // Series applies the walk to one series and returns the points to draw.

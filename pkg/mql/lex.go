@@ -53,7 +53,23 @@ type ParseError struct {
 
 func (e *ParseError) Error() string { return fmt.Sprintf("E001 at %d: %s", e.Pos, e.Msg) }
 
+// MaxQueryBytes bounds the MQL text this package will lex.
+//
+// It is not a style rule, it is a memory bound. Lexing materialises one
+// token per punctuation character before the parser sees any of them, and
+// a token is several times the size of the byte it came from -- so a body
+// at the store's default max_request_bytes of 32 MiB, posted to
+// /v1/parse as 32 million parentheses, turned into well over a gigabyte
+// of tokens per concurrent request. Every other buffer this system holds
+// is bounded; this one was the query editor's own endpoint. A megabyte is
+// orders of magnitude more than any hand-written or machine-generated
+// query needs.
+const MaxQueryBytes = 1 << 20
+
 func lex(src string) ([]token, error) {
+	if len(src) > MaxQueryBytes {
+		return nil, &ParseError{0, fmt.Sprintf("query is %d bytes, which is longer than the %d-byte limit", len(src), MaxQueryBytes)}
+	}
 	l := &lexer{src: src}
 	for {
 		l.skipSpaceAndComments()

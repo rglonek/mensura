@@ -108,6 +108,14 @@ collide with keywords or contain non-word characters are double-quoted.
 
 Comments: `--` to end of line.
 
+Two bounds apply to the text and to the AST alike, because the parser is
+recursive descent and a Go stack overflow is a fatal runtime error rather
+than a recoverable panic: a query may be at most 1 MiB, and a `WHERE`
+predicate may nest at most 64 levels. The deepest predicate in this
+document is three. The AST is held to the same depth by the validator, so
+an AST that validates is one `Print` can render and the parser can read
+back ([12](12-implementation.md) §6.118).
+
 ## 4. Semantics
 
 ### 4.1 `FROM`
@@ -248,7 +256,9 @@ FORMAT heatmap
 
 `HISTOGRAM(name)` expands to the bucket-set's member fields, sums counts per
 bucket per window, and emits a heatmap frame with real numeric bucket edges
-from the declaration. Bucket counts are reduced by **sum**, not by the min/max
+from the declaration. A column is one summed value, so the window is the
+undoubled width of [07](07-downsampling.md) §2 rather than the min/max
+pair's; `EVERY` overrides it as it does everywhere else. Bucket counts are reduced by **sum**, not by the min/max
 walk: a line asks what the extreme was, a heatmap column asks how many fell in
 the bucket ([12-implementation.md §6.4](12-implementation.md)). Grouping by a label yields one heatmap per group, so
 "per host" is a `BY` clause rather than a feature request.

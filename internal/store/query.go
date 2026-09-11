@@ -597,13 +597,7 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		return fmt.Errorf("query: bucket set %q has no buckets on set %q", name, q.From)
 	}
 
-	window := render.Window(req.ToMs-req.FromMs, req.MaxPoints, req.IntervalMs)
-	if q.EveryMs != nil {
-		window = *q.EveryMs
-	}
-	if window <= 0 {
-		window = 1
-	}
+	window := heatmapWindow(q, req)
 	type key struct {
 		group  string
 		bucket int
@@ -716,6 +710,28 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
 	}
 	return nil
+}
+
+// heatmapWindow is the column width of a heatmap.
+//
+// It is render.SingleWindow rather than render.Window because a heatmap
+// column carries one summed value, not the min/max pair the doubling in
+// Window exists to make room for: charging a heatmap the doubled width
+// spent the panel's whole budget on half the columns it asked for.
+// Explain reports this same number for a heatmap query, so the plan and
+// the executor cannot disagree.
+func heatmapWindow(q *mql.Query, req *wire.QueryRequest) int64 {
+	window := render.SingleWindow(req.ToMs-req.FromMs, req.MaxPoints, req.IntervalMs)
+	if q.EveryMs != nil {
+		window = *q.EveryMs
+	}
+	// A zero or negative width is not a window; the executor divides by
+	// it, so one millisecond -- which is "no bucketing" at the resolution
+	// a timestamp has -- is the degenerate case.
+	if window <= 0 {
+		window = 1
+	}
+	return window
 }
 
 // floorTo rounds a timestamp down onto a window boundary. Go's % keeps the
@@ -1226,15 +1242,20 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 			"gap_ms": f.spec.GapMs, "clamp_else_raw": f.spec.ClampElseRaw,
 		})
 	}
-	// Clamped exactly as runTimeseries clamps it. Reporting a window the
-	// executor would never use makes Explain describe a plan that is not
-	// the plan, which is the one thing this endpoint may not do.
+	// Clamped exactly as the executor clamps it, and taken from the same
+	// place: reporting a window the executor would never use makes
+	// Explain describe a plan that is not the plan, which is the one
+	// thing this endpoint may not do. A heatmap column is a single summed
+	// value and is sized by its own rule.
 	window := render.Window(req.ToMs-req.FromMs, req.MaxPoints, req.IntervalMs)
 	if q.EveryMs != nil {
 		window = *q.EveryMs
 	}
 	if window < 0 {
 		window = 0
+	}
+	if q.Format == mql.FormatHeatmap {
+		window = heatmapWindow(q, req)
 	}
 	return map[string]any{
 		"shards":            p.shards,

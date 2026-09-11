@@ -617,10 +617,27 @@ func (s *Store) SetRetentionFor(set string, retention, shard time.Duration) {
 	if retention >= 0 {
 		s.setRetention[set] = retention
 	}
+	shardChanged := false
 	if shard > 0 {
+		shardChanged = s.setShard[set] != shard
 		s.setShard[set] = shard
 	}
 	s.retentionMu.Unlock()
+
+	// Said out loud, the way a width from the config file is at startup.
+	// The suffix encoding can only express whole days and the hour counts
+	// that divide one, so anything else is rounded down -- and a spec is
+	// the only place that rounding happened in silence, because
+	// warnInexactShardWidths reads cfg and a spec-supplied width never
+	// goes there. An operator who wrote `shard: 30m` got hourly shards
+	// with nothing anywhere saying so. Only on a change, because the
+	// declaration arrives again on every ingest process start.
+	if shardChanged {
+		if hours, exact := normaliseShardWidth(shard); !exact {
+			s.cfg.Logger.Printf("WARNING set %s declares a shard width of %s, which is not a whole number of days or an hour count dividing a day; using %dh",
+				set, shard, hours)
+		}
+	}
 
 	// Persisted alongside the catalogue. The declaration travels once per
 	// ingest process, so an ingester that is already running never

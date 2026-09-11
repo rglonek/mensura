@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -338,6 +339,18 @@ func (s *Spec) Compile() error {
 	if s.Version != 1 {
 		return fmt.Errorf("extract: unsupported spec version %d (expected 1)", s.Version)
 	}
+	// The timestamp defaults are resolved per *stream*, so a typo in
+	// either compiled cleanly, passed `check`, and then failed once per
+	// file on a batch import, once per connection on a receiver, and on
+	// every single poll of a followed path -- "cannot follow x: unknown
+	// time zone", forever, from a spec the tool had called good. Both are
+	// decidable here, which is where every other spec name is decided.
+	if _, err := s.timezone(); err != nil {
+		return err
+	}
+	if _, err := s.assumeYear(time.Time{}); err != nil {
+		return err
+	}
 	for i := range s.Identity {
 		r := &s.Identity[i]
 		var err error
@@ -455,6 +468,18 @@ func (p *Profile) compile(s *Spec) error {
 		}
 		p.labelSet[l] = struct{}{}
 	}
+	// A selector glob is checked here because filepath.Match reports a
+	// malformed pattern as an error *alongside* "did not match", and
+	// matches() discards it -- so `path_glob: ['app[.log']` compiled,
+	// passed `check`, and then matched no file at all. The import reports
+	// that as "no profile matched", which points at the file rather than
+	// at the pattern. Every other regex and glob in a spec is compiled at
+	// this point; this one was read at run time and never validated.
+	for _, g := range p.Select.PathGlob {
+		if _, err := filepath.Match(g, "probe"); err != nil {
+			return fmt.Errorf("select.path_glob %q: %w", g, err)
+		}
+	}
 	if len(p.Timestamp.Formats) == 0 {
 		return fmt.Errorf("no timestamp formats declared")
 	}
@@ -543,6 +568,23 @@ func (p *Profile) compile(s *Spec) error {
 		for i := range m.Join {
 			if m.Join[i].re, err = regexp.Compile(m.Join[i].Regex); err != nil {
 				return fmt.Errorf("multiline join regex: %w", err)
+			}
+			// The capture index is a slice index into the submatch list,
+			// and it was the one number in a framing block that nothing
+			// checked. Process tests `len(g) > j.Capture` before reading
+			// g[j.Capture], which is true for every negative value, so
+			// `capture: -1` compiled cleanly and then panicked with an
+			// index out of range on the first continuation line that
+			// matched -- on the batch worker goroutines, the follow poll
+			// goroutine or a receive connection, any of which takes the
+			// whole ingester down. An index past the last group fails the
+			// other way and is just as invisible: the same test is false
+			// for every line, so the rule joins nothing while still
+			// opening a buffer on every start marker, which is exactly
+			// the failure an absent continue_regex is refused for.
+			if c, n := m.Join[i].Capture, m.Join[i].re.NumSubexp(); c < 0 || c > n {
+				return fmt.Errorf("multiline %q join %d: capture %d is outside 0..%d for regex %q",
+					m.StartContains, i+1, c, n, m.Join[i].Regex)
 			}
 		}
 		if m.IdleTimeout != "" {
@@ -886,9 +928,17 @@ func (b *BucketSet) compile() error {
 			}
 		}
 	case strings.HasPrefix(b.Edges, "linear:"):
-		var step float64
-		if _, err := fmt.Sscanf(b.Edges[len("linear:"):], "%g", &step); err != nil {
-			return fmt.Errorf("bucket set %s: bad linear step: %w", b.Name, err)
+		step, err := parseEdge(b.Edges[len("linear:"):])
+		if err != nil {
+			return fmt.Errorf("bucket set %s: bad linear step %q", b.Name, b.Edges[len("linear:"):])
+		}
+		// A step that does not advance gives every bucket the same lower
+		// bound, and a negative one runs the axis backwards. Either way
+		// the edges stop being the ordered lower bounds the heatmap draws
+		// its y-axis from, and heatmapSeriesName -- which names a series
+		// after its edge -- hands the panel several series with one name.
+		if step <= 0 {
+			return fmt.Errorf("bucket set %s: linear step %v must be positive; edges are ascending bucket lower bounds", b.Name, step)
 		}
 		for i := range b.Buckets {
 			b.edges[i] = float64(i) * step
@@ -900,9 +950,13 @@ func (b *BucketSet) compile() error {
 			return fmt.Errorf("bucket set %s: %d explicit edges for %d buckets", b.Name, len(parts), len(b.Buckets))
 		}
 		for i, p := range parts {
-			var v float64
-			if _, err := fmt.Sscanf(strings.TrimSpace(p), "%g", &v); err != nil {
+			v, err := parseEdge(p)
+			if err != nil {
 				return fmt.Errorf("bucket set %s: bad edge %q", b.Name, p)
+			}
+			if i > 0 && v <= b.edges[i-1] {
+				return fmt.Errorf("bucket set %s: explicit edge %v at position %d is not above %v; edges are ascending bucket lower bounds",
+					b.Name, v, i, b.edges[i-1])
 			}
 			b.edges[i] = v
 		}
@@ -910,6 +964,18 @@ func (b *BucketSet) compile() error {
 		return fmt.Errorf("bucket set %s: unknown edges %q", b.Name, b.Edges)
 	}
 	return nil
+}
+
+// parseEdge reads one edge value, and reads all of it.
+//
+// fmt.Sscanf with %g stops at the first byte it cannot use and reports no
+// error for the remainder, so `linear:5x` scanned as 5 and
+// `explicit:[3zzz,1]` as 3 -- a typo silently becoming a different
+// histogram axis, which is the same failure the config file's own
+// duration parser was moved off Sscanf to avoid. ParseFloat consumes the
+// whole string or fails.
+func parseEdge(s string) (float64, error) {
+	return strconv.ParseFloat(strings.TrimSpace(s), 64)
 }
 
 // EdgeValues exposes the numeric lower bound of each bucket.

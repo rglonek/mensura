@@ -45,6 +45,12 @@ correct behaviour when the raw data already fits the budget.
 
 An `EVERY d` clause replaces the computed `w` with `d`.
 
+The doubling belongs to the walk, not to the window. A reduction that
+emits one point per window rather than a min/max pair — `FORMAT heatmap`,
+which sums bucket counts ([06](06-query.md) §6) — uses the undoubled
+width, or it would spend the whole render budget on half the columns the
+panel asked for.
+
 ## 3. The ten stages
 
 Per raw sample, in chronological order, in exactly this sequence:
