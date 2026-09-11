@@ -321,6 +321,13 @@ never blocked, because blocking a UDP reader only moves the loss into the
 kernel where it is invisible. Max datagram 64 KiB; a record must fit in one
 datagram (no reassembly).
 
+A datagram larger than the cap is counted on `oversize_records`, reported once
+per power of ten on the collapsing per-record warning, and **discarded** rather
+than truncated. `recvfrom` hands back as much as the buffer holds and drops the
+rest without saying so, and there is no reassembly and no re-read here, so the
+prefix is not the record the sender meant: half a line judged on its own is how
+a prefix-anchored pattern invents a sample from a number that was cut in two.
+
 ### 7.3 HTTP API
 
 `POST /ingest/v1/lines` (text) and `POST /ingest/v1/samples` (JSON) for callers
@@ -332,6 +339,11 @@ Both answer a sender outside `allowed_sources` with `403`, and `/lines`
 answers `{"accepted": n, "refused": m, "reason": …}` — the denominator as
 well as the count, because a body whose every line the spec cannot read is
 otherwise indistinguishable from an empty one.
+
+A `/lines` body larger than 32 MiB is answered `413`, not truncated: cutting it
+at the limit ends part-way through a record, and extracting that half is the
+same invention a truncated datagram is. `413` is what the store's write API
+answers for the same condition.
 
 ## 8. Extraction, aggregation and histograms
 

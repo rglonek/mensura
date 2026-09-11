@@ -315,9 +315,12 @@ func (r *receiver) stream(ctx context.Context, peer string) (*peerStream, map[st
 func (r *receiver) drain(ctx context.Context, peers []*peerStream) {
 	for _, ps := range peers {
 		ps.mu.Lock()
-		results := ps.ex.Flush()
+		results, verdicts := ps.ex.Flush()
 		r.ing.cfg.Progress.MergeStream(&ps.ex.Stats)
 		ps.mu.Unlock()
+		for _, err := range verdicts {
+			r.ing.recordOutcome(err)
+		}
 		r.emit(ctx, ps, results)
 	}
 }
@@ -409,7 +412,7 @@ func (r *receiver) flushIdle(ctx context.Context, now time.Time) {
 	r.drain(ctx, evicted)
 	for _, ps := range r.peers() {
 		ps.mu.Lock()
-		results := ps.ex.FlushIdle(now)
+		results, verdicts := ps.ex.FlushIdle(now)
 		// Under the peer's own lock, because extract.Stats belongs to the
 		// extractor this lock guards. This is the only place a receiving
 		// ingest collects the unmatched lines that say why a listener is
@@ -417,6 +420,9 @@ func (r *receiver) flushIdle(ctx context.Context, now time.Time) {
 		// the life of the process.
 		r.ing.cfg.Progress.MergeStream(&ps.ex.Stats)
 		ps.mu.Unlock()
+		for _, err := range verdicts {
+			r.ing.recordOutcome(err)
+		}
 		r.emit(ctx, ps, results)
 	}
 }
@@ -552,6 +558,11 @@ func (r *receiver) handleConn(ctx context.Context, conn net.Conn) {
 // one per byte count.
 var errRecordCutShort = errors.New("the connection ended mid-record; the fragment was discarded rather than extracted from half a line")
 
+// errDatagramTooLarge names a datagram the socket truncated. A record
+// must fit in one datagram; there is no reassembly, so the prefix is not
+// the record the sender meant.
+var errDatagramTooLarge = errors.New("the datagram was larger than --max-datagram-bytes and was discarded rather than extracted from a truncated record")
+
 // maxHTTPBodyBytes bounds one request body on the HTTP listener. The
 // records inside it are bounded separately, by the same record cap every
 // other acquisition path applies.
@@ -589,7 +600,18 @@ func (r *receiver) serveUDP(ctx context.Context, conn *net.UDPConn) error {
 			}
 		}
 	}()
-	buf := make([]byte, r.opts.MaxDatagramBytes)
+	// One byte of headroom past the cap, so a datagram that overran it can
+	// be told from one that filled it exactly.
+	//
+	// recvfrom hands back min(len(buf), datagram) with no error and
+	// discards the rest, so reading into a buffer of exactly
+	// MaxDatagramBytes truncated an over-long datagram in silence: no
+	// counter, no log, and the truncated prefix went straight to the
+	// profile's regexes, where a prefix-anchored pattern matches half a
+	// line and invents a sample from a number that was cut in two. That
+	// is the failure handleConn refuses a cut-short TCP record for, and
+	// a datagram has even less recourse -- there is nothing to re-read.
+	buf := make([]byte, r.opts.MaxDatagramBytes+1)
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -606,6 +628,15 @@ func (r *receiver) serveUDP(ctx context.Context, conn *net.UDPConn) error {
 		}
 		peer := src.IP.String()
 		if !r.permitted(peer) {
+			continue
+		}
+		if n > r.opts.MaxDatagramBytes {
+			// Counted and dropped rather than truncated and extracted:
+			// there is no reassembly here, so what arrived is not the
+			// record the sender meant, and half a record judged on its
+			// own is worse than none.
+			r.ing.cfg.Progress.OversizeRecord()
+			r.warnRecord("udp "+peer, errDatagramTooLarge)
 			continue
 		}
 		text := strings.TrimRight(string(buf[:n]), "\r\n")
@@ -638,11 +669,26 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 		// here, nothing counted a truncation, and a newline-free body
 		// became a single record of up to maxHTTPBodyBytes handed whole
 		// to the profile's regexes.
-		br := bufio.NewReaderSize(io.LimitReader(req.Body, maxHTTPBodyBytes), 64<<10)
-		n, refused := 0, 0
+		// One byte past the cap, so a body that overran it is
+		// distinguishable from one that ended exactly on it. A plain
+		// LimitReader at the cap cut the last record in half and then
+		// handed that half to the extractor -- a prefix-anchored pattern
+		// matches it and invents a sample from a truncated number -- and
+		// answered 200, so the sender was told the whole body had landed.
+		// handleConn refuses a cut-short record for exactly that reason;
+		// a request/response listener can do better still and say so.
+		body := io.LimitReader(req.Body, maxHTTPBodyBytes+1)
+		br := bufio.NewReaderSize(body, 64<<10)
+		n, refused, consumed := 0, 0, int64(0)
 		var reason string
 		for {
 			rec, rerr := readRecord(br, r.ing.cfg.ReadBufferBytes)
+			consumed += int64(rec.Consumed)
+			if consumed > maxHTTPBodyBytes {
+				http.Error(w, fmt.Sprintf("request body is larger than the limit of %d bytes; split it across requests", maxHTTPBodyBytes),
+					http.StatusRequestEntityTooLarge)
+				return
+			}
 			if rec.Oversize {
 				r.ing.cfg.Progress.OversizeRecord()
 			}

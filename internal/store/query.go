@@ -1114,7 +1114,12 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 		}
 		proj := map[string]struct{}{model.TimestampField: {}, q.Label: {}}
 		expr, warns, impossible := s.buildExpr(set, q.Where, proj)
-		resp.Warnings = append(resp.Warnings, warns...)
+		// Deduplicated: the predicate is lowered once per set carrying
+		// the label, and it resolves against one global dictionary, so
+		// every set produced the identical "no values match ..." warning.
+		// A dashboard variable over a store with a dozen sets came back
+		// with a dozen copies of one sentence.
+		resp.Warnings = appendNewDiags(resp.Warnings, warns)
 		if impossible {
 			continue
 		}
@@ -1171,6 +1176,25 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 		resp.Warnings = append(resp.Warnings, mql.Diag{Code: "W401", Msg: gateErr})
 	}
 	return resp, nil
+}
+
+// appendNewDiags adds diagnostics that are not already present. The lists
+// are a handful of entries long, so the linear scan is cheaper than the
+// map that would replace it.
+func appendNewDiags(have []mql.Diag, add []mql.Diag) []mql.Diag {
+	for _, d := range add {
+		dup := false
+		for _, seen := range have {
+			if seen == d {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			have = append(have, d)
+		}
+	}
+	return have
 }
 
 // setsWithLabel lists the sets whose catalogue entry carries a label key.

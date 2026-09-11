@@ -251,7 +251,7 @@ profiles:
 		if junk != 2 {
 			t.Errorf("%s: %d record(s) reported as unusable, want 2", tc.mode, junk)
 		}
-		out := st.Flush()
+		out, _ := st.Flush()
 		if len(out) != 1 {
 			t.Fatalf("%s: %d window(s), want 1", tc.mode, len(out))
 		}
@@ -298,7 +298,7 @@ profiles:
 			t.Errorf("increment refused a record over its field value: %v", err)
 		}
 	}
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 || out[0].Fields["v"].String() != "3" {
 		t.Fatalf("counted %v, want one window of 3", out)
 	}
@@ -349,7 +349,7 @@ func TestMaxAggregationDoesNotSeedAWindowAtZero(t *testing.T) {
 			t.Fatalf("process %q: %v", line, err)
 		}
 	}
-	out := st.Flush()
+	out, _ := st.Flush()
 	if len(out) != 1 {
 		t.Fatalf("expected one window, got %d", len(out))
 	}

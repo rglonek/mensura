@@ -2258,6 +2258,125 @@ window width.
 - **`engine.indexKeyValue` is gone.** It recovered the indexed value from
   an index key and nothing has ever called it.
 
+### 6.112 An aggregation key nobody bounded
+
+An aggregation window is one accumulator plus a copy of the opening
+record's labels and fields, and `aggregate.on` opens one per distinct
+tuple per window period. Nothing bounded that set. `every: 1h` over a key
+whose cardinality the spec author misjudged — a request id, a path with
+parameters, anything the `labels:` list happens to admit — grew the
+ingester's memory for an hour at a time, with no cap, no counter and no
+diagnostic, in a process that is otherwise careful to bound every buffer
+it holds: the store's `max_label_cardinality`, the receiver's `max_peers`,
+the sink's `max_buffered_samples`, and the heatmap group map that §6.90
+was written about.
+
+`maxOpenWindows` (100 000, the same order as a label key's budget) is
+where it ends. Past it the oldest-*ending* windows are emitted early,
+handed back to the caller with the record's own results, and counted in
+`Stats.WindowsForcedClosed`, which `check` prints. Emitting early is the
+least-lossy answer available: the row still reaches the store carrying a
+window shorter than the spec declared, which is a visible loss of
+resolution, while refusing the record drops a measurement outright and
+holding on is how the process dies. The hold list is unaffected — a
+force-closed window leaves its span behind exactly as an expired one
+does, so §6.110's floor still pulls a checkpoint back past it.
+
+### 6.113 `check` reports how lossy an aggregate is
+
+§9 of [03](03-extraction.md) says aggregation is lossy on purpose and
+that `check` prints, for each aggregating pattern, an estimate of the
+reduction, "so the trade is visible". So does the `Aggregate` type's own
+doc comment. Nothing measured it, so the one number that makes the trade
+visible was never printed and the decision to aggregate had to be made
+blind.
+
+`Stats.Aggregates` now holds one entry per aggregating pattern, in
+pattern order, counting the records it absorbed and the rows those
+became; a window is counted against the pattern that opened it wherever
+it is emitted (expiry, flush, or the cap above). It is a measurement
+rather than an estimate, and `check --sample` prints it as
+`N record(s) -> M row(s), Kx reduction`.
+
+### 6.114 A flush reports the verdict on what it flushed
+
+§6.102 gave `Process` back the verdict on the multiline record that a
+start marker flushes, because the drivers are what turn a verdict into
+`Progress.UnmatchedLines`, `TSParseErrors` and `ExtractErrors`. The other
+three flush paths — a rotation, a retirement, the idle tick — still
+discarded it, and on a stream quiet enough to need an idle flush those
+are *all* of them: a multiline profile whose joined records match no
+pattern reported "0 unmatched" on the console, in the progress document
+and in the `_mensura_ingest` set, exactly as before the earlier fix.
+
+`Flush` and `FlushIdle` return `([]Result, []error)` now, one verdict per
+record they judge, and every driver reports them. `Flush` also walks the
+multiline rules in the profile's declared order rather than in map order:
+the samples one flush produces are keyed by a flush sequence number plus
+their position in the batch, so an order that varies from run to run keys
+the same record differently under `key: offset`.
+
+### 6.115 Every column name a pattern can write is validated
+
+A capture becomes a column on every row the pattern writes, and the store
+validates a column name per sample. A name it refuses therefore cost one
+rejection per record for the life of the process, with nothing anywhere
+pointing back at the spec — the failure mode that `route:` targets
+(§6.72), `kind:` (§6.88), profile label keys (§6.89) and bucket columns
+were each given a compile-time check for.
+
+The names that had none were the regex group names themselves, the field
+an `aggregate:` synthesises and the keys of `default_values:`. All three
+are now held to the same rule the store holds them to, classified the way
+`Stream.isLabel` classifies them: a declared label goes through
+`ValidateLabelKey`, anything else through `ValidateFieldName`. The two
+reserved histogram payload groups, `buckets` and `histogram`, are skipped
+because `expand()` consumes them and they never reach a row.
+
+### 6.116 A truncated record is not a record
+
+Two acquisition paths cut a record in half and then extracted it, which
+is the failure `handleConn` refuses a connection-cut fragment for: a
+prefix-anchored pattern matches half a line and invents a sample from a
+number that was cut in two.
+
+- **UDP.** `recvfrom` hands back `min(len(buf), datagram)` with no error
+  and discards the rest, so a socket buffer of exactly
+  `--max-datagram-bytes` truncated an over-long datagram in silence —
+  no counter, no log. The buffer is one byte larger than the cap now, so
+  the overrun is detectable; such a datagram is counted on
+  `oversize_records`, reported through the collapsing per-record warning,
+  and dropped rather than extracted. There is no reassembly and no
+  re-read, so a prefix is not the record the sender meant.
+- **`POST /ingest/v1/lines`.** The body was read through an
+  `io.LimitReader` at `maxHTTPBodyBytes`, so a longer one was cut
+  part-way through a record, that half was extracted, and the response
+  was `200` — telling the sender a body it never finished sending had
+  landed whole. The reader now carries one byte of headroom and the
+  handler answers `413` when the body overruns, which is what the store's
+  own `readBody` does with the same condition (§6.71).
+
+### 6.117 Smaller corrections
+
+- **A declined input is named once.** `Progress.NoProfile` and
+  `SkipArchive` append to a twenty-entry list, and the follower
+  reconsiders a path that matched no profile every `noProfileRetry`,
+  forever — so within twenty minutes the list held twenty copies of the
+  first such path, and every other unmatched path, which is what an
+  operator opens the list to find, could never appear.
+- **W102 is only offered where it can be taken.** "This field is a counter
+  and is plotted raw; consider `RATE`" was emitted for every counter
+  column of every `FORMAT table` and `FORMAT logs` query — where `E008`
+  refuses `RATE` and `DELTA` outright. A warning that recommends the one
+  thing the same validator will reject teaches an operator to ignore the
+  warnings that matter. W103 was already gated on the format; W102 is now
+  too.
+- **The `LABELS` filter says each thing once.** The predicate is lowered
+  once per set carrying the label and resolves against one dictionary for
+  the whole store, so `LABELS host WHERE pool = "typo"` came back with one
+  identical `W201` per set — a dozen copies of one sentence on a
+  dashboard variable.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

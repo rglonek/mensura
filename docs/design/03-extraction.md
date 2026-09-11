@@ -351,8 +351,23 @@ the second column was never written at all
 ([12-implementation.md §6.101](12-implementation.md)).
 
 Aggregation is a *lossy* choice, deliberately: individual occurrences are gone.
-`check` prints, for each aggregating pattern, an estimate of the reduction, so
-the trade is visible.
+`check --sample` prints, for each aggregating pattern, the records it absorbed
+and the rows those became, so the trade is visible.
+
+The open-window set is bounded. A window is an accumulator plus a copy of the
+opening record's labels and fields, and `on:` opens one per distinct tuple per
+window period, so a key whose cardinality was misjudged is an unbounded
+footprint for as long as `every` lasts. Past 100 000 open windows the
+oldest-ending ones are emitted early — a shorter window, not a lost one — and
+counted; `check` prints the count, and a non-zero one means `on:` is
+higher-cardinality than the spec expects.
+
+Every name a pattern can put on a row is validated at compile time against the
+same rule the store applies per sample: the named capture groups, the field an
+`aggregate:` synthesises, and the keys of `default_values:`. A name classified
+as a label is held to the label charset, anything else to the field charset.
+Leaving it to the store turned one spec typo into a rejection per record for
+the life of the process, with nothing pointing back at the spec.
 
 ## 10. Worked example
 

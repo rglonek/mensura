@@ -371,7 +371,10 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			return rerr
 		}
 	}
-	flushed := stream.Flush()
+	flushed, verdicts := stream.Flush()
+	for _, verr := range verdicts {
+		i.recordOutcome(verr)
+	}
 	i.cfg.Progress.AddSamples(int64(len(flushed)))
 	for n, r := range flushed {
 		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, flushPos(0), n)); err != nil {

@@ -171,7 +171,14 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			if info.Kind == model.KindString && format == FormatTimeseries {
 				warns = append(warns, Diag{"W104", fmt.Sprintf("field %q is declared as a string field; a timeseries panel plots only values that read as numbers, so the series may draw nothing -- FORMAT table or logs renders it", fe.Field)})
 			}
-			if info.Kind == model.KindCounter && !fe.Modifiers.Delta {
+			// Only where the advice can be taken. RATE and DELTA are
+			// timeseries-only modifiers -- E008 below refuses either one
+			// under FORMAT table or logs -- so telling a table query to
+			// "consider RATE" recommended the one thing the same
+			// validator would then refuse, on every counter column of
+			// every table panel. A warning an operator cannot act on
+			// teaches them to ignore the warnings that matter.
+			if info.Kind == model.KindCounter && !fe.Modifiers.Delta && format != FormatTable && format != FormatLogs {
 				warns = append(warns, Diag{"W102", fmt.Sprintf("field %q is a counter and is plotted raw; consider RATE", fe.Field)})
 			}
 			if fe.Modifiers.GapMs == nil && info.MaxInterval == 0 && format == FormatTimeseries {

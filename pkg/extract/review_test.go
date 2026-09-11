@@ -132,7 +132,8 @@ func (h *replayHarness) run(from, to int, flush bool) ([]Result, int64, bool) {
 	}
 	at, held := st.HeldFrom()
 	if flush {
-		out = append(out, st.Flush()...)
+		flushed, _ := st.Flush()
+		out = append(out, flushed...)
 	}
 	return out, at, held
 }
