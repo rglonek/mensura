@@ -1060,19 +1060,28 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		if len(s.shardsFor(logical, math.MinInt64, math.MaxInt64)) > 0 {
 			continue
 		}
-		// ForgetSet, not a bare catalogue delete. The spec-supplied
-		// retention and shard width live in their own maps and are
-		// persisted on the catalogue entry, so deleting only the entry
-		// left them stranded in two ways at once: a set later created
-		// with the same name silently inherited the policy of the one
-		// that aged out, and after a restart the persisted declaration
-		// was gone -- an ingester that is already running never repeats
-		// it, so with the documented "--retention 0 globally, per-set
-		// retention from the spec" deployment the set came back with no
-		// retention, was routed to the unsharded shard that the sweep
-		// skips, and was then kept forever with nothing saying so.
-		s.ForgetSet(logical)
-		forgotten++
+		// forgetAgedSet, not ForgetSet: what the shards took with them
+		// is the *observed* schema, not the declaration a spec made
+		// about the set.
+		//
+		// A declaration travels once per ingest process --
+		// Sink.DeclareSets marks it sent and never repeats it -- so an
+		// ingester that is still running when its set ages out will
+		// never say it again. Dropping the declaration here therefore
+		// dropped it for good: the next record re-created the set with
+		// the store's own defaults, which under the documented
+		// "--retention 0 globally, per-set retention from the spec"
+		// posture means no retention at all, so it was routed to the
+		// unsharded shard the sweep skips and then kept forever. Worse,
+		// the key scheme went with it: a set declared `key: offset`
+		// silently reverted to content keying, so two records sharing a
+		// millisecond and a label set collapsed into one row and the
+		// store's own "this set needs a key_hint" refusal stopped
+		// firing. Both are silent, and both outlive the process that
+		// could have corrected them.
+		if s.forgetAgedSet(logical) {
+			forgotten++
+		}
 	}
 	// Persisted now rather than on the next 30-second tick, which is what
 	// the admin drop already does and for the same reason: a crash in
@@ -1082,7 +1091,7 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	// the shards really are gone.
 	if forgotten > 0 {
 		if err := s.saveCatalogue(); err != nil {
-			s.cfg.Logger.Printf("ERROR saving catalogue after retention forgot %d set(s): %v", forgotten, err)
+			s.cfg.Logger.Printf("ERROR saving catalogue after retention emptied %d set(s): %v", forgotten, err)
 		}
 	}
 	return dropped, nil
@@ -1105,6 +1114,47 @@ func (s *Store) ForgetSet(name string) {
 	delete(s.setShard, name)
 	s.retentionMu.Unlock()
 	s.catVer.Add(1)
+}
+
+// forgetAgedSet drops what a set's shards took with them -- the fields,
+// the labels, the bucket sets and the observed time range -- while keeping
+// what a spec declared about it. It reports whether anything changed.
+//
+// The split matters because the two halves are rediscovered on very
+// different schedules. The observed schema comes back with the next
+// sample: observeSet re-learns it from the samples themselves. The
+// declaration does not, because it is sent once per ingest process and an
+// ingester that is already running never repeats it. A set with nothing
+// declared has nothing to keep, so it is removed outright, which is what
+// this sweep has always done.
+func (s *Store) forgetAgedSet(name string) bool {
+	s.mu.Lock()
+	e, ok := s.catalogue[name]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	if e.RetentionMs == nil && e.ShardMs == nil && e.KeyScheme == "" {
+		delete(s.catalogue, name)
+		s.mu.Unlock()
+		s.retentionMu.Lock()
+		delete(s.setRetention, name)
+		delete(s.setShard, name)
+		s.retentionMu.Unlock()
+		s.catVer.Add(1)
+		return true
+	}
+	changed := len(e.Fields) > 0 || len(e.Labels) > 0 || len(e.BucketSets) > 0 ||
+		e.FirstTSMs != 0 || e.LastTSMs != 0
+	e.Fields = map[string]*fieldEntry{}
+	e.Labels = map[string]struct{}{}
+	e.BucketSets = nil
+	e.FirstTSMs, e.LastTSMs = 0, 0
+	s.mu.Unlock()
+	if changed {
+		s.catVer.Add(1)
+	}
+	return changed
 }
 
 // Compact runs a full-keyspace compaction; batch ingest calls this once at

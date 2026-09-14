@@ -298,7 +298,14 @@ Semantics:
 ```
 
 5. `default_values` fills captures the matching regex did not produce, so a
-   sparse row still carries a zero where the panel expects one.
+   sparse row still carries a zero where the panel expects one. A capture
+   that did not produce anything includes a group that did not
+   participate — the ordinary shape of an optional
+   `(?: lat=(?P<lat>\d+))?` — because Go reports such a group as the empty
+   string and an empty capture is an absent one, for fields exactly as it
+   has always been for labels. A record whose every capture is empty is
+   therefore an extraction error rather than a row of empty strings, which
+   is what `default_values` is there to prevent.
 
 ## 8. Bucket sets (histograms / heatmaps)
 
@@ -387,7 +394,12 @@ window period, so a key whose cardinality was misjudged is an unbounded
 footprint for as long as `every` lasts. Past 100 000 open windows the
 oldest-ending ones are emitted early — a shorter window, not a lost one — and
 counted; `check` prints the count, and a non-zero one means `on:` is
-higher-cardinality than the spec expects.
+higher-cardinality than the spec expects. It also reports the windows that
+closed without ever holding a reading: `sum` of nothing is zero and
+`increment` counts the record that opened the window, but `max` and `last`
+have no value to report for a window whose records never carried
+`aggregate.field`, so such a window writes no row rather than a zero
+nothing measured.
 
 Every name a pattern can put on a row is validated at compile time against the
 same rule the store applies per sample: the named capture groups, the field an

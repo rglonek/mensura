@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sync"
+	"time"
 
 	"github.com/rglonek/mensura/internal/store"
 	"github.com/rglonek/mensura/pkg/mql"
@@ -51,18 +53,57 @@ func (l *localService) Parse(_ context.Context, text string) (*mql.Query, []mql.
 	return q, append(lints, warns...), verr
 }
 
+// metadataTTL is how long a fetched catalogue or hello is reused.
+//
+// It exists because validation is not only a per-panel cost: the query
+// editor calls the "parse" resource on every keystroke, and proxy-mode
+// validation needs the upstream catalogue and the upstream ceilings. So
+// each character typed cost two HTTP round trips to the store, and
+// rendering the catalogue on the far side walks every shard -- which is
+// exactly the cost CallResource stopped paying by not fetching the
+// catalogue for "parse" itself, one layer further in.
+//
+// A second is long enough to collapse a burst of typing into one fetch
+// and short enough that a set or field appearing upstream shows up while
+// the author is still looking at the editor. Nothing correctness-critical
+// rides on it: the store re-validates every query it executes against its
+// own live catalogue.
+const metadataTTL = time.Second
+
 // remoteService forwards to a store that owns the data directory. Same
 // code path, one network hop.
-type remoteService struct{ client *wire.Client }
+type remoteService struct {
+	client *wire.Client
+
+	mu      sync.Mutex
+	cat     wire.Catalogue
+	catAt   time.Time
+	catOK   bool
+	hello   wire.Hello
+	helloAt time.Time
+	helloOK bool
+}
 
 func (r *remoteService) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryResponse, error) {
 	return r.client.Query(ctx, req)
 }
 
 func (r *remoteService) Catalogue(ctx context.Context) (wire.Catalogue, error) {
+	r.mu.Lock()
+	if r.catOK && time.Since(r.catAt) < metadataTTL {
+		cat := r.cat
+		r.mu.Unlock()
+		return cat, nil
+	}
+	r.mu.Unlock()
 	var cat wire.Catalogue
-	err := r.client.GetJSON(ctx, "/v1/catalogue", &cat)
-	return cat, err
+	if err := r.client.GetJSON(ctx, "/v1/catalogue", &cat); err != nil {
+		return wire.Catalogue{}, err
+	}
+	r.mu.Lock()
+	r.cat, r.catAt, r.catOK = cat, time.Now(), true
+	r.mu.Unlock()
+	return cat, nil
 }
 
 func (r *remoteService) LabelValues(ctx context.Context, key string) ([]string, error) {
@@ -77,9 +118,21 @@ func (r *remoteService) LabelValues(ctx context.Context, key string) ([]string, 
 }
 
 func (r *remoteService) Hello(ctx context.Context) (wire.Hello, error) {
+	r.mu.Lock()
+	if r.helloOK && time.Since(r.helloAt) < metadataTTL {
+		h := r.hello
+		r.mu.Unlock()
+		return h, nil
+	}
+	r.mu.Unlock()
 	var h wire.Hello
-	err := r.client.GetJSON(ctx, "/v1/hello", &h)
-	return h, err
+	if err := r.client.GetJSON(ctx, "/v1/hello", &h); err != nil {
+		return wire.Hello{}, err
+	}
+	r.mu.Lock()
+	r.hello, r.helloAt, r.helloOK = h, time.Now(), true
+	r.mu.Unlock()
+	return h, nil
 }
 
 // Parse is done locally even in proxy mode: the parser is a pure function

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -648,5 +649,55 @@ func TestLabelValuesOfAnUnknownKeyIsAnEmptyList(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"values":null`) {
 		t.Fatalf("the body carries a null value list: %s", raw)
+	}
+}
+
+// The request-body budget has to cover the body for as long as the
+// handler holds it, not only while it is being read.
+//
+// The reservation used to be released the moment the read finished, while
+// the caller still held the whole body, decoded it into a request several
+// times its size and then queued for a write slot. So the budget only saw
+// bodies that were arriving at the same instant -- almost none of them --
+// and the peak footprint it exists to bound was still one
+// max_request_bytes per connection.
+func TestBodyBudgetIsHeldUntilTheHandlerReleasesIt(t *testing.T) {
+	s := openTestStore(t)
+	api := NewAPI(s, APIConfig{MaxRequestBytes: 1 << 20, MaxBufferedRequestBytes: 1 << 20})
+
+	big := bytes.Repeat([]byte("x"), 1<<20)
+	first := httptest.NewRequest(http.MethodPost, "/v1/write", bytes.NewReader(big))
+	body, release, err := api.readBody(first)
+	if err != nil {
+		t.Fatalf("first body: %v", err)
+	}
+	if len(body) != len(big) {
+		t.Fatalf("read %d bytes, want %d", len(body), len(big))
+	}
+	if got := api.bodyBytes.Load(); got != int64(len(big)) {
+		t.Fatalf("holding %d bytes for a %d-byte body still in hand", got, len(big))
+	}
+
+	// A second request cannot be admitted while the first is still held.
+	second := httptest.NewRequest(http.MethodPost, "/v1/write", bytes.NewReader([]byte("y")))
+	if _, _, err := api.readBody(second); !errors.Is(err, errBusy) {
+		t.Fatalf("second body was admitted while the first was still buffered: %v", err)
+	}
+
+	release()
+	if got := api.bodyBytes.Load(); got != 0 {
+		t.Fatalf("release left %d bytes reserved", got)
+	}
+	// Idempotent: a handler that releases twice must not go negative.
+	release()
+	if got := api.bodyBytes.Load(); got != 0 {
+		t.Fatalf("a second release moved the budget to %d", got)
+	}
+
+	third := httptest.NewRequest(http.MethodPost, "/v1/write", bytes.NewReader([]byte("y")))
+	if _, rel, err := api.readBody(third); err != nil {
+		t.Fatalf("third body refused after the first was released: %v", err)
+	} else {
+		rel()
 	}
 }

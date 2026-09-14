@@ -50,19 +50,31 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 		return nil, verr
 	}
 
+	// The auxiliary forms answer with the same envelope as a data query,
+	// so they report the same statistics. Every one of them used to leave
+	// duration_ms at zero -- the field an operator reads to tell a
+	// dashboard variable that is taking seconds from one that is
+	// instant -- and the filter scan left its own points at zero too,
+	// which is the same omission runTabular was fixed for.
+	aux := func(resp *wire.QueryResponse, err error) (*wire.QueryResponse, error) {
+		if err == nil && resp != nil {
+			resp.Stats.DurationMs = time.Since(started).Milliseconds()
+		}
+		return resp, err
+	}
 	switch q.Kind {
 	case mql.KindSets:
-		return s.querySets(), nil
+		return aux(s.querySets(), nil)
 	case mql.KindFields:
-		return s.queryFields(q.From)
+		return aux(s.queryFields(q.From))
 	case mql.KindLabelKeys:
-		return s.queryLabelKeys(q.From), nil
+		return aux(s.queryLabelKeys(q.From), nil)
 	case mql.KindLabels:
 		resp, err := s.queryLabelValues(ctx, q, req, narrower(seriesCeiling, q.Limits.Series), narrower(pointsCeiling, q.Limits.Points))
 		if err == nil && resp != nil {
 			resp.Warnings = append(warns, resp.Warnings...)
 		}
-		return resp, err
+		return aux(resp, err)
 	}
 
 	// LIMIT may only narrow, never widen — Validate has already refused a
@@ -1040,6 +1052,7 @@ func (s *Store) querySets() *wire.QueryResponse {
 	for _, n := range s.Sets() {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{n}})
 	}
+	resp.Stats.PointsOut = len(resp.Rows)
 	return resp
 }
 
@@ -1074,6 +1087,7 @@ func (s *Store) queryFields(set string) (*wire.QueryResponse, error) {
 	for _, r := range rows {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{r.name, r.kind, r.unit, float64(r.maxInterval)}})
 	}
+	resp.Stats.PointsOut = len(resp.Rows)
 	return resp, nil
 }
 
@@ -1082,6 +1096,7 @@ func (s *Store) queryLabelKeys(set string) *wire.QueryResponse {
 	for _, k := range s.LabelKeys(set) {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{k}})
 	}
+	resp.Stats.PointsOut = len(resp.Rows)
 	return resp
 }
 
@@ -1100,6 +1115,7 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 		for _, v := range s.LabelValues(q.Label) {
 			resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
 		}
+		resp.Stats.PointsOut = len(resp.Rows)
 		return resp, nil
 	}
 
@@ -1186,6 +1202,10 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 	for _, v := range out {
 		resp.Rows = append(resp.Rows, wire.Row{Values: []any{v}})
 	}
+	// The rows are this form's output, so they are what "points" counts:
+	// a variable query that came back with a hundred values reported the
+	// same statistics as one that came back with none.
+	resp.Stats.PointsOut = len(resp.Rows)
 	if gateErr != "" {
 		resp.Error = gateErr
 		resp.Stats.Truncated = true

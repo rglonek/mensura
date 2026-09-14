@@ -50,6 +50,14 @@ type Stats struct {
 	// closes early is a shorter window, not a lost one, but it is not
 	// what the spec asked for, so it is counted rather than silent.
 	WindowsForcedClosed int64
+
+	// WindowsEmpty counts windows that closed without ever holding a
+	// reading, under a mode for which zero is not the identity: no record
+	// that opened or joined them carried the aggregated field. They write
+	// no row, because the number they would write is one nothing
+	// measured, and a spec that produces many of them is aggregating on a
+	// field its own pattern does not reliably capture.
+	WindowsEmpty int64
 }
 
 // AggregateStat is one aggregating pattern's reduction.
@@ -631,7 +639,12 @@ func (st *Stream) Flush() ([]Result, []error) {
 	for _, k := range st.aggKeysInEndOrder() {
 		a := st.aggs[k]
 		delete(st.aggs, k)
-		out = append(out, a.emit())
+		r, ok := a.emit()
+		if !ok {
+			st.Stats.WindowsEmpty++
+			continue
+		}
+		out = append(out, r)
 		st.countWindow(a)
 		st.Stats.Samples++
 	}
@@ -799,6 +812,23 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 			}
 			continue
 		}
+		// An empty capture is an absent one, which is the rule the label
+		// branch above has always applied. Go reports a group that did
+		// not participate -- the ordinary shape of an optional
+		// `(?: lat=(?P<lat>\d+))?` -- as the empty string, so storing it
+		// wrote a string into a numeric column on every record that did
+		// not carry the field. Three things went wrong with that at
+		// once: `default_values`, whose documented job is to fill "the
+		// captures the matching regex did not produce" (03-extraction.md
+		// section 7.5), never fired, because the key was present;
+		// FORMAT table saw one string cell and retyped the whole column;
+		// and an `aggregate:` pattern refused the record outright --
+		// "aggregate field %q is , which is not a finite number" -- so a
+		// spec with one optional numeric capture lost every record that
+		// omitted it, not just that column.
+		if v == "" {
+			continue
+		}
 		fields[name] = model.Coerce(v)
 	}
 
@@ -901,7 +931,12 @@ func (st *Stream) aggregate(pat *Pattern, patIdx int, set string, ts time.Time, 
 	for _, on := range ag.On {
 		v, ok := labels[on]
 		if !ok {
-			return nil, fmt.Errorf("extract: aggregation key %q is not a declared label", on)
+			// Compile refuses a key that no regex captures and one that
+			// is not declared as a label, so at run time the only way
+			// here is a record whose group did not participate or
+			// matched nothing. Saying "not a declared label" sent the
+			// operator to a spec that is correct.
+			return nil, fmt.Errorf("extract: aggregation key %q was not captured from this record, so there is no window to fold it into", on)
 		}
 		writeKeyPart(&kb, on)
 		writeKeyPart(&kb, v)
@@ -1033,11 +1068,16 @@ func (st *Stream) shedOldestWindows() []Result {
 		if !ok || a != e.a {
 			continue
 		}
-		out = append(out, a.emit())
 		delete(st.aggs, e.key)
+		over--
+		r, emitted := a.emit()
+		if !emitted {
+			st.Stats.WindowsEmpty++
+			continue
+		}
+		out = append(out, r)
 		st.countWindow(a)
 		st.Stats.WindowsForcedClosed++
-		over--
 	}
 	return out
 }
@@ -1067,8 +1107,13 @@ func (st *Stream) closeExpiredAggregators(now time.Time) []Result {
 		if !ok || a != e.a {
 			continue
 		}
-		out = append(out, a.emit())
 		delete(st.aggs, e.key)
+		r, emitted := a.emit()
+		if !emitted {
+			st.Stats.WindowsEmpty++
+			continue
+		}
+		out = append(out, r)
 		st.countWindow(a)
 	}
 	return out
@@ -1109,17 +1154,46 @@ func (q *aggQueue) Pop() any {
 // below is range-checked before it is made rather than relying on either.
 const maxExactInt = 1 << 53
 
-func (a *aggregator) emit() Result {
+// emit renders one window. ok is false when the window has nothing left
+// to report, which is the only honest answer for a window that measured
+// nothing at all.
+//
+// The synthesised column is written only where the accumulator really
+// holds a reading, or where zero is the identity of the fold. `sum` of
+// nothing is zero and `increment` counts the opening record, so both
+// always have one. `max` and `last` do not: a window whose records never
+// carried the field left the accumulator at its zero value and emitted
+// it, so a latency maximum nobody measured was drawn as 0 -- the same
+// invention hasValue was added to stop one case earlier, and the same one
+// BucketSet.expand refuses when it writes an absent bucket as absent
+// rather than as a measured zero. An absent column reads as a gap, which
+// is what the render walk already draws for a row that does not carry a
+// field.
+func (a *aggregator) emit() (Result, bool) {
 	fields := map[string]model.Value{}
 	for k, v := range a.fields {
 		fields[k] = v
 	}
-	if a.value >= -maxExactInt && a.value <= maxExactInt && a.value == float64(int64(a.value)) {
-		fields[a.field] = model.Int(int64(a.value))
+	if a.hasValue || a.mode == "sum" || a.mode == "increment" {
+		if a.value >= -maxExactInt && a.value <= maxExactInt && a.value == float64(int64(a.value)) {
+			fields[a.field] = model.Int(int64(a.value))
+		} else {
+			fields[a.field] = model.Float(a.value)
+		}
 	} else {
-		fields[a.field] = model.Float(a.value)
+		// The opening record cannot have carried a value under this name
+		// -- aggregate() refuses a non-numeric one for these modes -- so
+		// there is nothing here to leave behind.
+		delete(fields, a.field)
 	}
-	return Result{Set: a.set, TSMs: a.start.UnixMilli(), Labels: a.labels, Fields: fields, Line: a.line}
+	if len(fields) == 0 {
+		// A pattern that aggregates and extracts nothing else has one
+		// column, and it is the one there is no reading for. A row with
+		// no fields is a row the store refuses by name, so the window is
+		// dropped here instead, where it can be counted.
+		return Result{}, false
+	}
+	return Result{Set: a.set, TSMs: a.start.UnixMilli(), Labels: a.labels, Fields: fields, Line: a.line}, true
 }
 
 // trimToRune drops a trailing partial UTF-8 sequence left by cutting a

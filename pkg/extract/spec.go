@@ -536,7 +536,8 @@ func (p *Profile) compile(s *Spec) error {
 	if p.Framing.MaxRecordBytes == 0 {
 		p.Framing.MaxRecordBytes = 1 << 20
 	}
-	for _, m := range p.Framing.Multiline {
+	seenStart := map[string]int{}
+	for mi, m := range p.Framing.Multiline {
 		var err error
 		// An empty start_contains is silently self-defeating:
 		// strings.Contains(line, "") is true for every line, so every
@@ -562,6 +563,21 @@ func (p *Profile) compile(s *Spec) error {
 		if m.ContinueRegex == "" {
 			return fmt.Errorf("multiline %q needs a continue_regex: without one no line is ever joined, so the rule only delays every record that opens it", m.StartContains)
 		}
+		// Two rules with the same marker are one rule. The stream keys
+		// its open buffers by start_contains, and Process returns at the
+		// first rule whose marker the line carries, so the second rule's
+		// join list, its idle_timeout and its buffer are unreachable:
+		// every line it was written for is absorbed by the first. Flush
+		// walks the declared order and deletes the shared buffer on the
+		// first of them, so the second never sees one there either. It is
+		// the same dead configuration an empty start_contains and a
+		// missing continue_regex are refused for, arriving through a
+		// duplicate instead of an omission.
+		if first, dup := seenStart[m.StartContains]; dup {
+			return fmt.Errorf("multiline %d repeats the start_contains %q of multiline %d; they share one buffer and the first one wins, so the second joins nothing",
+				mi+1, m.StartContains, first+1)
+		}
+		seenStart[m.StartContains] = mi
 		if m.continueRe, err = regexp.Compile(m.ContinueRegex); err != nil {
 			return fmt.Errorf("multiline continue_regex: %w", err)
 		}
@@ -614,6 +630,15 @@ func (p *Profile) compile(s *Spec) error {
 	for _, bs := range p.BucketSets {
 		if err := bs.compile(); err != nil {
 			return err
+		}
+		// Bucket sets are resolved by name, so a repeated one is a rule
+		// that silently replaces another: a pattern naming it expands
+		// whichever declaration happened to be last, and the columns,
+		// edges and unit of the first are never written by anything.
+		// Duplicate profile names are already refused on the same
+		// grounds.
+		if _, dup := p.buckets[bs.Name]; dup {
+			return fmt.Errorf("duplicate bucket set name %q; the later declaration silently replaces the earlier one", bs.Name)
 		}
 		// Bucket names become field names on the row, and expand()
 		// derives "<bucket>plus" from them. Checking them here names the

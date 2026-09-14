@@ -2528,6 +2528,135 @@ made exactly-once by content-addressed row keys (§6.5).
   that changes it: the declaration arrives again on every ingest process
   start.
 
+### 6.125 Retention drops a set's data, not its declaration
+
+A set whose every shard has aged out was forgotten completely: the
+catalogue entry went, and with it the `retention`, `shard` and `key`
+that a spec's `sets:` block had declared for it.
+
+The two halves of a catalogue entry are rediscovered on very different
+schedules. The observed schema — which fields, which labels, what time
+range — comes back with the next sample, because `observeSet` re-learns
+it from the samples themselves. The declaration does not:
+`Sink.DeclareSets` marks it sent with the first write and never repeats
+it, so an ingester that is still running when its set ages out will never
+say it again. Dropping the declaration therefore dropped it for good, and
+the next record re-created the set with the store's own defaults. Under
+the deployment [09](09-operations.md) documents — `--retention 0`
+globally, per-set retention from the spec — that means no retention at
+all, so the set was routed to the `@all` shard the sweep skips and then
+kept forever. The key scheme went with it: a set declared `key: offset`
+silently reverted to content keying, so two records sharing a millisecond
+and a label set collapsed into one row, and the store's own "this set
+needs a `key_hint`" refusal stopped firing.
+
+`RunRetention` now calls `forgetAgedSet`, which clears the fields, the
+labels, the bucket sets and the observed time range — what the shards
+really did take with them — and keeps what was declared, in the live
+override maps and on the persisted entry. A set with nothing declared has
+nothing to keep and is still removed outright, which is what this sweep
+has always done and what `DELETE /v1/admin/sets/` still does through
+`ForgetSet`.
+
+### 6.126 A capture that did not participate is an absent field
+
+Go reports a regex group that did not participate as the empty string,
+which is indistinguishable from one that matched nothing. The label
+branch of the pattern stage has always treated an empty capture as
+absent; the field branch stored it, so an ordinary optional capture —
+`op=(?P<op>\S+)(?: lat=(?P<lat>\d+))?` — wrote `lat: ""` on every record
+that omitted it.
+
+Three things went wrong with that at once. `default_values`, whose
+documented job ([03](03-extraction.md) §7.5) is to fill "the captures the
+matching regex did not produce", never fired, because the key was
+present. `FORMAT table` saw one string cell in a numeric column and
+retyped the whole column. And an `aggregate:` pattern refused the record
+outright — *aggregate field "lat" is , which is not a finite number* — so
+a spec with one optional numeric capture lost **every record that omitted
+it**, not just that column.
+
+An empty capture is now absent for fields as well as for labels. A record
+whose every capture is empty is an extraction error rather than a row of
+empty strings, which is what `default_values` exists to prevent.
+
+### 6.127 A window that measured nothing writes no row
+
+`aggregator.emit` wrote the accumulator unconditionally, so a `max` or
+`last` window in which no record ever carried `aggregate.field` reported
+`0` — a latency maximum nobody measured. `hasValue` was added to stop the
+seed from beating a negative reading; this is the case where there is no
+reading at all.
+
+The synthesised column is now written only where the accumulator holds
+one, or where zero is the identity of the fold: `sum` of nothing is zero
+and `increment` counts the record that opened the window, so both always
+have one. A window left with no columns writes no row, because the row it
+would write is refused by the store for carrying no fields, and
+`Stats.WindowsEmpty` counts it so `check` can say how often a spec
+aggregates on a field its own pattern does not reliably capture. It is
+the rule `BucketSet.expand` already follows when it writes an absent
+bucket as absent rather than as a measured zero.
+
+### 6.128 The request-body budget covers the body, not the read
+
+`limits.max_buffered_request_bytes` bounds the request-body bytes the
+whole API holds in memory at once. It did not: the reservation was
+released the moment the read finished, while the caller still held the
+whole body, decoded it into a request several times its size and then
+queued for a write slot with both alive. So the budget only ever saw the
+bodies that happened to be *arriving* at the same instant — for fast
+clients, almost none of them — every request found the counter back at
+zero, every request was admitted, and the peak footprint was still one
+`max_request_bytes` per connection.
+
+`API.readBody` now returns the release the handler owes, and every
+body-reading handler defers it. The reservation is also corrected
+downwards once the size is known: admission has to be pessimistic,
+because a gzipped body may decompress to anything up to the limit, but
+charging every 4 MiB batch for the 32 MiB it might have been would shed
+at a small fraction of the configured budget.
+
+### 6.129 Proxy-mode validation is not a round trip per keystroke
+
+The query editor calls the `parse` resource on every character typed, and
+proxy-mode validation needs the upstream catalogue and the upstream
+ceilings — so each keystroke cost two HTTP requests to the store, and
+rendering a catalogue walks every shard on the far side. That is the same
+cost `CallResource` stopped paying by not fetching the catalogue for
+`parse` itself, one layer further in. `remoteService` now caches both
+behind a one-second TTL: long enough to collapse a burst of typing into
+one fetch, short enough that a set appearing upstream shows up while the
+author is still looking at the editor. Nothing correctness-critical rides
+on it, because the store re-validates every query it executes against its
+own live catalogue.
+
+### 6.130 Smaller corrections
+
+- **Two multiline rules may not share a `start_contains`.** The stream
+  keys its open buffers by the marker and `Process` returns at the first
+  rule whose marker the line carries, so the second rule's `join` list,
+  its `idle_timeout` and its buffer are unreachable — and `Flush` walks
+  the declared order and deletes the shared buffer on the first of them,
+  so the second never finds one either. It is the dead configuration an
+  empty `start_contains` and a missing `continue_regex` are already
+  refused for, arriving through a duplicate instead of an omission.
+- **Two bucket sets may not share a name.** They are resolved by name, so
+  a repeated one silently replaces the earlier declaration and its
+  columns, edges and unit are never written by anything. Duplicate
+  profile names were already refused on the same grounds.
+- **The auxiliary query forms report their statistics.** `SETS`,
+  `FIELDS`, `LABEL KEYS` and `LABELS` answer with the same envelope as a
+  data query and left `duration_ms` at zero — the one field an operator
+  reads to tell a dashboard variable that takes seconds from one that is
+  instant — and the `LABELS … WHERE` filter scan left `points` at zero
+  too, which is the omission `runTabular` was fixed for.
+- **An aggregation key that a record did not carry says so.** Compile
+  refuses a key no regex captures and one that is not declared as a
+  label, so at run time the only way to reach that error is a record
+  whose group did not participate. Reporting it as "not a declared label"
+  sent the operator to a spec that is correct.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
