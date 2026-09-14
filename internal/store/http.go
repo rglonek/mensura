@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -270,12 +271,15 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 	// The body is read before a write slot is taken. Holding a slot across
 	// the read would let MaxConcurrentWrites slow clients occupy the whole
 	// pool without ever presenting a batch.
-	body, err := a.readBody(r)
+	body, release, err := a.readBody(r)
 	if err != nil {
 		a.writeErrs.Add(1)
 		writeBodyErr(w, err)
 		return
 	}
+	// Held until the handler is done: the decoded request and the batch
+	// it commits both live off these bytes.
+	defer release()
 	var req wire.WriteRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields() // a typo must fail loudly, not silently
@@ -339,11 +343,12 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusMethodNotAllowed, "use POST")
 		return
 	}
-	body, err := a.readBody(r)
+	body, release, err := a.readBody(r)
 	if err != nil {
 		writeBodyErr(w, err)
 		return
 	}
+	defer release()
 	var req wire.QueryRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
@@ -425,11 +430,12 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 	// can be used to make the store buffer an unbounded request, and no
 	// number of them can make it buffer more than
 	// MaxBufferedRequestBytes at once.
-	raw, rerr := a.readBody(r)
+	raw, release, rerr := a.readBody(r)
 	if rerr != nil {
 		writeBodyErr(w, rerr)
 		return
 	}
+	defer release()
 	var body struct {
 		Text string `json:"text"`
 	}
@@ -460,11 +466,12 @@ func (a *API) handleParse(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
-	raw, rerr := a.readBody(r)
+	raw, release, rerr := a.readBody(r)
 	if rerr != nil {
 		writeBodyErr(w, rerr)
 		return
 	}
+	defer release()
 	var q mql.Query
 	if err := json.Unmarshal(raw, &q); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -474,11 +481,12 @@ func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
-	raw, rerr := a.readBody(r)
+	raw, release, rerr := a.readBody(r)
 	if rerr != nil {
 		writeBodyErr(w, rerr)
 		return
 	}
+	defer release()
 	var req wire.QueryRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -598,12 +606,30 @@ var errBusy = errors.New("the server is already buffering its limit of request b
 // 400 that says so.
 var errTooLarge = errors.New("request body is larger than the configured limit")
 
-// readBody reads a request body against the shared in-memory budget.
+// readBody reads a request body against the shared in-memory budget, and
+// returns the release the caller owes when it is finished with the bytes.
 //
 // Shedding rather than queueing is the same choice the write pool makes:
 // a client that is told to back off stops its readers, which stops its
 // sources, while a queue of blocked readers is memory nobody bounded.
-func (a *API) readBody(r *http.Request) ([]byte, error) {
+//
+// The reservation outlives this function on purpose. It used to be
+// released the moment the read finished -- while the caller still held
+// the whole body, decoded it into a request several times its size and
+// then waited for a write slot with both alive. So the budget only ever
+// saw the bodies that happened to be *arriving* at the same instant,
+// which for fast clients is almost none of them: every request found
+// bodyBytes back at zero, every request was admitted, and the peak
+// footprint this field exists to bound was still connections x
+// max_request_bytes. Holding the reservation until the handler is done
+// is what makes the number mean what it says.
+//
+// It is also corrected downwards once the size is known. Admission has to
+// be pessimistic -- a gzipped body may decompress to anything up to the
+// limit -- but charging every 4 MiB batch for the 32 MiB it might have
+// been would shed at a small fraction of the configured budget, so what
+// is held afterwards is what the body turned out to be.
+func (a *API) readBody(r *http.Request) ([]byte, func(), error) {
 	// What the body may still turn into once it is decompressed, since
 	// that is what has to fit in memory. Content-Length only helps when
 	// the body arrives as it was sent.
@@ -614,14 +640,21 @@ func (a *API) readBody(r *http.Request) ([]byte, error) {
 	for {
 		cur := a.bodyBytes.Load()
 		if cur+reserve > a.cfg.MaxBufferedRequestBytes {
-			return nil, errBusy
+			return nil, nil, errBusy
 		}
 		if a.bodyBytes.CompareAndSwap(cur, cur+reserve) {
 			break
 		}
 	}
-	defer a.bodyBytes.Add(-reserve)
-	return readBody(r, a.cfg.MaxRequestBytes)
+	b, err := readBody(r, a.cfg.MaxRequestBytes)
+	if err != nil {
+		a.bodyBytes.Add(-reserve)
+		return nil, nil, err
+	}
+	held := int64(len(b))
+	a.bodyBytes.Add(held - reserve)
+	var once sync.Once
+	return b, func() { once.Do(func() { a.bodyBytes.Add(-held) }) }, nil
 }
 
 // bodyErrStatus maps a body failure to its status: a refused admission is

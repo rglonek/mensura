@@ -1033,18 +1033,23 @@ func TestEngineTuningReachesTheEngine(t *testing.T) {
 	}
 }
 
-// A set whose every shard has aged out is forgotten completely, not just
-// removed from the catalogue.
+// A set whose every shard has aged out keeps what a spec declared about
+// it and loses only what the shards took with them.
 //
-// The spec-supplied retention and shard width live in their own maps and
-// are persisted on the catalogue entry, so deleting only the entry left
-// them stranded twice over: a set later created with the same name
-// inherited the policy of the one that aged out, and after a restart the
-// persisted declaration was gone -- an ingester that is already running
-// never repeats it -- so with the documented "--retention 0 globally,
-// per-set retention from the spec" deployment the set came back with no
-// retention at all and was routed to the unsharded shard the sweep skips.
-func TestRetentionSweepForgetsThePolicyWithTheSet(t *testing.T) {
+// The two halves are rediscovered on very different schedules. The
+// observed schema -- fields, labels, the time range -- comes back with the
+// next sample, because observeSet re-learns it from the samples
+// themselves. The declaration does not: Sink.DeclareSets marks it sent
+// and never repeats it, so an ingester that is still running when its set
+// ages out will never say it again. Dropping the declaration here dropped
+// it for good, and the next record re-created the set with the store's
+// own defaults -- which under the documented "--retention 0 globally,
+// per-set retention from the spec" posture means no retention at all, so
+// it was routed to the unsharded shard the sweep skips and then kept
+// forever. The key scheme went with it too, so a set declared
+// `key: offset` silently reverted to content keying and two records
+// sharing a millisecond and a label set collapsed into one row.
+func TestRetentionKeepsTheDeclaredPolicyWhenASetAgesOut(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.DataDir = dir
@@ -1061,9 +1066,9 @@ func TestRetentionSweepForgetsThePolicyWithTheSet(t *testing.T) {
 	shard := day
 	old := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
 	if _, err := s.Write(&wire.WriteRequest{
-		SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &retention, ShardMs: &shard}},
+		SetMeta: []wire.SetMeta{{Set: "app", RetentionMs: &retention, ShardMs: &shard, KeyScheme: model.KeyOffset}},
 		Batches: []model.Batch{{Set: "app", Samples: []model.Sample{
-			{TSMs: old, Fields: map[string]model.Value{"v": model.Int(1)}},
+			{TSMs: old, Fields: map[string]model.Value{"v": model.Int(1)}, KeyHint: "a"},
 		}}},
 	}, "", "test"); err != nil {
 		t.Fatalf("write: %v", err)
@@ -1079,28 +1084,54 @@ func TestRetentionSweepForgetsThePolicyWithTheSet(t *testing.T) {
 	if n == 0 {
 		t.Fatal("expected the aged-out shard to be dropped")
 	}
-	// The override went with the entry, so a set recreated under the same
-	// name does not silently inherit a dead set's policy.
-	s.retentionMu.RLock()
-	_, keptRetention := s.setRetention["app"]
-	_, keptShard := s.setShard["app"]
-	s.retentionMu.RUnlock()
-	if keptRetention || keptShard {
-		t.Fatalf("retention sweep left the spec policy behind: retention=%v shard=%v", keptRetention, keptShard)
+	// What the shards took with them is gone: the entry advertises no
+	// fields, no labels and no time range.
+	s.mu.RLock()
+	e := s.catalogue["app"]
+	s.mu.RUnlock()
+	if e == nil {
+		t.Fatal("the declaration was dropped with the data")
+	}
+	if len(e.Fields) != 0 || len(e.Labels) != 0 || e.FirstTSMs != 0 || e.LastTSMs != 0 {
+		t.Fatalf("the aged-out set still advertises data: %+v", e)
+	}
+	// What the spec declared survives, in the live maps and on the entry.
+	if got := s.retentionFor("app"); got != time.Duration(retention)*time.Millisecond {
+		t.Fatalf("declared retention was lost by the sweep: %v", got)
+	}
+	if got := s.shardWidth("app"); got != time.Duration(shard)*time.Millisecond {
+		t.Fatalf("declared shard width was lost by the sweep: %v", got)
+	}
+	if got := s.keyScheme("app"); got != model.KeyOffset {
+		t.Fatalf("declared key scheme was lost by the sweep: %q", got)
+	}
+	// So a record the same still-running ingester writes afterwards is
+	// still keyed and sharded the way the spec asked for.
+	resp, err := s.Write(&wire.WriteRequest{Batches: []model.Batch{{Set: "app", Samples: []model.Sample{
+		{TSMs: time.Now().UnixMilli(), Fields: map[string]model.Value{"v": model.Int(2)}},
+	}}}}, "", "test")
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp.Accepted != 0 {
+		t.Fatal("an offset-keyed set accepted a sample with no key_hint after its shards aged out")
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	// And it is gone after a restart too, rather than the entry being
-	// absent while the in-memory maps still held it.
+	// And it survives a restart, which is the only reason the entry is
+	// persisted at all.
 	s2, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s2.Close()
-	if got := s2.retentionFor("app"); got != 0 {
-		t.Fatalf("expected the default retention after the set aged out, got %v", got)
+	if got := s2.retentionFor("app"); got != time.Duration(retention)*time.Millisecond {
+		t.Fatalf("declared retention did not survive the restart: %v", got)
+	}
+	if got := s2.keyScheme("app"); got != model.KeyOffset {
+		t.Fatalf("declared key scheme did not survive the restart: %q", got)
 	}
 }
 

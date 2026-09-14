@@ -242,3 +242,41 @@ profiles:
 		}
 	}
 }
+
+// Two multiline rules with the same start_contains are one rule: the
+// stream keys its open buffers by that marker and the first rule wins, so
+// the second's join list and idle_timeout are unreachable.
+func TestDuplicateMultilineMarkerIsRefused(t *testing.T) {
+	_, err := Parse(specWith(`    framing:
+      multiline:
+        - start_contains: 'Exception'
+          continue_regex: '^\s+at '
+          join: [{regex: '^(.*)$', capture: 1}]
+        - start_contains: 'Exception'
+          continue_regex: '^Caused by'
+          join: [{regex: '^(.*)$', capture: 1}]
+` + joinPatterns))
+	if err == nil {
+		t.Fatal("a repeated start_contains compiled; the second rule can never join anything")
+	}
+	if !strings.Contains(err.Error(), "start_contains") {
+		t.Fatalf("error does not name the duplicate: %v", err)
+	}
+}
+
+// Bucket sets are resolved by name, so a repeated one silently replaces
+// the earlier declaration.
+func TestDuplicateBucketSetNameIsRefused(t *testing.T) {
+	_, err := Parse(specWith(`    bucket_sets:
+      - name: hdr
+        buckets: ['00','01']
+      - name: hdr
+        buckets: ['00','01','02']
+` + joinPatterns))
+	if err == nil {
+		t.Fatal("a duplicate bucket set name compiled; the later one silently replaces the earlier")
+	}
+	if !strings.Contains(err.Error(), "duplicate bucket set") {
+		t.Fatalf("error does not name the duplicate: %v", err)
+	}
+}

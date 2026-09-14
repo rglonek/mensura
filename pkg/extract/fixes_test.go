@@ -491,3 +491,133 @@ func TestAnUnrepresentableTotalDoesNotFabricateATail(t *testing.T) {
 		t.Fatalf("00plus is %d, want 7", v)
 	}
 }
+
+// A `max` window in which no record ever carried the aggregated field
+// used to emit the accumulator's zero value, which is a reading nothing
+// took. hasValue already stopped the seed from beating a negative
+// measurement; this is the case where there is no measurement at all.
+func TestEmptyMaxWindowWritesNoFabricatedZero(t *testing.T) {
+	spec, err := Parse([]byte(`
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats:
+        - layout: epoch_s
+          regex: '^\d+'
+      anchor: prefix
+      strip: true
+    labels: [op]
+    patterns:
+      - set: lat
+        search: 'op='
+        extract:
+          - 'op=(?P<op>\S+)(?: lat=(?P<lat>\d+))?'
+        aggregate: {every: 10s, on: [op], field: lat, mode: max}
+`))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	st, err := spec.NewStream(spec.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	// Three records in one window, none of them carrying `lat`.
+	for i := 0; i < 3; i++ {
+		if _, err := st.Process(fmt.Sprintf("%d op=GET", 1700000000+i)); err != nil {
+			t.Fatalf("process: %v", err)
+		}
+	}
+	out, _ := st.Flush()
+	for _, r := range out {
+		if v, ok := r.Fields["lat"]; ok {
+			t.Fatalf("a window that measured nothing reported lat=%s", v.String())
+		}
+	}
+	if len(out) != 0 {
+		t.Fatalf("a window whose only column had no reading still wrote %d row(s): %+v", len(out), out)
+	}
+	if st.Stats.WindowsEmpty != 1 {
+		t.Fatalf("the dropped window was not counted: %d", st.Stats.WindowsEmpty)
+	}
+
+	// A window that does see a value still reports it, including a
+	// negative one.
+	st2, err := spec.NewStream(spec.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if _, err := st2.Process("1700000000 op=GET"); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if _, err := st2.Process("1700000001 op=GET lat=42"); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	out2, _ := st2.Flush()
+	if len(out2) != 1 {
+		t.Fatalf("expected one row, got %+v", out2)
+	}
+	if v, ok := out2[0].Fields["lat"]; !ok || v.String() != "42" {
+		t.Fatalf("max window reported %v, want 42", out2[0].Fields)
+	}
+}
+
+// A capture group that did not participate is an absent field, not a
+// field holding the empty string.
+//
+// Go reports a non-participating group as "", so an optional numeric
+// capture wrote a string into a numeric column on every record that
+// omitted it: `default_values` never fired because the key was present,
+// and an aggregating pattern refused the whole record rather than just
+// that column.
+func TestAbsentOptionalCaptureIsNotAnEmptyField(t *testing.T) {
+	spec, err := Parse([]byte(`
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats:
+        - layout: epoch_s
+          regex: '^\d+'
+      anchor: prefix
+      strip: true
+    labels: [op]
+    patterns:
+      - set: req
+        search: 'op='
+        extract:
+          - 'op=(?P<op>\S+) code=(?P<code>\d+)(?: bytes=(?P<bytes_sent>\d+))?'
+        default_values: {bytes_sent: 0}
+`))
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	st, err := spec.NewStream(spec.Profiles[0], StreamOptions{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	out, err := st.Process("1700000000 op=GET code=200")
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one sample, got %+v", out)
+	}
+	// default_values fills the capture the regex did not produce, which
+	// is the whole of what it is documented to do.
+	v, ok := out[0].Fields["bytes_sent"]
+	if !ok {
+		t.Fatal("default_values did not fill the absent capture")
+	}
+	if v.T != model.TypeInt || v.I != 0 {
+		t.Fatalf("bytes_sent is %v (%v), want the integer 0", v.String(), v.T)
+	}
+	// And a record that does carry it is untouched.
+	out2, err := st.Process("1700000001 op=GET code=200 bytes=512")
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if got := out2[0].Fields["bytes_sent"]; got.T != model.TypeInt || got.I != 512 {
+		t.Fatalf("bytes_sent is %v, want 512", got.String())
+	}
+}

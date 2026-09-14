@@ -109,6 +109,10 @@ func checkSample(spec *extract.Spec, path string, labels map[string]string, maxR
 		fmt.Printf("  windows closed early:   %d (the open-window cap was reached; `aggregate.on` is higher-cardinality than the spec expects)\n",
 			st.WindowsForcedClosed)
 	}
+	if st.WindowsEmpty > 0 {
+		fmt.Printf("  windows with no value:  %d (no record in them carried `aggregate.field`, so they wrote no row rather than a zero nothing measured)\n",
+			st.WindowsEmpty)
+	}
 	// The reduction each aggregating pattern buys. 03-extraction.md
 	// section 9 says aggregation is lossy on purpose and that `check`
 	// reports how lossy; nothing measured it, so the one number that
