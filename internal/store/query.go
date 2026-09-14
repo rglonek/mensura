@@ -22,8 +22,19 @@ import (
 // partial shape and the reason.
 func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryResponse, error) {
 	started := time.Now()
+	// Refused before a job slot is asked for. Close takes every slot and
+	// never gives one back, so without this a query arriving during
+	// shutdown would block on the semaphore until its own context expired
+	// rather than being told the store is going away.
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
 	if req.AST == nil {
-		return nil, fmt.Errorf("query: no AST supplied")
+		// A Diag, not a bare error: handleQuery turns anything else into
+		// a 500, so a request that simply forgot its AST was reported as
+		// a fault in the store rather than in what the client sent --
+		// and a 500 is what wire.Client classifies as worth retrying.
+		return nil, mql.Diag{Code: "E002", Msg: "the request carries no AST; a panel stores the AST, never the text"}
 	}
 	q := req.AST
 
@@ -156,6 +167,10 @@ type queryPlan struct {
 	// wants: reading forward to a LIMIT returns the oldest matches in the
 	// range and never the most recent ones.
 	reverse bool
+	// overlapping says two of the selected shards can hold a row at the
+	// same instant, so the order the scan meets rows in is not time
+	// order. A bounded walk may then not stop at the first rows it sees.
+	overlapping bool
 }
 
 // resolvedField is one selected field with its modifiers resolved against
@@ -171,7 +186,7 @@ func (s *Store) plan(q *mql.Query, req *wire.QueryRequest) (*queryPlan, []mql.Di
 	p := &queryPlan{}
 	var warns []mql.Diag
 
-	p.shards = s.shardsFor(q.From, req.FromMs, req.ToMs)
+	p.shards, p.overlapping = s.shardsFor(q.From, req.FromMs, req.ToMs)
 	p.reverse = q.Format == mql.FormatLogs
 
 	proj := map[string]struct{}{model.TimestampField: {}}
@@ -816,6 +831,20 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 		vals []any
 	}
 	var rows []tsRow
+	truncated := false
+	// keepBest reduces the buffer to the rows the format asks for: the
+	// newest under FORMAT logs, the oldest otherwise. It is what decides
+	// which rows survive a LIMIT, rather than the order the scan happened
+	// to meet them in.
+	keepBest := func() {
+		sort.SliceStable(rows, func(i, j int) bool {
+			if p.reverse {
+				return rows[i].ts > rows[j].ts
+			}
+			return rows[i].ts < rows[j].ts
+		})
+		rows = rows[:limit]
+	}
 	err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
 		ts, ok := row[model.TimestampField].AsInt()
 		if !ok {
@@ -858,16 +887,37 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 			return true
 		}
 		rows = append(rows, tsRow{ts, vals})
-		return len(rows) <= limit
+		if len(rows) <= limit {
+			return true
+		}
+		// One row past the limit is the signal that the range held more
+		// than was asked for.
+		truncated = true
+		// Stopping here is only correct while the scan meets rows in
+		// time order, which needs the shards to be disjoint. They are
+		// not after an ordinary configuration change: declaring
+		// `retention: 0` routes later writes to the unsharded "@all"
+		// shard while the dated ones are still there, and changing
+		// `shard:` leaves a wide shard straddling narrow ones. "@all"
+		// sorts first, so a FORMAT logs query stopped after the *oldest*
+		// shard and answered with the oldest rows under a message saying
+		// the newest had been kept -- and FORMAT table did the mirror
+		// image. Where the order cannot be trusted the walk has to see
+		// every row; the buffer is compacted rather than grown without
+		// bound.
+		if !p.overlapping {
+			return false
+		}
+		if len(rows) >= 2*limit+tabularSlack {
+			keepBest()
+		}
+		return true
 	})
 	if err != nil {
 		return err
 	}
-	// The scan stops one row past the limit, so an extra row is the signal
-	// that the range held more than was asked for.
-	truncated := len(rows) > limit
-	if truncated {
-		rows = rows[:limit]
+	if len(rows) > limit {
+		keepBest()
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
 	// A column that carried even one string is a string column, and every
@@ -912,6 +962,12 @@ func (s *Store) runTabular(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	}
 	return nil
 }
+
+// tabularSlack is the headroom keepBest is allowed before it compacts, so
+// a scan over overlapping shards pays for one sort per slack rows rather
+// than one per row. It also keeps the degenerate LIMIT POINTS 0 case from
+// sorting on every row.
+const tabularSlack = 64
 
 // scan walks every shard the plan selected, honouring the request context
 // so a client disconnect unwinds iteration rather than finishing it.
@@ -1155,10 +1211,8 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 		if impossible {
 			continue
 		}
-		p := &queryPlan{
-			shards: shardsInRange(set, byLogical[set], req.FromMs, req.ToMs),
-			expr:   expr,
-		}
+		shards, overlapping := shardsInRange(set, byLogical[set], req.FromMs, req.ToMs)
+		p := &queryPlan{shards: shards, overlapping: overlapping, expr: expr}
 		for c := range proj {
 			p.projection = append(p.projection, c)
 		}

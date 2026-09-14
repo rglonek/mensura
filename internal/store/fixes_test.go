@@ -118,8 +118,11 @@ func TestShardsInRangeMatchesShardsFor(t *testing.T) {
 		{base + 24*3600*1000, base + 2*24*3600*1000},
 		{base - 10*24*3600*1000, base - 9*24*3600*1000},
 	} {
-		want := s.shardsFor("app", r.from, r.to)
-		got := shardsInRange("app", all, r.from, r.to)
+		want, wantOverlap := s.shardsFor("app", r.from, r.to)
+		got, gotOverlap := shardsInRange("app", all, r.from, r.to)
+		if wantOverlap != gotOverlap {
+			t.Fatalf("range %d..%d: overlap %v vs %v", r.from, r.to, wantOverlap, gotOverlap)
+		}
 		if len(want) != len(got) {
 			t.Fatalf("range %d..%d: shardsFor %v, shardsInRange %v", r.from, r.to, want, got)
 		}

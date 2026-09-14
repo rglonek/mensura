@@ -342,6 +342,15 @@ Rules:
   literally `tail`. A pattern feeding a `tail: true` bucket set may not also
   capture a group by that name; the compiler refuses the clash rather than
   letting one silently overwrite the other.
+- Every column a bucket set writes must be a distinct name: the buckets
+  themselves, the `<bucket>plus` columns `cumulative:` derives, the `tail`
+  column and the `total_field` capture all land on one row. A repeated
+  bucket is not a duplicate declaration but a corrupted histogram —
+  `expand()` adds each occurrence into the sum it derives the tail from,
+  so the tail comes out short and every cumulative column below it with
+  it — and a bucket named after another's cumulative column has the count
+  the source reported overwritten by a derived number. The compiler names
+  both declarations rather than letting either happen silently.
 - A pattern that names a `bucket_set` must capture the payload in a group
   called `buckets` or `histogram`, and the compiler checks that it does.
 - Edges are ascending lower bounds, and the compiler holds them to that:

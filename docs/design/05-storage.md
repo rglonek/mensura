@@ -239,6 +239,26 @@ day shards, `set@YYYYMMDDHH` for hour shards, `set@all` for `retention: none`.
 `@` is therefore excluded from the set-name charset, which is what keeps the
 physical and logical namespaces from colliding.
 
+### 7.1 Shards can overlap, and a bounded scan has to know
+
+Shards of one set are normally disjoint, so reading them oldest-first
+visits rows in time order. Two ordinary configuration changes break that,
+and both leave the old shards where they are:
+
+- **Withdrawing retention.** `set@all` covers every instant, so a set that
+  already has dated shards and then gains `retention: 0` has one shard
+  overlapping all the others.
+- **Changing the shard width.** A set written at `shard: 24h` and then at
+  `shard: 1h` has a day shard straddling the hour shards inside it.
+
+Neither loses data and neither affects a timeseries or heatmap query,
+which aggregate the whole range. It matters to a *bounded* one: a
+`FORMAT logs` query stops as soon as it has `LIMIT POINTS` rows, and
+`set@all` sorts first, so it used to stop after the oldest shard and
+answer with the oldest rows under a message saying the newest were kept.
+The shard planner now reports whether its selection overlaps, and the
+tabular executor keeps the early stop only where it does not.
+
 Internal sets, all under the reserved prefix and all writable only by the store
 itself:
 

@@ -374,6 +374,14 @@ The partial-result behaviour is part of the contract:
 | `MaxDataPointsReceived` | 34 560 000 | Return partial data plus "too many datapoints; zoom in or filter" |
 | Per-query wall clock | none (client context governs) | Client disconnect unwinds the scan |
 | `LIMIT POINTS` (table/logs) | 1 000 | Truncate, flag `truncated: true`, and return the error plus `W401` — a table that silently shows the first rows of a range is indistinguishable from one that shows all of them |
+
+Truncation keeps what the format promises: the newest rows under `FORMAT
+logs`, the oldest under `FORMAT table`. The walk normally reaches them by
+reading shards in time order and stopping as soon as it has enough, which
+is only sound while a set's shards are disjoint — see
+[05](05-storage.md) §7.1 for the two configuration changes that make them
+overlap. Where they do, the scan reads the whole range and keeps the
+right rows instead; the memory it holds is still bounded by the limit.
 | `LABELS <key> WHERE …` filter scan | the two size gates above | Return the values collected so far plus the error and `W401` |
 
 Both size gates can be disabled per query via datasource-level toggles exposed

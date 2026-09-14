@@ -116,7 +116,7 @@ func TestOutOfRangeTimestampIsRejected(t *testing.T) {
 	); r.Accepted != 1 {
 		t.Fatalf("the boundary timestamp was rejected: %v", r.Rejected)
 	}
-	if got := s.shardsFor("app", math.MinInt64, math.MaxInt64); len(got) != 1 {
+	if got, _ := s.shardsFor("app", math.MinInt64, math.MaxInt64); len(got) != 1 {
 		t.Fatalf("boundary sample is not in a visible shard: %v", got)
 	}
 }
@@ -137,7 +137,7 @@ func TestSpecSuppliedRetentionIsSwept(t *testing.T) {
 	put(t, s, "app",
 		model.Sample{TSMs: old, Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(1)}},
 	)
-	if len(s.shardsFor("app", math.MinInt64, math.MaxInt64)) == 0 {
+	if got, _ := s.shardsFor("app", math.MinInt64, math.MaxInt64); len(got) == 0 {
 		t.Fatal("the sample was not stored in a shard")
 	}
 	n, err := s.RunRetention(time.Now())

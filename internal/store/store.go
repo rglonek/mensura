@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -110,8 +111,14 @@ type Store struct {
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	closeOnce sync.Once
+	closed    atomic.Bool
 	wg        sync.WaitGroup
 }
+
+// ErrClosed is what a query that arrives while the store is shutting down
+// is answered with. It is not an internal fault: the caller should come
+// back to whatever takes this store's place.
+var ErrClosed = errors.New("store: the store is shutting down")
 
 // setEntry is the catalogue record for one logical set.
 type setEntry struct {
@@ -377,14 +384,53 @@ func (s *Store) warnInexactShardWidths() {
 func (s *Store) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		s.stopOnce.Do(func() { close(s.stopCh) })
 		s.wg.Wait()
+		s.drainJobs()
 		if serr := s.saveCatalogue(); serr != nil {
 			s.cfg.Logger.Printf("ERROR saving catalogue on close: %v", serr)
 		}
 		err = s.db.Close()
 	})
 	return err
+}
+
+// closeJobDrain bounds how long Close waits for the queries that are still
+// running. A query that will not finish must not stop a store from
+// shutting down.
+const closeJobDrain = 30 * time.Second
+
+// drainJobs waits for every executing query before the engine is torn
+// down.
+//
+// Closing underneath one is not untidy, it is unsound: a query holds a
+// pebble iterator over a snapshot for the whole of its scan, and Close
+// releases the sstable readers and the cached blocks that iterator is
+// reading out of. Pebble's own contract is that every iterator is closed
+// first.
+//
+// Nothing else guaranteed it. In server mode the HTTP listeners are shut
+// down first, but http.Server.Shutdown gives up after its own timeout and
+// returns while a long scan is still running. In plugin mode Grafana's
+// queries do not go through an http.Server at all: ServeLocal keeps
+// answering until the process exits, so a SIGTERM during a panel refresh
+// closed the engine under a live iterator every time.
+//
+// Every query path takes a job slot for the whole of its scan, so taking
+// all of them is what "no query is running" means here. The slots are
+// never given back: Close is one-way, and Query refuses outright once the
+// closed flag is set, so nothing is waiting on them.
+func (s *Store) drainJobs() {
+	deadline := time.After(closeJobDrain)
+	for i := 0; i < cap(s.jobs); i++ {
+		select {
+		case s.jobs <- struct{}{}:
+		case <-deadline:
+			s.cfg.Logger.Printf("WARNING closing the engine with %d quer(ies) still running after %s", cap(s.jobs)-i, closeJobDrain)
+			return
+		}
+	}
 }
 
 func (s *Store) DB() *engine.DB        { return s.db }
@@ -897,8 +943,9 @@ func mod(a, b int64) int64 {
 }
 
 // shardsFor lists the physical shards of a logical set that overlap a time
-// range, oldest first.
-func (s *Store) shardsFor(set string, fromMs, toMs int64) []string {
+// range, oldest first, and reports whether any two of them can hold a row
+// at the same instant.
+func (s *Store) shardsFor(set string, fromMs, toMs int64) ([]string, bool) {
 	return shardsInRange(set, s.db.Sets(), fromMs, toMs)
 }
 
@@ -910,11 +957,20 @@ func (s *Store) shardsFor(set string, fromMs, toMs int64) []string {
 // catalogue was moved off that shape onto shardsByLogical; the LABELS
 // filter scan, which walks every set carrying a label on every dashboard
 // variable refresh, was left on it.
-func shardsInRange(set string, names []string, fromMs, toMs int64) []string {
+//
+// The second return value is what tells a bounded walk whether the scan
+// order means anything. Shards are normally disjoint, so reading them
+// oldest-first (or newest-first) visits rows in time order and a query
+// with a LIMIT may stop as soon as it has enough. Two things break that:
+// the unsharded "@all" shard, which covers every instant, and a set whose
+// shard width was changed, which leaves a wide shard straddling narrow
+// ones. Both happen through ordinary configuration changes, and both used
+// to be invisible -- see runTabular.
+func shardsInRange(set string, names []string, fromMs, toMs int64) ([]string, bool) {
 	prefix := set + "@"
 	type shard struct {
-		name  string
-		start int64
+		name       string
+		start, end int64
 	}
 	var found []shard
 	for _, name := range names {
@@ -924,7 +980,7 @@ func shardsInRange(set string, names []string, fromMs, toMs int64) []string {
 		suffix := name[len(prefix):]
 		if suffix == shardAll {
 			// The unsharded shard covers everything, so it sorts first.
-			found = append(found, shard{name, math.MinInt64})
+			found = append(found, shard{name, math.MinInt64, math.MaxInt64})
 			continue
 		}
 		start, width, err := parseShardSuffix(suffix)
@@ -935,7 +991,7 @@ func shardsInRange(set string, names []string, fromMs, toMs int64) []string {
 		if end.UnixMilli() <= fromMs || start.UnixMilli() > toMs {
 			continue
 		}
-		found = append(found, shard{name, start.UnixMilli()})
+		found = append(found, shard{name, start.UnixMilli(), end.UnixMilli()})
 	}
 	// Chronological, not lexicographic: "all" sorts after digits, so a set
 	// that has both forms would otherwise be scanned out of time order.
@@ -946,10 +1002,17 @@ func shardsInRange(set string, names []string, fromMs, toMs int64) []string {
 		return found[i].name < found[j].name
 	})
 	out := make([]string, 0, len(found))
-	for _, f := range found {
+	overlapping, covered := false, int64(math.MinInt64)
+	for i, f := range found {
+		if i > 0 && f.start < covered {
+			overlapping = true
+		}
+		if f.end > covered {
+			covered = f.end
+		}
 		out = append(out, f.name)
 	}
-	return out
+	return out, overlapping
 }
 
 // parseShardSuffix recovers a shard's start and width. The bare forms are
@@ -1057,7 +1120,7 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	// key's cardinality budget only ever grows; recovering it needs the
 	// per-set dictionaries that ADR-004 rejected, not a sweep here.
 	for logical := range emptied {
-		if len(s.shardsFor(logical, math.MinInt64, math.MaxInt64)) > 0 {
+		if live, _ := s.shardsFor(logical, math.MinInt64, math.MaxInt64); len(live) > 0 {
 			continue
 		}
 		// forgetAgedSet, not ForgetSet: what the shards took with them

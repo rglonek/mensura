@@ -149,6 +149,9 @@ Memory floor for the store is roughly `cache_bytes + memtable_size ×
 (stop_writes_threshold + 1) + 512 MiB` of headroom for query buffers; at
 defaults that is ~2.5 GiB. On a small host, set `cache_bytes: 268435456` and
 `memtable_size_bytes: 67108864` and expect slower scans, not failures.
+`cache_bytes: -1` asks for no block cache at all; the engine translates it
+into the smallest cache the LSM will build, because leaving the setting
+unset there is what makes the engine allocate its own default instead.
 
 CPU: ingest is regex-bound and scales nearly linearly with cores up to the
 file-parallelism cap; the store is I/O-bound on ingest and scan-bound on query.

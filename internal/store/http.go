@@ -369,6 +369,13 @@ func (a *API) handleQuery(w http.ResponseWriter, r *http.Request, _ string) {
 			// The client went away; there is nobody to read a body.
 			return
 		}
+		// A store that is shutting down is not a broken one: say so with
+		// the status that means "come back", the way a shed body does.
+		if errors.Is(err, ErrClosed) {
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		// Anything else came from the engine, not from the request. A 400
 		// would tell the caller to fix a query that is not the problem.
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -560,7 +567,8 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	dropped := 0
-	for _, shard := range a.store.shardsFor(name, math.MinInt64, math.MaxInt64) {
+	shards, _ := a.store.shardsFor(name, math.MinInt64, math.MaxInt64)
+	for _, shard := range shards {
 		if err := a.store.db.DropSet(shard); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
