@@ -66,6 +66,19 @@ ignored or routed to `default_profile:`, and the decision is counted and
 logged — silently dropping unmatched files is the failure mode that wastes an
 afternoon.
 
+Every `path_glob` is compiled at spec-compile time. `filepath.Match`
+reports a malformed pattern as an error *alongside* "did not match", so a
+glob that does not compile matched no file at all and surfaced at import
+time as "no profile matched" — which points at the file rather than at
+the pattern.
+
+`defaults.timestamp.timezone` and `assume_year` are checked there too,
+though they are used per stream: an unknown zone name or a year that is
+not one used to compile cleanly, pass `check`, and then fail once per
+file, once per connection, or on every single poll of a followed path.
+`assume_year` must fall inside 1970..9999, because a year-less timestamp
+resolved against anything outside it is a sample the store refuses.
+
 Dialect (which profile parses this stream) and identity (which labels the
 stream carries) are separate concepts, and conflating them — using the identity
 label to select the parser — is the mistake this two-key design exists to
@@ -140,6 +153,15 @@ opposite of what it says is refused, the way `identity.scan_lines` and a
 negative `sets:` retention are.
 Timestamp regression inside a multiline record is an error for that record,
 not a silent join.
+
+`capture` names a regex group and is read as a slice index into the
+submatch list, so it is checked against the rule's own regex at compile
+time: `0 <= capture <= NumSubexp()`. A negative value used to compile and
+then panic with an index out of range on the first continuation line that
+matched — on a batch worker, the follow poll loop or a receive
+connection, any of which takes the ingester down — and an index past the
+last group failed the other way, joining nothing while still opening a
+buffer on every start marker.
 
 Both keys are required, and the compiler refuses a rule missing either.
 `continue_regex` is the only test applied to a candidate continuation, so
@@ -315,6 +337,11 @@ Rules:
   letting one silently overwrite the other.
 - A pattern that names a `bucket_set` must capture the payload in a group
   called `buckets` or `histogram`, and the compiler checks that it does.
+- Edges are ascending lower bounds, and the compiler holds them to that:
+  a `linear:` step must be positive and `explicit:` edges must increase.
+  They are also parsed strictly — a step or an edge that is not entirely a
+  number is refused rather than read up to the first byte that does not
+  fit, so `linear:5x` is an error and not a step of 5.
 
 Bucket-set membership is recorded in the field catalogue, which is how
 `FORMAT heatmap` knows which fields form one histogram

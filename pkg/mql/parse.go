@@ -10,7 +10,27 @@ type parser struct {
 	toks  []token
 	i     int
 	diags []Diag
+	// depth is how many predicate groups the recursive descent is
+	// currently inside, so MaxPredicateDepth can be enforced.
+	depth int
 }
+
+// MaxPredicateDepth bounds how deeply a WHERE predicate may nest, in the
+// text grammar and in the AST alike.
+//
+// It exists because the predicate parser is recursive descent and Go's
+// stack overflow is not a recoverable panic: it is a fatal runtime error
+// that kills the process, so net/http's per-request recovery cannot catch
+// it. `FROM a SELECT b WHERE ((((...` with a million parentheses -- well
+// inside the store's default 32 MiB body limit -- took down whichever
+// process served POST /v1/parse, which in plugin mode is the process that
+// owns the data directory. The same bound is applied in Validate, so an
+// AST too deep to print-and-reparse is refused rather than accepted, and
+// the text and JSON surfaces stay the same language.
+//
+// Sixty-four is far past anything a dashboard or a query builder emits;
+// the deepest predicate in the documentation is three.
+const MaxPredicateDepth = 64
 
 // Parse turns MQL text into the canonical AST.
 func Parse(src string) (*Query, error) {
@@ -565,6 +585,15 @@ func (p *parser) parseAnd() (Expr, error) {
 }
 
 func (p *parser) parseUnary() (Expr, error) {
+	// The recursion bound, taken at the one function every nesting
+	// construct -- a parenthesised group and NOT alike -- passes through.
+	// Counting here rather than in parsePredicate keeps `a AND b AND c`,
+	// which is a loop and not a nesting, at depth one.
+	if p.depth >= MaxPredicateDepth {
+		return Expr{}, p.errf("predicate nests deeper than the limit of %d", MaxPredicateDepth)
+	}
+	p.depth++
+	defer func() { p.depth-- }()
 	if p.acceptKeyword("NOT") {
 		inner, err := p.parseUnary()
 		if err != nil {

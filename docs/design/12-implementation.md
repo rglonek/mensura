@@ -168,6 +168,7 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Percentile estimation from bucket sets, `AGGREGATE … BY` | **not implemented** (M5) |
 | Streaming live tail, annotations, dashboard library, dashboard converter | **not implemented** (M6) |
 | Spec reload on SIGHUP | **not implemented** (M4 remainder) |
+| Ingest config file, environment-variable configuration layer, `mensura-store config check` | **not implemented**: `mensura-ingest` takes flags only, and only the two bearer tokens come from the environment (§7) |
 
 ## 6. Divergences from documents 01–11
 
@@ -2377,6 +2378,156 @@ number that was cut in two.
   identical `W201` per set — a dozen copies of one sentence on a
   dashboard variable.
 
+### 6.118 A predicate that nests deeper than the stack
+
+The MQL predicate parser is recursive descent, and nothing bounded its
+recursion. Go's stack overflow is not a recoverable panic: it is a fatal
+runtime error, so `net/http`'s per-request recovery cannot catch it and
+the process exits. `FROM app SELECT cpu WHERE ((((…` with a million
+parentheses is 1 MB of text — well inside the store's default
+`max_request_bytes` of 32 MiB — and `POST /v1/parse` is the endpoint the
+query editor calls on every keystroke. In `mode: plugin` the process it
+took down is the one holding the data directory.
+
+Three bounds, all in `pkg/mql`:
+
+- **`MaxPredicateDepth` (64) in the parser.** Counted in `parseUnary`,
+  which is the one function every nesting construct passes through — a
+  parenthesised group and `NOT` alike — so `a AND b AND c`, which is a
+  loop rather than a nesting, stays at depth one. The deepest predicate
+  anywhere in these documents is three.
+- **The same bound in `Validate`.** An AST arrives as JSON, whose decoder
+  allows far deeper nesting than the printer, the store's lowering or the
+  engine's evaluator are written for, and the AST is the canonical form:
+  a panel stores it directly. Refusing it at the depth the text grammar
+  refuses also keeps `Print` → `Parse` total, which [06](06-query.md) §7
+  promises.
+- **`MaxQueryBytes` (1 MiB) in the lexer.** Lexing materialises one token
+  per punctuation character before the parser sees any of them, and a
+  token is several times the size of the byte it came from, so a 32 MiB
+  body of parentheses is over a gigabyte of tokens per concurrent
+  request. Every other buffer in this system is bounded; this one was
+  reached through the query editor's own endpoint.
+
+### 6.119 A join capture is a slice index
+
+`multiline.join[].capture` names a regex group, and `Process` reads
+`g[j.Capture]` after testing `len(g) > j.Capture` — which is true for
+every negative value. `capture: -1` therefore compiled cleanly, passed
+`check`, and then panicked with an index out of range on the first
+continuation line that matched, on whichever goroutine happened to be
+extracting: a batch worker, the follow poll loop, or a receive
+connection. A panic on any of them takes the ingester down.
+
+The other end fails open instead of loudly, which is the failure an
+absent `continue_regex` is already refused for (§6.98): an index past the
+last group makes the same test false for every line, so the rule joins
+nothing while still opening a buffer on every start marker and holding
+the checkpoint behind it. `compile` now requires
+`0 <= capture <= re.NumSubexp()` and names the valid range.
+
+### 6.120 Two spec numbers that were parsed leniently
+
+`fmt.Sscanf` with `%g` stops at the first byte it cannot use and reports
+no error for the rest, which is how `retention: 1h30d` used to expand to
+`24h` before the config loader was moved off it. The same call was still
+reading bucket-set edges: `edges: linear:5x` scanned as a step of 5 and
+`explicit:[3zzz, 1, 2]` as an edge of 3 — a typo silently becoming a
+different histogram axis. Both go through `strconv.ParseFloat` now, which
+consumes the whole string or fails.
+
+Their *values* are checked as well, because [03](03-extraction.md) §8
+defines an edge as a bucket's numeric lower bound and the heatmap draws
+its y-axis from them in order. A `linear:` step of zero gives every
+bucket the same bound and a negative one runs the axis backwards; either
+way `heatmapSeriesName`, which names a series after its edge, hands the
+panel several series with one name. Explicit edges must ascend for the
+same reason.
+
+### 6.121 Everything a spec declares is decided at compile time
+
+Three declarations were still resolved at run time, so a typo compiled,
+passed `check`, and then failed once per stream for the life of the
+process:
+
+- **`select.path_glob`.** `filepath.Match` reports a malformed pattern as
+  an error *alongside* "did not match", and `matches()` discarded it — so
+  `path_glob: ['app[.log']` matched no file at all and surfaced at import
+  time as "no profile matched", which points at the file rather than at
+  the pattern.
+- **`defaults.timestamp.timezone`** and **`assume_year`.** Both are
+  resolved in `NewStream`, which runs once per file on a batch import,
+  once per connection on a receiver, and on *every poll* of a followed
+  path — so an unknown zone name logged "cannot follow x" four times a
+  second, forever, from a spec `check` had called good. `assume_year` is
+  range-checked as well as parsed: a year-less layout parses into year 0
+  and is shifted by this number, so a value outside 1970..9999 produces a
+  timestamp the store refuses per sample.
+
+### 6.122 A heatmap column is one value, not a pair
+
+The window formula in [07](07-downsampling.md) §2 doubles its width, and
+says why: each window emits both its min and its max, so sizing it to two
+points' worth of the render budget lands the output on what the panel
+asked for. A heatmap column is a single summed value (§6.4), and it was
+charged the doubled width anyway — so a panel asking for 100 data points
+drew 50 columns, with nothing saying so and no way to recover the
+resolution short of an explicit `EVERY`. `render.SingleWindow` is the
+undoubled width; `runHeatmap` and `Explain` both read the heatmap's width
+from one place, so the plan and the executor cannot disagree.
+
+### 6.123 A checkpoint is fsynced on a timer, as it always said
+
+[02](02-ingest.md) §5 describes a resume record as "written atomically
+(temp + rename) and fsynced on a timer and on clean shutdown". The timer
+was not there: `EndFlush` persisted every acked commit, and a commit
+happens whenever the batch fills or the 50 ms flush tick finds samples.
+Each one is a write, an fsync, a rename and an fsync of the directory,
+serialised on `CheckpointStore`'s own mutex, on the goroutine that also
+holds the sink's delivery lock -- so a busy follow of fifty files was
+thousands of fsync pairs a second and the state directory became the
+pipeline's throughput ceiling. On a network-mounted one it is a hard stop.
+
+`checkpointSaveInterval` (one second) is now the floor between writes for
+one stream, in both followers -- `tailer` for local files, `checkpointBox`
+for SSH paths. The in-memory acked offset still advances on every commit,
+because that is what `BeginFlush` and `EndFlush` reason about; only the
+disk copy is coalesced, and a deferred record is *owed* rather than
+dropped, so the latest offset is what eventually lands. It is written by
+whatever clock the path has -- the poll sweep locally, the probe and idle
+ticks over SSH -- and forced where deferring it would lose it: a
+retirement that removes the tailer from the map, the end of an SSH
+connection, and both shutdown exits, after the final flush.
+
+Two writes are never deferred, because the offsets on disk stop describing
+the file the moment they happen: the rewind a rotation performs, and the
+record that carries a new remote file identity.
+
+What it costs is that an unclean stop resumes from a record up to an
+interval behind, so at most a second of records is re-read. That is the
+guarantee this pipeline already offers everywhere else -- at-least-once,
+made exactly-once by content-addressed row keys (§6.5).
+
+### 6.124 Smaller corrections
+
+- **An aggregation key is length-prefixed.** The window key joined its
+  components with `\x00` and paired each `on` key to its value with `=`,
+  both of which a label value may itself contain — so `{a: "x", b: "y"}`
+  and `{a: "x\x00b=y"}` built the same key and two windows measuring
+  different things folded into one accumulator. This is the ambiguity
+  `model.PrimaryKey` and the store's `seriesKey` were each rewritten to
+  remove, and it is removed the same way: a length cannot be forged from
+  content.
+- **A spec-declared shard width says when it is rounded.** A shard suffix
+  can express whole days and the hour counts that divide one, and nothing
+  else. `Open` warns about an inexact width from the config file;
+  `warnInexactShardWidths` reads `cfg`, and a width from a spec's `sets:`
+  block never goes there — which is the documented way to declare per-set
+  sharding and the only way an ingester can. `shard: 30m` became hourly
+  shards in silence. `SetRetentionFor` now says so, once, on the call
+  that changes it: the declaration arrives again on every ingest process
+  start.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
@@ -2406,11 +2557,24 @@ number that was cut in two.
   grammar offers both; the asymmetry is recorded here rather than resolved,
   because changing either one silently changes what a stored panel draws.
 - **Documented CLI surface that does not exist.** `mensura-store
-  convert-dashboard`, `mensura-ingest --label-from-path`,
-  `--read-only-input`, and the config file with several `inputs:` entries
-  are described in [02](02-ingest.md) and [06](06-query.md) and are not
-  built. The subcommands that are built cover the single-input case each
-  of them is sugar for.
+  convert-dashboard`, `mensura-store config check`, `mensura-ingest
+  --label-from-path`, `--read-only-input`, and the whole ingest config
+  file of [09](09-operations.md) §1.2 — `store:`, `state_dir:`, `spec:`,
+  `labels:`, several `inputs:` entries, `progress:` — are described in
+  [02](02-ingest.md), [06](06-query.md) and [09](09-operations.md) and
+  are not built. `mensura-ingest` is configured by flags only, and the
+  subcommands that exist cover the single-input case each of the missing
+  ones is sugar for. What `config check` describes does happen: the store
+  refuses an inline secret at startup and names the key
+  ([config.go](../../cmd/mensura-store/config.go)); there is simply no
+  subcommand of that name.
+- **There is no environment-variable configuration layer.**
+  [09](09-operations.md) §1 describes three sources in increasing
+  precedence — config file, environment, flag — with variables following
+  the field path (`MENSURA_STORE_DB_CACHE_BYTES`). Only the two bearer
+  tokens are read from the environment (`MENSURA_STORE_TOKEN`,
+  `MENSURA_INGEST_TOKEN`), which is also the one thing §1 says may *only*
+  come from there. Everything else is config file or flag.
 - **Retention does not reclaim label dictionary entries.** There is one
   dictionary per label key for the whole store ([05](05-storage.md) §8,
   ADR-004) and every stored row holds an index into it, so a value dropped

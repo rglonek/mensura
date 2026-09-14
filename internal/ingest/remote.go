@@ -154,10 +154,26 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	// struct, so marshalling one goroutine's write while the other is
 	// mid-update is a race that can persist a torn record.
 	box := &checkpointBox{cp: cp}
-	save := func(off int64) {
-		snap := box.advance(off)
+	write := func(snap Checkpoint) {
 		if err := cps.Save(&snap); err != nil {
 			i.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", target, err)
+		}
+	}
+	// Coalesced exactly as the local follower's is, and for the same
+	// reason: Save is a write, an fsync, a rename and an fsync of the
+	// directory, and the observer fires on every acked flush -- which is
+	// as often as the batch fills. See checkpointSaveInterval.
+	save := func(off int64) {
+		if snap, ok := box.advance(off); ok {
+			write(snap)
+		}
+	}
+	// persistOwed writes what a coalesced advance deferred. The tail loop
+	// is this path's timer: it has no sweep, so the probe tick, the idle
+	// tick and the end of each connection are where an owed record lands.
+	persistOwed := func(force bool) {
+		if snap, ok := box.dueSave(force); ok {
+			write(snap)
 		}
 	}
 	obs := &remoteObserver{
@@ -174,9 +190,12 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	progress := obs.progress
 	i.cfg.Sink.Observe(obs)
 
+	// A reset is a rotation or a --start-at: the offsets on disk stop
+	// describing the file the moment it happens, so this one is never
+	// deferred.
 	resetTo := func(off int64) {
 		progress.set(off)
-		save(off)
+		write(box.forceAdvance(off))
 	}
 	saveIdentity := func(ident string) {
 		snap := box.setIdentity(ident)
@@ -244,7 +263,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		if err != nil {
 			return err
 		}
-		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity(), lag)
+		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity(), lag, persistOwed)
 		rs.mergeStats(i.cfg.Progress)
 		flushed, pos, verdicts := rs.flushAll()
 		for _, verr := range verdicts {
@@ -276,6 +295,9 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		// samples were not all queued, while remoteStream.consumed --
 		// which only advances once delivery has succeeded -- has not.
 		progress.advance(rs.held())
+		// The connection is over, so this is the last moment its
+		// checkpoint can be written before a reconnect re-reads from it.
+		persistOwed(true)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -288,6 +310,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		case <-time.After(opts.ReconnectBackoff):
 		}
 	}
+	persistOwed(true)
 	return nil
 }
 
@@ -422,15 +445,58 @@ func (rs *remoteStream) flushAll() ([]extract.Result, string, []error) {
 type checkpointBox struct {
 	mu sync.Mutex
 	cp *Checkpoint
+	// savedAt is when this record last reached disk and saveOwed says an
+	// advance since then was coalesced away. See checkpointSaveInterval.
+	savedAt  time.Time
+	saveOwed bool
 }
 
-// advance moves the resume point and returns the record to persist.
-func (b *checkpointBox) advance(off int64) Checkpoint {
+// advance moves the resume point and returns the record to persist, or
+// reports false when the last write was too recent and the record is owed
+// instead. The in-memory offset always moves; the file is only its
+// crash-resume copy.
+func (b *checkpointBox) advance(off int64) (Checkpoint, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.setLocked(off)
+	return b.takeLocked(false)
+}
+
+// forceAdvance moves the resume point and always persists it, for a
+// rotation or a --start-at: the offsets on disk stop describing the file
+// the moment either happens.
+func (b *checkpointBox) forceAdvance(off int64) Checkpoint {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setLocked(off)
+	cp, _ := b.takeLocked(true)
+	return cp
+}
+
+// dueSave hands back a record a coalesced advance deferred, once the
+// interval has passed or the caller forces it.
+func (b *checkpointBox) dueSave(force bool) (Checkpoint, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.saveOwed {
+		return Checkpoint{}, false
+	}
+	return b.takeLocked(force)
+}
+
+func (b *checkpointBox) setLocked(off int64) {
 	b.cp.Offset, b.cp.AckedOffset = off, off
 	b.cp.UpdatedUnix = time.Now().Unix()
-	return *b.cp
+}
+
+func (b *checkpointBox) takeLocked(force bool) (Checkpoint, bool) {
+	at := time.Now()
+	if !force && !b.savedAt.IsZero() && at.Sub(b.savedAt) < checkpointSaveInterval {
+		b.saveOwed = true
+		return Checkpoint{}, false
+	}
+	b.savedAt, b.saveOwed = at, false
+	return *b.cp, true
 }
 
 func (b *checkpointBox) ackedOffset() int64 {
@@ -455,6 +521,9 @@ func (b *checkpointBox) setIdentity(ident string) Checkpoint {
 	defer b.mu.Unlock()
 	b.cp.Fingerprint = ident
 	b.cp.UpdatedUnix = time.Now().Unix()
+	// This record is about to be written whole, offsets included, so any
+	// advance a coalesced write deferred is discharged by it.
+	b.savedAt, b.saveOwed = time.Now(), false
 	return *b.cp
 }
 
@@ -777,7 +846,7 @@ func (i *Ingest) remoteStat(ctx context.Context, opts RemoteOptions, path string
 // CRLF stream or a file whose last line has no newline would otherwise
 // drift the offset permanently, and the drift compounds on every
 // reconnect.
-func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, rs *remoteStream, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string, lag *remoteLag) (int64, error) {
+func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, target string, rs *remoteStream, ex *extract.Stream, labels map[string]string, progress *remoteProgress, ident string, lag *remoteLag, persistOwed func(bool)) (int64, error) {
 	args := sshArgs(opts)
 	dest := sshDest(opts)
 	start := progress.startFrom()
@@ -830,12 +899,17 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 				return
 			case now := <-idle.C:
 				i.remoteFlushIdle(ctx, rs, target, labels, progress, now)
+				// This ticker and the probe below are the only clocks a
+				// live connection has, so they are where a resume record
+				// that checkpointSaveInterval deferred is written.
+				persistOwed(false)
 			case <-progress.rewind:
 				// A hole cleared: the tail is streaming bytes from past
 				// the frozen offset, so it has to be restarted from it.
 				_ = cmd.Process.Kill()
 				return
 			case <-t.C:
+				persistOwed(false)
 				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				size, now, serr := i.remoteStat(sctx, opts, path)
 				cancel()

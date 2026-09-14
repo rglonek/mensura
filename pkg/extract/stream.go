@@ -2,6 +2,7 @@ package extract
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strconv"
@@ -216,32 +217,62 @@ type StreamOptions struct {
 	From, To time.Time
 }
 
+// timezone resolves `defaults.timestamp.timezone`. Compile calls it too,
+// so a name the platform does not know is a spec error rather than a
+// failure repeated once per stream for the life of the process.
+func (s *Spec) timezone() (*time.Location, error) {
+	tz := s.Defaults.Timestamp.Timezone
+	if tz == "" || tz == "UTC" {
+		return time.UTC, nil
+	}
+	l, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("extract: defaults.timestamp.timezone %q: %w", tz, err)
+	}
+	return l, nil
+}
+
+// assumeYear resolves `defaults.timestamp.assume_year` against a
+// reference time. A zero reference is what Compile passes: it is checking
+// the declaration, not resolving a stream.
+func (s *Spec) assumeYear(ref time.Time) (int, error) {
+	switch ay := s.Defaults.Timestamp.AssumeYear; ay {
+	case "", "file-mtime":
+		if !ref.IsZero() {
+			return ref.Year(), nil
+		}
+		return time.Now().UTC().Year(), nil
+	case "now":
+		return time.Now().UTC().Year(), nil
+	default:
+		n, err := strconv.Atoi(ay)
+		if err != nil {
+			return 0, fmt.Errorf("extract: defaults.timestamp.assume_year %q: expected file-mtime, now or a year", ay)
+		}
+		// Range-checked as well as parsed. A year-less layout parses into
+		// year 0 and is then shifted by this number, so a year outside
+		// what a sample may carry produces a timestamp the store refuses
+		// per sample -- silently, from the ingester's side, for every
+		// record the profile reads.
+		if n < 1970 || n > 9999 {
+			return 0, fmt.Errorf("extract: defaults.timestamp.assume_year %d is outside 1970..9999; a year-less timestamp resolved against it is a sample the store refuses", n)
+		}
+		return n, nil
+	}
+}
+
 // NewStream binds a profile to one source.
 func (s *Spec) NewStream(p *Profile, opts StreamOptions) (*Stream, error) {
 	if p == nil {
 		return nil, fmt.Errorf("extract: no profile selected for this stream")
 	}
-	loc := time.UTC
-	if tz := s.Defaults.Timestamp.Timezone; tz != "" && tz != "UTC" {
-		l, err := time.LoadLocation(tz)
-		if err != nil {
-			return nil, fmt.Errorf("extract: timezone %q: %w", tz, err)
-		}
-		loc = l
+	loc, err := s.timezone()
+	if err != nil {
+		return nil, err
 	}
-	year := time.Now().UTC().Year()
-	switch ay := s.Defaults.Timestamp.AssumeYear; {
-	case ay == "" || ay == "file-mtime":
-		if !opts.RefTime.IsZero() {
-			year = opts.RefTime.Year()
-		}
-	case ay == "now":
-	default:
-		n, err := strconv.Atoi(ay)
-		if err != nil {
-			return nil, fmt.Errorf("extract: assume_year %q: expected file-mtime, now or a year", ay)
-		}
-		year = n
+	year, err := s.assumeYear(opts.RefTime)
+	if err != nil {
+		return nil, err
 	}
 	// One Stats.Aggregates entry per aggregating pattern, in pattern
 	// order, so `check` can report the reduction each one buys.
@@ -814,6 +845,15 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 	return out, nil
 }
 
+// writeKeyPart appends one length-prefixed component of an aggregation
+// key. A length cannot be forged from content, so distinct inputs always
+// produce distinct byte streams.
+func writeKeyPart(b *strings.Builder, s string) {
+	var buf [binary.MaxVarintLen64]byte
+	b.Write(buf[:binary.PutUvarint(buf[:], uint64(len(s)))])
+	b.WriteString(s)
+}
+
 func (st *Stream) isLabel(pat *Pattern, name string) bool {
 	if _, ok := st.profile.labelSet[name]; ok {
 		return true
@@ -845,16 +885,28 @@ func (st *Stream) aggregate(pat *Pattern, patIdx int, set string, ts time.Time, 
 	// Two patterns that really do declare the same column with the same
 	// mode still share a window, which is the one case where merging is
 	// what the spec asks for.
-	keyParts := make([]string, 0, len(ag.On)+3)
-	keyParts = append(keyParts, set, ag.Field, ag.Mode)
+	// Every component is length-prefixed rather than joined by a
+	// separator, for the reason model.PrimaryKey and the store's
+	// seriesKey are: a label value is any valid UTF-8, so it may contain
+	// both the '=' that paired it with its key and the NUL that framed
+	// the pair. With separators, {a: "x", b: "y"} and {a: "x\x00b=y"}
+	// built the same key, so two windows that measure different things
+	// silently folded into one accumulator -- the merge this key was
+	// widened to prevent, arriving through the values instead of the
+	// column names.
+	var kb strings.Builder
+	writeKeyPart(&kb, set)
+	writeKeyPart(&kb, ag.Field)
+	writeKeyPart(&kb, ag.Mode)
 	for _, on := range ag.On {
 		v, ok := labels[on]
 		if !ok {
 			return nil, fmt.Errorf("extract: aggregation key %q is not a declared label", on)
 		}
-		keyParts = append(keyParts, on+"="+v)
+		writeKeyPart(&kb, on)
+		writeKeyPart(&kb, v)
 	}
-	key := strings.Join(keyParts, "\x00")
+	key := kb.String()
 
 	// The verdict AsFloat returns is honoured rather than discarded.
 	//

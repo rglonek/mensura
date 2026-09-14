@@ -66,7 +66,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		// a trap for whoever threads one through. Sequenced, not returned
 		// inline: return operands are evaluated left to right, so the
 		// slice header would be copied before validateExpr appended to it.
-		verr := validateExpr(q, q.Where, nil, &warns)
+		verr := validateExpr(q, q.Where, nil, &warns, 0)
 		return warns, verr
 	}
 	if q.From == "" {
@@ -219,7 +219,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		}
 	}
 
-	if err := validateExpr(q, q.Where, s, &warns); err != nil {
+	if err := validateExpr(q, q.Where, s, &warns, 0); err != nil {
 		return warns, err
 	}
 	for _, l := range q.By {
@@ -296,16 +296,27 @@ func arms(e Expr) int {
 
 // validateArm validates one arm of a compound predicate, where an empty
 // node is a fault rather than the absence of a predicate.
-func validateArm(q *Query, e Expr, s Schema, warns *[]Diag, parent string) error {
+func validateArm(q *Query, e Expr, s Schema, warns *[]Diag, parent string, depth int) error {
 	if e.Empty() {
 		return Diag{"E001", fmt.Sprintf("empty predicate node inside %q; every arm must set one of and|or|not|eq|ne|in|match|noMatch|has|missing", parent)}
 	}
-	return validateExpr(q, e, s, warns)
+	return validateExpr(q, e, s, warns, depth)
 }
 
-func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
+// validateExpr walks a predicate. depth is how many arms deep this node
+// sits, bounded by MaxPredicateDepth for the reason the parser bounds its
+// own recursion: an AST arrives as JSON, whose decoder allows far deeper
+// nesting than anything downstream is written for, and the lowering in
+// the store, the printer here and the engine's own evaluator are all
+// recursive over the same shape. Refusing the AST at the same depth the
+// text grammar refuses also keeps Print -> Parse total: an AST this
+// accepts is one the parser can read back.
+func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag, depth int) error {
 	if e.Empty() {
 		return nil
+	}
+	if depth >= MaxPredicateDepth {
+		return Diag{"E001", fmt.Sprintf("predicate nests deeper than the limit of %d", MaxPredicateDepth)}
 	}
 	if n := arms(e); n > 1 {
 		return Diag{"E001", fmt.Sprintf("predicate node sets %d fields; exactly one of and|or|not|eq|ne|in|match|noMatch|has|missing is allowed", n)}
@@ -317,17 +328,17 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag) error {
 	// "( AND host = "x")" for it, which does not parse, and the AST and
 	// its canonical text are documented to round-trip losslessly.
 	for _, sub := range e.And {
-		if err := validateArm(q, sub, s, warns, "and"); err != nil {
+		if err := validateArm(q, sub, s, warns, "and", depth+1); err != nil {
 			return err
 		}
 	}
 	for _, sub := range e.Or {
-		if err := validateArm(q, sub, s, warns, "or"); err != nil {
+		if err := validateArm(q, sub, s, warns, "or", depth+1); err != nil {
 			return err
 		}
 	}
 	if e.Not != nil {
-		if err := validateArm(q, *e.Not, s, warns, "not"); err != nil {
+		if err := validateArm(q, *e.Not, s, warns, "not", depth+1); err != nil {
 			return err
 		}
 	}

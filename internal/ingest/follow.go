@@ -74,7 +74,10 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 			// that last flush failed against a store that was already
 			// gone, which is the normal ordering in a rolling restart.
 			f.closeAll(ctx)
-			return i.cfg.Sink.Flush(context.Background())
+			err := i.cfg.Sink.Flush(context.Background())
+			// After the flush, so it records what that flush committed.
+			f.persistOwed(true)
+			return err
 		case <-i.cfg.Sink.GaveUp():
 			// Delivery has been abandoned, so reading on only produces
 			// samples nothing will store. The extractors are drained and
@@ -85,6 +88,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 			// a supervisor notices.
 			f.closeAll(ctx)
 			_ = i.cfg.Sink.Flush(context.Background())
+			f.persistOwed(true)
 			return ErrGaveUp
 		case <-idle.C:
 			f.flushIdle(ctx)
@@ -181,6 +185,11 @@ type tailer struct {
 	// published directly so the progress document can report the backlog
 	// across every followed file rather than the last one visited.
 	lag int64
+	// savedAt is when this tailer's resume record last reached disk, and
+	// saveOwed says a commit since then was coalesced away and still has
+	// to be written. See checkpointSaveInterval.
+	savedAt  time.Time
+	saveOwed bool
 }
 
 func (t *tailer) setLag(n int64) {
@@ -233,11 +242,37 @@ func (t *tailer) markInflight() {
 	t.mu.Unlock()
 }
 
+// checkpointSaveInterval bounds how often a followed file's resume record
+// is rewritten to disk.
+//
+// The record has to be durable, so CheckpointStore.Save is a write, an
+// fsync, a rename and an fsync of the directory -- and it used to run on
+// every acked flush, per tailer. A flush happens whenever the batch fills
+// or the 50 ms flush tick finds samples, so a busy follow of fifty files
+// was thousands of fsync pairs a second, serialised on the checkpoint
+// store's own mutex, on the goroutine that also holds the sink's delivery
+// lock: the state directory became the pipeline's throughput ceiling, and
+// on a network-mounted one a hard stop.
+//
+// 02-ingest.md section 5 already describes the intended cadence -- "written
+// atomically (temp + rename) and fsynced on a timer and on clean
+// shutdown" -- and the timer is what makes it affordable. What it costs is
+// that an unclean stop resumes from a record up to this far behind, so at
+// most an interval of records is re-read. That is the delivery guarantee
+// this pipeline already offers everywhere else: at-least-once, made
+// exactly-once by content-addressed row keys.
+const checkpointSaveInterval = time.Second
+
 // commitInflight promotes the snapshot to acked and returns the checkpoint
-// to write, or reports false when there is nothing new to persist. The
-// record is built and copied under the lock: two flushes can land at once,
-// and mutating the shared Checkpoint while another goroutine marshals it
-// is a race.
+// to write, or reports false when there is nothing new to write *now* --
+// either because nothing moved, or because the last write was too recent
+// and the record is owed instead. The record is built and copied under the
+// lock: two flushes can land at once, and mutating the shared Checkpoint
+// while another goroutine marshals it is a race.
+//
+// The in-memory acked offset always advances, whatever the disk does. It
+// is what BeginFlush and EndFlush reason about; the file is only the
+// crash-resume copy of it.
 func (t *tailer) commitInflight(now int64) (Checkpoint, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -248,7 +283,40 @@ func (t *tailer) commitInflight(now int64) (Checkpoint, bool) {
 	t.cp.Offset = t.acked
 	t.cp.AckedOffset = t.acked
 	t.cp.UpdatedUnix = now
+	return t.takeSaveLocked(false)
+}
+
+// takeSaveLocked decides whether the current record goes to disk now. A
+// deferred one is remembered, so persistOwed can write it when the
+// interval has passed or the follower is shutting down.
+func (t *tailer) takeSaveLocked(force bool) (Checkpoint, bool) {
+	at := time.Now()
+	if !force && !t.savedAt.IsZero() && at.Sub(t.savedAt) < checkpointSaveInterval {
+		t.saveOwed = true
+		return Checkpoint{}, false
+	}
+	t.savedAt = at
+	t.saveOwed = false
 	return *t.cp, true
+}
+
+// dueSave hands back a resume record a coalesced commit deferred, once the
+// interval has passed or the caller forces it.
+func (t *tailer) dueSave(force bool) (Checkpoint, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.saveOwed {
+		return Checkpoint{}, false
+	}
+	return t.takeSaveLocked(force)
+}
+
+// dropOwedSave forgets a deferred record, for a caller that is about to
+// write one of its own.
+func (t *tailer) dropOwedSave() {
+	t.mu.Lock()
+	t.saveOwed = false
+	t.mu.Unlock()
 }
 
 // markHoled freezes the resume offset after a dropped batch, and reports
@@ -386,7 +454,27 @@ func (f *follower) poll(ctx context.Context) error {
 	// contributing to the backlog rather than pinning it at whatever it
 	// held when it went away.
 	f.publishLag()
+	// The sweep is this follower's timer, so it is where a resume record
+	// that checkpointSaveInterval deferred is written. Without it a file
+	// that goes quiet right after a coalesced commit would keep the older
+	// record on disk until the next batch arrived.
+	f.persistOwed(false)
 	return firstErr
+}
+
+// persistOwed writes the resume records that a coalesced commit deferred.
+// force ignores the interval, which is what a shutdown wants: this is the
+// last chance the process has to record what the store already holds.
+func (f *follower) persistOwed(force bool) {
+	for _, t := range f.snapshotTailers() {
+		cp, ok := t.dueSave(force)
+		if !ok {
+			continue
+		}
+		if err := f.cps.Save(&cp); err != nil {
+			f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
+		}
+	}
 }
 
 // retireUnmatched drains and closes the tailers of paths the glob no
@@ -903,6 +991,20 @@ func (f *follower) retireKeepingCheckpoint(ctx context.Context, t *tailer) {
 
 func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
 	f.drainExtractor(ctx, t)
+	// A retired tailer leaves f.tailers below, so persistOwed will never
+	// see it again: whatever a coalesced commit deferred has to go to disk
+	// here or be lost, and losing it means re-reading those bytes when the
+	// path comes back. The rewinding form writes its own zeroed record
+	// afterwards and supersedes this one.
+	if !rewind {
+		if cp, ok := t.dueSave(true); ok {
+			if err := f.cps.Save(&cp); err != nil {
+				f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
+			}
+		}
+	} else {
+		t.dropOwedSave()
+	}
 	// Last chance: this extractor is about to be dropped, and whatever it
 	// could not match is the most useful thing it holds.
 	f.ing.cfg.Progress.MergeStream(&t.ex.Stats)
