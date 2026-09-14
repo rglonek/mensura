@@ -14,9 +14,18 @@ import (
 	"github.com/cockroachdb/pebble/bloom"
 )
 
-// NoBlockCache is the sentinel for Options.CacheBytes meaning "allocate no
-// block cache at all"; zero means "unset, use the default".
+// NoBlockCache is the sentinel for Options.CacheBytes meaning "spend no
+// memory on a block cache"; zero means "unset, use the default".
 const NoBlockCache int64 = -1
+
+// minBlockCacheBytes is what NoBlockCache is actually translated into.
+//
+// Leaving pebble.Options.Cache nil does not disable the block cache:
+// pebble's own EnsureDefaults allocates an 8 MiB one, so the sentinel an
+// operator sets precisely to reclaim that memory silently handed them
+// 8 MiB of it. Pebble has no "no cache" mode, so the honest translation
+// is the smallest cache it will build -- one that holds nothing.
+const minBlockCacheBytes int64 = 1
 
 // BytesPerSyncDisabled disables Pebble's periodic sync_file_range, which on
 // a network filesystem is a synchronous COMMIT round trip per call.
@@ -128,12 +137,15 @@ func (o *Options) pebbleOptions() *pebble.Options {
 	po.Experimental.MaxWriterConcurrency = 2
 	maxCompactions := o.MaxConcurrentCompactions
 	po.MaxConcurrentCompactions = func() int { return maxCompactions }
-	if o.CacheBytes > 0 {
-		// Pebble's cache is reference counted and Open takes its own
-		// reference, so the one held here is released by the caller once
-		// the DB is open. Dropping it on the floor leaks the whole cache
-		// for the lifetime of the process.
+	// Pebble's cache is reference counted and Open takes its own
+	// reference, so the one held here is released by the caller once the
+	// DB is open. Dropping it on the floor leaks the whole cache for the
+	// lifetime of the process.
+	switch {
+	case o.CacheBytes > 0:
 		po.Cache = pebble.NewCache(o.CacheBytes)
+	case o.CacheBytes == NoBlockCache:
+		po.Cache = pebble.NewCache(minBlockCacheBytes)
 	}
 	if o.MaxOpenFiles > 0 {
 		po.MaxOpenFiles = o.MaxOpenFiles

@@ -2657,6 +2657,81 @@ own live catalogue.
   whose group did not participate. Reporting it as "not a declared label"
   sent the operator to a spec that is correct.
 
+### 6.131 A LIMIT keeps the rows the format promises, not the rows the scan met first
+
+`FORMAT logs` walks the range newest-first and stops as soon as it holds
+`LIMIT POINTS` rows; `FORMAT table` does the same walking forwards. Both
+rely on the scan meeting rows in time order, which needs the selected
+shards to be disjoint — and two ordinary configuration changes make them
+overlap.
+
+Withdrawing a set's retention (`sets: {app: {retention: 0}}`, or the
+documented "`--retention 0` globally" posture) routes later writes to the
+unsharded `@all` shard while the dated ones are still on disk, and `@all`
+covers every instant. Changing a set's `shard:` width leaves a wide shard
+straddling narrow ones. `@all` sorts first, because it is the shard that
+starts earliest, so a `FORMAT logs` query stopped after the *oldest*
+shard and answered with the oldest rows — under an error string saying
+"the newest were kept". `FORMAT table` did the mirror image.
+
+`shardsInRange` now reports whether the shards it selected can hold a row
+at the same instant, and `runTabular` keeps the early stop only where
+they cannot. Where they can, the walk sees every row and the buffer is
+compacted to the best `LIMIT` rows as it goes, so the memory it holds is
+still bounded by the limit rather than by the range.
+
+### 6.132 Closing the store waits for the queries that are running
+
+A query holds a pebble iterator over a snapshot for the whole of its
+scan, and `DB.Close` releases the sstable readers and the cached blocks
+that iterator is reading out of; pebble's own contract is that every
+iterator is closed first. Nothing guaranteed the ordering. In server mode
+the HTTP listeners are shut down before `Store.Close`, but
+`http.Server.Shutdown` gives up after its own timeout and returns while a
+long scan is still running. In plugin mode Grafana's queries never go
+through an `http.Server` at all: `ServeLocal` keeps answering until the
+process exits, so a `SIGTERM` during a panel refresh closed the engine
+under a live iterator every time.
+
+Every query path already takes a slot from `MaxConcurrentJobs` for the
+whole of its scan, so `Close` now takes all of them before it closes the
+engine, bounded by 30 seconds because a query that will not finish must
+not stop a store from shutting down. The slots are never given back:
+`Query` refuses outright once the closing flag is set, with a `503` and a
+`Retry-After` rather than a blocked semaphore.
+
+### 6.133 Every column a bucket set writes is a distinct name
+
+The buckets of a bucket set are fields on one row, and `expand()` derives
+`<bucket>plus` and `tail` from them onto the same row, so two of them
+carrying one name is not a duplicate declaration — it is a corrupted
+histogram. `expand()` adds each occurrence of a bucket into the running
+sum it derives the tail from, so a bucket listed twice made the tail
+short by that bucket's own count (often clamped to zero) and every
+cumulative column below it wrong with it. A bucket named after another
+bucket's cumulative column, or called `tail` alongside `tail: true`, had
+the count the source really reported overwritten by a derived number. A
+`total_field` naming one of the buckets read that bucket's count as the
+total. None of it is visible at run time: the row is well formed and the
+heatmap draws. `Profile.compile` now claims each column name once and
+names both declarations when two collide — the check a pattern
+*capturing* `tail` was already given, from the other side.
+
+### 6.134 Smaller corrections
+
+- **A query with no AST is a `400`.** `Store.Query` returned a bare error
+  for it, and `handleQuery` turns anything that is not a diagnostic into
+  a `500` — so a request that simply forgot its AST was reported as a
+  fault in the store, on the status `wire.Client` reads as "come back
+  later". It is `E002` now, like every other malformed query.
+- **`NoBlockCache` allocates a cache.** Leaving `pebble.Options.Cache`
+  nil does not disable the block cache: pebble's `EnsureDefaults`
+  allocates an 8 MiB one. So `db: {cache_bytes: -1}` — the setting an
+  operator reaches for precisely to reclaim that memory on a small host —
+  silently handed them 8 MiB of it. Pebble has no "no cache" mode, so the
+  sentinel is translated into the smallest cache it will build, one that
+  holds nothing.
+
 ## 7. Known gaps worth naming
 
 - **No frontend.** The plugin backend answers Grafana correctly, but until the

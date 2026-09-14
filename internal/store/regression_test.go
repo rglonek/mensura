@@ -206,7 +206,7 @@ func TestShardSuffixCarriesItsWidth(t *testing.T) {
 	writeSamples(t, s, "http", []model.Sample{{
 		TSMs: t0.UnixMilli(), Fields: map[string]model.Value{"v": model.Int(1)},
 	}})
-	shards := s.shardsFor("http", t0.Add(-time.Minute).UnixMilli(), t0.Add(time.Minute).UnixMilli())
+	shards, _ := s.shardsFor("http", t0.Add(-time.Minute).UnixMilli(), t0.Add(time.Minute).UnixMilli())
 	if len(shards) != 1 {
 		t.Fatalf("expected the 6h shard to overlap the range, got %v", shards)
 	}
@@ -613,7 +613,8 @@ func TestAmbiguousLabelSetsStayDistinctRows(t *testing.T) {
 		t.Fatalf("accepted %d, expected 2", resp.Accepted)
 	}
 	rows := 0
-	p := &queryPlan{shards: s.shardsFor("app", ts-1000, ts+1000), projection: []string{model.TimestampField}}
+	planShards, _ := s.shardsFor("app", ts-1000, ts+1000)
+	p := &queryPlan{shards: planShards, projection: []string{model.TimestampField}}
 	if err := s.scan(context.Background(), p, &wire.QueryRequest{FromMs: ts - 1000, ToMs: ts + 1000}, nil, func(engine.Row) bool {
 		rows++
 		return true

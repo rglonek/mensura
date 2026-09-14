@@ -206,12 +206,12 @@ func TestTimeShardingAndRetention(t *testing.T) {
 		{TSMs: old.UnixMilli(), Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(1)}},
 		{TSMs: now.UnixMilli(), Labels: map[string]string{"host": "a"}, Fields: map[string]model.Value{"v": model.Int(2)}},
 	})
-	shards := s.shardsFor("http", 0, 1<<62)
+	shards, _ := s.shardsFor("http", 0, 1<<62)
 	if len(shards) != 2 {
 		t.Fatalf("expected two day shards, got %v", shards)
 	}
 	// A query for the recent window must not open the old shard.
-	if got := s.shardsFor("http", now.Add(-time.Hour).UnixMilli(), now.UnixMilli()); len(got) != 1 {
+	if got, _ := s.shardsFor("http", now.Add(-time.Hour).UnixMilli(), now.UnixMilli()); len(got) != 1 {
 		t.Fatalf("expected one overlapping shard, got %v", got)
 	}
 	n, err := s.RunRetention(now)
@@ -221,7 +221,7 @@ func TestTimeShardingAndRetention(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("expected one shard dropped, got %d", n)
 	}
-	if got := s.shardsFor("http", 0, 1<<62); len(got) != 1 {
+	if got, _ := s.shardsFor("http", 0, 1<<62); len(got) != 1 {
 		t.Fatalf("expected one shard to remain, got %v", got)
 	}
 }

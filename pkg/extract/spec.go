@@ -644,14 +644,56 @@ func (p *Profile) compile(s *Spec) error {
 		// derives "<bucket>plus" from them. Checking them here names the
 		// offending bucket; leaving it to the store turns a spec typo
 		// into a per-sample rejection with no pointer back to the spec.
-		for _, b := range bs.Buckets {
+		//
+		// Every column the set writes also has to be a *distinct* name,
+		// because they all land on one row. A repeated bucket is not a
+		// harmless duplicate declaration, it is a corrupted histogram:
+		// expand() adds each occurrence into the running `sum`, so the
+		// tail comes out short by the repeated count -- often clamped to
+		// zero -- and every cumulative column below it is wrong with it.
+		// A bucket whose name collides with a derived column is the same
+		// fault from the other side: the count the source actually
+		// reported is overwritten by a number nothing measured. Neither
+		// is visible anywhere at run time -- the row is well formed and
+		// the heatmap draws -- which is why it is decided here.
+		cols := map[string]string{}
+		claim := func(name, what string) error {
+			if prev, dup := cols[name]; dup {
+				return fmt.Errorf("bucket set %s: %s and %s both write the column %q; they share one row, so one overwrites the other and the derived totals are wrong",
+					bs.Name, prev, what, name)
+			}
+			cols[name] = what
+			return nil
+		}
+		for i, b := range bs.Buckets {
 			if err := model.ValidateFieldName(b); err != nil {
 				return fmt.Errorf("bucket set %s: %w", bs.Name, err)
 			}
-			if bs.Cumulative {
+			if err := claim(b, fmt.Sprintf("bucket %d", i+1)); err != nil {
+				return err
+			}
+		}
+		if bs.Cumulative {
+			for i, b := range bs.Buckets {
 				if err := model.ValidateFieldName(b + "plus"); err != nil {
 					return fmt.Errorf("bucket set %s: cumulative column: %w", bs.Name, err)
 				}
+				if err := claim(b+"plus", fmt.Sprintf("the cumulative column of bucket %d (%s)", i+1, b)); err != nil {
+					return err
+				}
+			}
+		}
+		if bs.Tail {
+			if err := claim(tailField, "the `tail: true` column"); err != nil {
+				return err
+			}
+		}
+		if bs.TotalField != "" {
+			// expand() writes the buckets before it reads the total, so a
+			// total_field naming one of them reads a bucket count as the
+			// total and derives the tail from it.
+			if err := claim(bs.TotalField, "`total_field`"); err != nil {
+				return err
 			}
 		}
 		p.buckets[bs.Name] = bs
