@@ -48,7 +48,8 @@ limits:
   max_concurrent_jobs: 8          # concurrent queries
   max_series_per_graph: 1000
   max_datapoints_received: 34560000
-  max_label_cardinality: 100000
+  max_label_cardinality: 100000   # distinct values under one label key
+  max_label_keys: 1000            # distinct label keys in all; <0 disables
 
 # Per-client rate limiting is not implemented (12-implementation.md §5), so
 # there is no write_rate_per_client key and no max_concurrent_requests:

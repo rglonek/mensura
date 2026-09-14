@@ -100,11 +100,17 @@ value        = string | number | variable ;
 variable     = "$" ident | "${" ident "}" ;
 format       = "timeseries" | "table" | "heatmap" | "logs" ;
 limit        = "SERIES" number | "POINTS" number ;
-duration     = number ( "ms" | "s" | "m" | "h" | "d" ) ;
+duration     = number ( "ms" | "s" | "m" | "h" | "d" ) | "0" ;
 ```
 
 Keywords are case-insensitive; identifiers are case-sensitive. Identifiers that
 collide with keywords or contain non-word characters are double-quoted.
+
+A bare `0` is the one duration written without a unit, because every unit
+gives the same answer; it is also what the printer emits for a zero, so
+`GAP 0` round-trips. `mql.ParseDuration`, which is what the extraction
+spec reads `retention:`, `shard:` and `max_interval:` through, reads the
+same language.
 
 Comments: `--` to end of line.
 

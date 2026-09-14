@@ -119,6 +119,15 @@ func (c *idempotencyCache) record(key string) {
 // are named and the rest is committed, because dropping a whole batch for
 // one malformed row loses far more than it protects.
 func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string) (*wire.WriteResponse, error) {
+	// Counted for the whole of the write, so Close waits for it rather
+	// than tearing the engine down while PutBatch is still applying. A
+	// write is the operation that runs long here: it blocks on the
+	// engine's own back-pressure when L0 is stalled, which is exactly
+	// when a shutdown is most likely to overtake it.
+	if !s.enterEngine() {
+		return nil, ErrClosed
+	}
+	defer s.leaveEngine()
 	release := s.idem.acquire(idempotencyKey)
 	defer release()
 	if s.idem.seen(idempotencyKey) {
@@ -695,7 +704,17 @@ func (s *Store) retentionFor(set string) time.Duration {
 // SaveCatalogue persists the catalogue; the HTTP layer calls it on a timer
 // so a crash loses at most the last interval of metadata, which is
 // rediscovered on the next write anyway.
-func (s *Store) SaveCatalogue() error { return s.saveCatalogue() }
+//
+// Gated, unlike the unexported form Close itself uses: this one is called
+// from a background ticker and from the admin endpoints, and it writes
+// through the engine.
+func (s *Store) SaveCatalogue() error {
+	if !s.enterEngine() {
+		return ErrClosed
+	}
+	defer s.leaveEngine()
+	return s.saveCatalogue()
+}
 
 // LabelKeys lists the label keys present on a set.
 func (s *Store) LabelKeys(set string) []string {

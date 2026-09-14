@@ -225,6 +225,12 @@ fields:
     limits: {min: 0, max: 100}
 ```
 
+`limits:` becomes the clamp the query layer installs for the field by
+default ([06](06-query.md) §4.3), so both bounds are checked at compile
+time: each must be a finite number, and `min` may not sit above `max`. A
+non-finite bound cannot be encoded on the wire at all, and a pair that
+crosses declares a range without bounding anything.
+
 Field metadata travels with the samples (once per field per set, not per
 sample — see [04-wire-protocol.md §5](04-wire-protocol.md)), is stored in the
 store's catalogue, and is served to the plugin. Effects:
@@ -266,8 +272,13 @@ patterns:
       - '(?P<method>[A-Z]+) (?P<path_x>\S+) HTTP/1\.\d" (?P<status>\d{3}) (?P<bytes_sent>\d+) (?P<request_ms>[\d.]+)'
     labels: [method]                # pattern-local label promotion
     default_values: {bytes_sent: 0} # pad missing captures
-    store_stream_label: worker      # attach the stream's ordinal as a field
 ```
+
+`store_stream_label:` appears in earlier drafts of this section and is
+**refused by the compiler**, not ignored: the key was decoded and acted on
+nowhere, and a declaration that does nothing is worse than one that is
+rejected ([12-implementation.md §7](12-implementation.md)). A spec that
+sets it fails to compile, so it is not shown above.
 
 Semantics:
 

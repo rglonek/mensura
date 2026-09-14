@@ -259,6 +259,20 @@ answer with the oldest rows under a message saying the newest were kept.
 The shard planner now reports whether its selection overlaps, and the
 tabular executor keeps the early stop only where it does not.
 
+### 7.2 The dictionary is bounded in both dimensions
+
+`max_label_cardinality` bounds the distinct values under one label key.
+`max_label_keys` bounds how many keys there are, because §8's one
+dictionary per key for the whole store means each new key is a new
+dictionary, a new entry in a catalogue that is persisted as a single
+record, and a cost nothing ever gives back — a value cannot be reclaimed
+without relabelling the rows of every set that still carries its index.
+
+Both refuse by name, per sample, on the write path, and both refuse only
+*new* entries: a key or a value the store already holds always works. The
+key budget defaults to 1000, which is far more than any spec in these
+documents declares; a negative value switches it off.
+
 Internal sets, all under the reserved prefix and all writable only by the store
 itself:
 

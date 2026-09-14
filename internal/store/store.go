@@ -59,6 +59,22 @@ type Config struct {
 	MaxDataPointsReceived int
 	MaxLabelCardinality   int
 
+	// MaxLabelKeys bounds how many distinct label *keys* the store will
+	// intern, which is the one dimension of the dictionary nothing used
+	// to bound.
+	//
+	// MaxLabelCardinality caps the values under one key; the number of
+	// keys was open. Every key allocates its own dictionary, is persisted
+	// in the catalogue -- which is written as a single JSON record -- and
+	// is never reclaimed, because a value dropped from a dictionary would
+	// relabel the rows of every set that still carries it (ADR-004). So a
+	// sender choosing its own label keys, which the line protocol,
+	// /ingest/v1/samples and /v1/write all allow, could grow the store's
+	// memory and the size of every catalogue save without limit. A key
+	// already on disk is always usable; only a new one past the cap is
+	// refused, by name, the way an over-cardinality value already is.
+	MaxLabelKeys int
+
 	// MaxConcurrentJobs bounds how many queries may execute at once. A
 	// query buffers its series in memory, so an unbounded number of them
 	// is an unbounded memory footprint.
@@ -78,6 +94,7 @@ func DefaultConfig() Config {
 		MaxSeriesPerGraph:     1000,
 		MaxDataPointsReceived: 34_560_000,
 		MaxLabelCardinality:   100_000,
+		MaxLabelKeys:          1000,
 		MaxConcurrentJobs:     8,
 		Logger:                log.New(os.Stderr, "mensura-store ", log.LstdFlags),
 	}
@@ -113,7 +130,43 @@ type Store struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	wg        sync.WaitGroup
+
+	// engineMu and engineWG are the write-side mirror of the jobs
+	// semaphore: they count the operations that are inside the engine
+	// right now, so Close can wait for them the way drainJobs waits for
+	// queries.
+	//
+	// Pebble's contract is that Close may not run concurrently with any
+	// other DB method, and only the read half of that was guaranteed. In
+	// server mode the listeners are shut down first, but
+	// http.Server.Shutdown gives up after its own timeout and returns
+	// while a handler is still running -- and a write is exactly the
+	// operation that runs long, because PutBatch blocks on the engine's
+	// own back-pressure when L0 is stalled. So a SIGTERM during a
+	// compaction stall closed the engine underneath a batch that was
+	// still applying.
+	engineMu sync.RWMutex
+	engineWG sync.WaitGroup
 }
+
+// enterEngine registers an operation that is about to touch the engine and
+// reports whether it may proceed. The caller must call leaveEngine when it
+// is done. A store that is closing refuses, so nothing new starts once
+// Close has begun waiting.
+func (s *Store) enterEngine() bool {
+	s.engineMu.RLock()
+	defer s.engineMu.RUnlock()
+	if s.closed.Load() {
+		return false
+	}
+	// Under the read lock, which is what makes this safe against the
+	// Wait in drainEngine: Close takes the write lock before it sets the
+	// flag, so no Add can race a Wait that has already started.
+	s.engineWG.Add(1)
+	return true
+}
+
+func (s *Store) leaveEngine() { s.engineWG.Done() }
 
 // ErrClosed is what a query that arrives while the store is shutting down
 // is answered with. It is not an internal fault: the caller should come
@@ -268,6 +321,9 @@ func Open(cfg Config) (*Store, error) {
 	if cfg.MaxConcurrentJobs <= 0 {
 		cfg.MaxConcurrentJobs = 8
 	}
+	if cfg.MaxLabelKeys == 0 {
+		cfg.MaxLabelKeys = DefaultConfig().MaxLabelKeys
+	}
 	opts := engine.DefaultOptions()
 	opts.Path = cfg.DataDir
 	opts.Logger = cfg.Logger
@@ -384,10 +440,16 @@ func (s *Store) warnInexactShardWidths() {
 func (s *Store) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		// Under the write lock, so an enterEngine that is mid-flight
+		// either finishes before the flag is set -- and is then counted
+		// by drainEngine -- or sees it and refuses.
+		s.engineMu.Lock()
 		s.closed.Store(true)
+		s.engineMu.Unlock()
 		s.stopOnce.Do(func() { close(s.stopCh) })
 		s.wg.Wait()
 		s.drainJobs()
+		s.drainEngine()
 		if serr := s.saveCatalogue(); serr != nil {
 			s.cfg.Logger.Printf("ERROR saving catalogue on close: %v", serr)
 		}
@@ -430,6 +492,28 @@ func (s *Store) drainJobs() {
 			s.cfg.Logger.Printf("WARNING closing the engine with %d quer(ies) still running after %s", cap(s.jobs)-i, closeJobDrain)
 			return
 		}
+	}
+}
+
+// drainEngine waits for the writes and admin operations that are inside
+// the engine before it is torn down, for the reason drainJobs waits for
+// the queries: pebble's Close may not run concurrently with any other DB
+// method.
+//
+// It is bounded like drainJobs and says so on the way out, because an
+// operation that will not finish must not stop a store from shutting
+// down -- and a shutdown that closes underneath one has to be visible
+// rather than silent.
+func (s *Store) drainEngine() {
+	done := make(chan struct{})
+	go func() {
+		s.engineWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeJobDrain):
+		s.cfg.Logger.Printf("WARNING closing the engine with writes still in flight after %s", closeJobDrain)
 	}
 }
 
@@ -677,6 +761,14 @@ func (s *Store) intern(key, value string) (int32, error) {
 	defer s.dictMu.Unlock()
 	d, ok = s.dict[key]
 	if !ok {
+		// The key budget, checked before the dictionary is allocated. It
+		// is the same shape as the value budget below: loud and early,
+		// naming the offending key, rather than letting an unbounded
+		// label namespace grow the catalogue record and the process
+		// footprint until neither can be written.
+		if s.cfg.MaxLabelKeys > 0 && len(s.dict) >= s.cfg.MaxLabelKeys {
+			return 0, fmt.Errorf("label key %q would be a new key past the limit of %d distinct label keys; unbounded label *names* cost what unbounded label values do", key, s.cfg.MaxLabelKeys)
+		}
 		d = &dictionary{index: map[string]int32{}}
 		s.dict[key] = d
 	}
@@ -1068,7 +1160,14 @@ func (s *Store) retentionLoop() {
 		case <-s.stopCh:
 			return
 		case <-t.C:
-			if n, err := s.RunRetention(time.Now()); err != nil {
+			// A sweep that finds the store shutting down is not a failed
+			// sweep: stopCh and the closed flag are set by the same
+			// Close, and whichever the select reaches first, the other
+			// is already true. Logging it would put an ERROR line on
+			// every clean shutdown the ticker happened to race.
+			if n, err := s.RunRetention(time.Now()); errors.Is(err, ErrClosed) {
+				return
+			} else if err != nil {
 				s.cfg.Logger.Printf("ERROR retention sweep: %v", err)
 			} else if n > 0 {
 				s.cfg.Logger.Printf("retention dropped %d shard(s)", n)
@@ -1081,6 +1180,10 @@ func (s *Store) retentionLoop() {
 // horizon. Dropping a whole shard is one range delete, not millions of
 // point tombstones.
 func (s *Store) RunRetention(now time.Time) (int, error) {
+	if !s.enterEngine() {
+		return 0, ErrClosed
+	}
+	defer s.leaveEngine()
 	dropped, forgotten := 0, 0
 	emptied := map[string]struct{}{}
 	for _, name := range s.db.Sets() {
@@ -1222,7 +1325,42 @@ func (s *Store) forgetAgedSet(name string) bool {
 
 // Compact runs a full-keyspace compaction; batch ingest calls this once at
 // the end of an import.
-func (s *Store) Compact() error { return s.db.Compact() }
+func (s *Store) Compact() error {
+	if !s.enterEngine() {
+		return ErrClosed
+	}
+	defer s.leaveEngine()
+	return s.db.Compact()
+}
+
+// Flush pushes the memtables down, which is what makes a filesystem
+// snapshot of the data directory meaningful.
+func (s *Store) Flush() error {
+	if !s.enterEngine() {
+		return ErrClosed
+	}
+	defer s.leaveEngine()
+	return s.db.Flush()
+}
+
+// DropShards removes every physical shard of a logical set and reports how
+// many went. It is the admin drop's engine half, gated so a shutdown
+// cannot land in the middle of it.
+func (s *Store) DropShards(name string) (int, error) {
+	if !s.enterEngine() {
+		return 0, ErrClosed
+	}
+	defer s.leaveEngine()
+	dropped := 0
+	shards, _ := s.shardsFor(name, math.MinInt64, math.MaxInt64)
+	for _, shard := range shards {
+		if err := s.db.DropSet(shard); err != nil {
+			return dropped, err
+		}
+		dropped++
+	}
+	return dropped, nil
+}
 
 // Stats returns engine statistics for the admin endpoint.
 func (s *Store) Stats() engine.StatsSnapshot { return s.db.Snapshot() }
