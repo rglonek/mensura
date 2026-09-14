@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -484,6 +483,20 @@ func (a *API) handlePrint(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The one check Print itself cannot make. It returns a string rather
+	// than an error, so it walks whatever depth the JSON decoder allowed
+	// -- ten thousand levels -- rebuilding the whole sub-expression at
+	// every one of them. Only the predicate is checked, so a half-built
+	// query from a builder still prints.
+	if err := mql.CheckPredicateDepth(&q); err != nil {
+		var d mql.Diag
+		if asDiag(err, &d) {
+			writeJSONErr(w, http.StatusBadRequest, d.Msg, d.Code)
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"text": mql.Print(&q)})
 }
 
@@ -516,7 +529,7 @@ func (a *API) handleCompact(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	if err := a.store.Compact(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeAdminErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "compacted"})
@@ -528,7 +541,7 @@ func (a *API) handleRetention(w http.ResponseWriter, r *http.Request, _ string) 
 	}
 	n, err := a.store.RunRetention(time.Now())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeAdminErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"shards_dropped": n})
@@ -542,11 +555,14 @@ func (a *API) handleQuiesce(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	if err := a.store.SaveCatalogue(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeAdminErr(w, err)
 		return
 	}
-	if err := a.store.db.Flush(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// Store.Flush, not db.Flush: everything that reaches the engine goes
+	// through a gate Close waits on, or a shutdown can land in the
+	// middle of it.
+	if err := a.store.Flush(); err != nil {
+		writeAdminErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
@@ -566,14 +582,10 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	dropped := 0
-	shards, _ := a.store.shardsFor(name, math.MinInt64, math.MaxInt64)
-	for _, shard := range shards {
-		if err := a.store.db.DropSet(shard); err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		dropped++
+	dropped, err := a.store.DropShards(name)
+	if err != nil {
+		writeAdminErr(w, err)
+		return
 	}
 	// The catalogue entry and the spec-supplied retention and shard
 	// overrides go with the data, and the catalogue is persisted now
@@ -585,6 +597,18 @@ func (a *API) handleDropSet(w http.ResponseWriter, r *http.Request, _ string) {
 		a.store.cfg.Logger.Printf("ERROR saving catalogue after dropping %s: %v", name, err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"shards_dropped": dropped})
+}
+
+// writeAdminErr answers a failed admin call. A store that is shutting
+// down is not a broken one, so it gets the status that means "come back"
+// -- the same answer handleQuery gives a query that arrives too late.
+func writeAdminErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrClosed) {
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, err.Error())
 }
 
 // requirePost keeps a state-changing admin endpoint off GET, so it cannot

@@ -714,6 +714,31 @@ func (p *Profile) compile(s *Spec) error {
 				return fmt.Errorf("field %s: %w", name, err)
 			}
 		}
+		// The declared limits are the clamp the query layer installs by
+		// default, and they were the one part of a `fields:` block
+		// nothing checked.
+		//
+		// A non-finite bound cannot travel: YAML reads `.nan` and `.inf`
+		// as real float64s, and encoding/json refuses to marshal either
+		// -- so the *whole* write request carrying that declaration is
+		// unencodable, which the sink reports as a lost batch and every
+		// followed file's checkpoint freezes behind it until the next
+		// flush thaws them. An inverted pair is quieter and lasts
+		// longer: MQL refuses `CLAMP MIN 5 MAX 1` as E007, but the same
+		// pair arriving from the catalogue installs a clamp whose two
+		// halves cancel, so the field declares a range and is not
+		// bounded by it.
+		if fs.Limits != nil {
+			if err := checkLimit(name, "min", fs.Limits.Min); err != nil {
+				return err
+			}
+			if err := checkLimit(name, "max", fs.Limits.Max); err != nil {
+				return err
+			}
+			if fs.Limits.Min != nil && fs.Limits.Max != nil && *fs.Limits.Min > *fs.Limits.Max {
+				return fmt.Errorf("field %s: limits min %g is above max %g; a clamp whose bounds cross does not bound anything", name, *fs.Limits.Min, *fs.Limits.Max)
+			}
+		}
 		if fs.MaxInterval != "" {
 			ms, err := mql.ParseDuration(fs.MaxInterval)
 			if err != nil {
@@ -893,6 +918,14 @@ func (p *Profile) compile(s *Spec) error {
 	}
 	p.matcher = newACMatcher(searches)
 	return nil
+}
+
+// checkLimit refuses a declared bound that cannot be encoded.
+func checkLimit(field, which string, v *float64) error {
+	if v == nil || model.IsFinite(*v) {
+		return nil
+	}
+	return fmt.Errorf("field %s: limits %s is %g, which is not a finite number; it cannot be encoded on the wire, so the declaration would make every batch carrying it undeliverable", field, which, *v)
 }
 
 // isDeclaredLabel reports whether a captured name is classified as a

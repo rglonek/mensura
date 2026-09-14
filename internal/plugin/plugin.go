@@ -395,6 +395,13 @@ func (d *Datasource) CallResource(ctx context.Context, req *backend.CallResource
 		if err := json.Unmarshal(req.Body, &q); err != nil {
 			return send(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		// Bounded the way /v1/print is, and for the same reason: Print
+		// returns a string rather than an error, so it is the one entry
+		// point that would walk a predicate deeper than the parser and
+		// the validator both refuse.
+		if err := mql.CheckPredicateDepth(&q); err != nil {
+			return send(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 		return send(http.StatusOK, map[string]any{"text": mql.Print(&q)})
 	}
 	return send(http.StatusNotFound, map[string]string{"error": "unknown resource " + req.Path})

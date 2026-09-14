@@ -497,9 +497,13 @@ func (p *parser) integer() (int64, error) {
 // milliseconds.
 func (p *parser) duration() (int64, error) {
 	t := p.cur()
+	// A bare zero lexes as a number rather than a duration, because there
+	// is no unit for the lexer to attach. It is still a duration, and
+	// ParseDuration is where that is decided, so the two surfaces cannot
+	// drift apart.
 	if t.kind == tokNumber && t.text == "0" {
 		p.i++
-		return 0, nil
+		return ParseDuration(t.text)
 	}
 	if t.kind != tokDuration {
 		return 0, p.errf("expected a duration such as 30s, found %s", p.describe(t))
@@ -509,7 +513,9 @@ func (p *parser) duration() (int64, error) {
 }
 
 // ParseDuration converts "30s" style text to milliseconds. Compound forms
-// are rejected on purpose: one number, one unit.
+// are rejected on purpose: one number, one unit. The single exception is
+// a bare "0", which needs no unit because every unit gives the same
+// answer and which is what printDuration emits for a zero.
 func ParseDuration(s string) (int64, error) {
 	i := 0
 	// A leading sign is accepted so that Print -> Parse round-trips a
@@ -540,6 +546,23 @@ func ParseDuration(s string) (int64, error) {
 		return int64(n * 3_600_000), nil
 	case "d":
 		return int64(n * 86_400_000), nil
+	case "":
+		// A bare zero carries no unit because every unit gives the same
+		// answer, and it is the form both halves of this package already
+		// use: the parser accepts the token `0` wherever a duration is
+		// expected, and printDuration emits exactly `0` for a zero.
+		// Only this function disagreed, so printDuration -> ParseDuration
+		// was not a round trip at zero -- and it is the function the
+		// extraction spec reads its durations through, so
+		// `sets: {app: {retention: 0}}` failed to compile with "invalid
+		// duration unit in \"0\"". That is the documented way to withdraw
+		// a set's retention (05-storage.md section 7.1), and the store's
+		// own --retention 0 accepts it, so refusing it here made one
+		// spelling of one setting work on the store and not in the spec.
+		if n == 0 {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("invalid duration %q: a number other than 0 needs a unit (ms, s, m, h or d)", s)
 	}
 	return 0, fmt.Errorf("invalid duration unit in %q: expected ms, s, m, h or d", s)
 }

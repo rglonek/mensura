@@ -49,6 +49,9 @@ type fileConfig struct {
 		MaxSeriesPerGraph       int   `yaml:"max_series_per_graph"`
 		MaxDatapointsReceived   int   `yaml:"max_datapoints_received"`
 		MaxLabelCardinality     int   `yaml:"max_label_cardinality"`
+		// MaxLabelKeys bounds the distinct label *names* the store will
+		// intern; max_label_cardinality bounds the values under each one.
+		MaxLabelKeys int `yaml:"max_label_keys"`
 
 		// Accepted by the decoder only so they can be refused by name.
 		// Neither is implemented, and KnownFields(true) reported them as
@@ -169,6 +172,12 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 	}
 	if c.Limits.MaxLabelCardinality > 0 {
 		sc.MaxLabelCardinality = c.Limits.MaxLabelCardinality
+	}
+	if c.Limits.MaxLabelKeys != 0 {
+		// Non-zero rather than positive: a negative value is how every
+		// other gate here is switched off, and Open reads zero as
+		// "unset, use the default".
+		sc.MaxLabelKeys = c.Limits.MaxLabelKeys
 	}
 	if c.Limits.MaxConcurrentJobs > 0 {
 		sc.MaxConcurrentJobs = c.Limits.MaxConcurrentJobs

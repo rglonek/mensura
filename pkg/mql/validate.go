@@ -276,6 +276,58 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	return warns, nil
 }
 
+// CheckPredicateDepth refuses a predicate that nests deeper than
+// MaxPredicateDepth.
+//
+// Every other surface of this package already enforces that bound: the
+// parser counts it in parseUnary, and Validate counts it again on the AST
+// so the text and JSON forms stay the same language. Print does not, and
+// cannot -- it returns a string, not an error -- so it was the one entry
+// point that would walk an arbitrarily deep predicate.
+//
+// That matters because an AST arrives as JSON, whose decoder allows ten
+// thousand levels of nesting. printExpr rebuilds the whole sub-expression
+// at every level, so POST /v1/print on a body of nested "and" arrays --
+// a few hundred kilobytes, well inside max_request_bytes -- turned into
+// hundreds of megabytes of transient string copying per request, on a
+// query-scoped endpoint an editor calls freely. It is the same
+// unbounded-work hazard MaxQueryBytes and MaxPredicateDepth were added to
+// close for /v1/parse, on the endpoint that sits beside it. And the text
+// it produced was a predicate this package's own parser refuses, which
+// the AST-and-text round trip is documented not to do.
+//
+// It checks the predicate and nothing else, so a half-built query from a
+// builder -- one with no SELECT yet -- still prints.
+func CheckPredicateDepth(q *Query) error {
+	if q == nil {
+		return nil
+	}
+	return predicateDepthOK(q.Where, 0)
+}
+
+func predicateDepthOK(e Expr, depth int) error {
+	if e.Empty() {
+		return nil
+	}
+	if depth >= MaxPredicateDepth {
+		return Diag{"E001", fmt.Sprintf("predicate nests deeper than the limit of %d", MaxPredicateDepth)}
+	}
+	for _, sub := range e.And {
+		if err := predicateDepthOK(sub, depth+1); err != nil {
+			return err
+		}
+	}
+	for _, sub := range e.Or {
+		if err := predicateDepthOK(sub, depth+1); err != nil {
+			return err
+		}
+	}
+	if e.Not != nil {
+		return predicateDepthOK(*e.Not, depth+1)
+	}
+	return nil
+}
+
 // arms counts how many of the mutually exclusive fields of an Expr node
 // are populated. The JSON form is documented as a tagged union, but
 // nothing used to enforce it: a node carrying both "and" and "eq"

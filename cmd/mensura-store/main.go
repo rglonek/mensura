@@ -60,6 +60,12 @@ func runServer(argv []string) error {
 	mode := fs.String("mode", "", "server | plugin | proxy")
 	dataDir := fs.String("data-dir", "", "data directory (server and plugin modes)")
 	writeAddr := fs.String("listen-write", "", "address for the write and query API")
+	// The read-only surface has a flag of its own, like the other three.
+	// It was reachable from a config file and nowhere else, so the one
+	// listener an operator publishes to Grafana -- the one that must not
+	// carry /v1/write or /v1/admin/* -- could not be asked for without
+	// writing a config file for it.
+	queryAddr := fs.String("listen-query", "", "read-only query API address (no /v1/write, no /v1/admin)")
 	debugAddr := fs.String("listen-debug", "", "loopback-only debug API address")
 	metricsAddr := fs.String("listen-metrics", "", "Prometheus metrics address")
 	storeURL := fs.String("store-url", "", "upstream store URL (proxy mode)")
@@ -97,6 +103,9 @@ func runServer(argv []string) error {
 	}
 	if *writeAddr != "" {
 		cfg.Listen.Write.Addr = *writeAddr
+	}
+	if *queryAddr != "" {
+		cfg.Listen.Query.Addr = *queryAddr
 	}
 	if *debugAddr != "" {
 		cfg.Listen.Debug.Addr = *debugAddr

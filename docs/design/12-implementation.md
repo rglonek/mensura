@@ -124,6 +124,7 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | A frozen checkpoint thaws when delivery recovers | `…:TestAFrozenCheckpointThawsWhenDeliveryRecovers`, `…:TestRotationClearsAFrozenCheckpoint` |
 | Overlapping `--source` entries are read once | `…:TestResolveDeduplicatesOverlappingSources` |
 | A negative duration is a spec error, sub-second cadence survives | `pkg/extract/regression_test.go:TestNegativeSetDurationsAreASpecError`, `…:TestSubSecondMaxIntervalIsKept` |
+| Declared field limits are finite and ordered | `pkg/extract/zero_retention_test.go:TestFieldLimitsAreValidated` |
 | `field_meta` carries a sub-second cadence | `internal/store/regression_test.go:TestFieldMetaCarriesSubSecondCadence` |
 | The query listener carries no write or admin surface | `…:TestQueryHandlerCarriesNoWriteOrAdminSurface` |
 | `LABELS … WHERE` is gated, and table truncation is visible | `…:TestLabelsFilterScanIsBounded`, `…:TestTabularTruncationIsVisible` |
@@ -147,6 +148,10 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | A framing bound that would remove itself is refused | `pkg/extract/review_test.go:TestFramingBoundsAreValidated` |
 | A replay from `HeldFrom` reproduces exactly the undelivered results | `…:TestAggregationReplayFromHeldFromIsLossless`, `…:TestAggregationReplayIsLosslessOverRandomStreams`, `…:TestMultilineReplayFromHeldFromIsLossless`, `…:TestMultilineReplayIsLosslessOverRandomStreams` |
 | Holding a span keeps the list bounded and the floor advancing | `…:TestHoldListStaysBoundedWithInterleavedKeys`, `…:TestHoldFloorStillAdvances` |
+| A bare zero is a duration, and `retention: 0` compiles | `pkg/mql/zero_duration_test.go:TestParseDurationAcceptsABareZero`, `…:TestPrintDurationRoundTripsThroughParseDuration`, `pkg/extract/zero_retention_test.go:TestSetRetentionZeroCompiles` |
+| Label *keys* are bounded, and a known key still works | `internal/store/label_keys_test.go:TestNewLabelKeysAreBounded`, `…:TestAKnownLabelKeyStillWorksAtTheLimit` |
+| Closing waits for the writes as well as the queries | `internal/store/close_drain_test.go:TestCloseWaitsForAnInFlightEngineOperation`, `…:TestEngineOperationsRefuseAfterClose` |
+| `Print` carries the nesting bound the parser and validator carry | `pkg/mql/print_depth_test.go:TestCheckPredicateDepthRefusesWhatParseRefuses`, `internal/store/label_keys_test.go:TestPrintRefusesAPredicateDeeperThanTheGrammar` |
 
 ## 5. Implementation status
 
@@ -2731,6 +2736,105 @@ names both declarations when two collide — the check a pattern
   silently handed them 8 MiB of it. Pebble has no "no cache" mode, so the
   sentinel is translated into the smallest cache it will build, one that
   holds nothing.
+
+### 6.135 A bare zero is a duration
+
+`printDuration` emits `0` for a zero — there is no unit to pick, because
+every unit gives the same answer — and the MQL parser accepts that token
+wherever a duration is expected, so `GAP 0` has always round-tripped.
+`mql.ParseDuration` did not: it required a unit, so `ParseDuration("0")`
+failed on text this package itself prints.
+
+That function is also how the extraction spec reads every duration it
+declares, which made the disagreement visible to operators rather than
+only to the printer. `sets: {app: {retention: 0}}` is the documented way
+to withdraw a set's retention — [05](05-storage.md) §7.1 and §6.131 above
+both name that exact form, and the store's own `--retention 0` accepts it
+— and it failed to compile with `invalid duration unit in "0"`. One
+spelling of one setting worked on the store and not in the spec that
+configures it.
+
+A bare zero is now accepted, and only a bare zero: a unit-less number
+other than zero still fails, because there is no default unit to guess
+and guessing would silently change what the spec asks for.
+
+### 6.136 The number of label *keys* is bounded, not only their values
+
+`max_label_cardinality` caps how many distinct values one label key may
+hold. Nothing capped how many keys there are.
+
+Every key allocates its own dictionary, is recorded in the catalogue —
+which is persisted as a single JSON record — and is never reclaimed,
+because §6.0 makes the dictionary global per key and a value dropped from
+one would relabel the rows of every set that still carries it. A sender
+chooses its own label names on three paths that reach the store: the
+line protocol, `POST /ingest/v1/samples` and `/v1/write` itself. So the
+one dimension of the dictionary nobody bounded was the one an
+unauthenticated loopback deployment hands to whoever can reach the port,
+in a store that otherwise bounds every buffer it holds.
+
+`limits.max_label_keys` (default 1000, far past any spec in these
+documents) refuses a *new* key past the budget, by name and per sample,
+exactly as the value budget already does. A key the store already holds
+always works, so the bound is on growth and never on use, and a negative
+value switches it off the way the other gates are switched off.
+
+### 6.137 Closing the store waits for the writes as well as the queries
+
+§6.132 made `Close` take every job slot before tearing the engine down,
+because pebble's contract is that `Close` may not run concurrently with
+any other DB method. That covered the read half only.
+
+A write is the operation that runs long here: `PutBatch` blocks on the
+engine's own back-pressure when L0 is stalled, which is exactly the
+condition under which a shutdown overtakes it. In server mode the
+listeners are shut down first, but `http.Server.Shutdown` gives up after
+its own timeout and returns while a handler is still inside the engine.
+So a `SIGTERM` during a compaction stall closed the engine underneath a
+batch that was still applying — the same unsound teardown §6.132
+describes, through the other door.
+
+`Store.enterEngine`/`leaveEngine` now count every operation that reaches
+the engine — `Write`, `Compact`, `Flush`, `RunRetention`,
+`SaveCatalogue` and the admin drop — and `Close` waits for them under the
+same 30-second bound `drainJobs` uses, saying so if it expires. Nothing
+new starts once `Close` has begun: each of those answers `ErrClosed`,
+which the HTTP layer already renders as a `503` with `Retry-After`.
+
+### 6.138 Smaller corrections
+
+- **`Print` has the nesting bound the rest of the package has.** The
+  parser counts predicate depth in `parseUnary` and `Validate` counts it
+  again on the AST, so the text and JSON forms stay the same language.
+  `Print` could not: it returns a string, not an error. So it was the one
+  entry point that walked whatever depth the JSON decoder allowed — ten
+  thousand levels — rebuilding the whole sub-expression at every one of
+  them, which turned a few hundred kilobytes posted to `/v1/print` into
+  hundreds of megabytes of transient copying, on a query-scoped endpoint
+  an editor calls freely. That is the hazard `MaxQueryBytes` and
+  `MaxPredicateDepth` closed for `/v1/parse`, on the endpoint beside it.
+  `mql.CheckPredicateDepth` is what the two print surfaces now gate on;
+  it checks the predicate and nothing else, so a half-built query with no
+  `SELECT` still prints.
+- **`--listen-query` exists.** The read-only surface was reachable from a
+  config file and from nowhere else, while the other three listeners each
+  had a flag — so the one listener an operator publishes to Grafana, the
+  one that must not carry `/v1/write` or `/v1/admin/*`, could not be
+  asked for without writing a config file for it.
+- **A field's declared `limits:` are validated.** They become the clamp
+  the query layer installs by default, and they were the one part of a
+  `fields:` block nothing checked. A non-finite bound cannot travel —
+  YAML reads `.nan` and `.inf` as real float64s and `encoding/json`
+  refuses both, so the whole write request carrying the declaration is
+  undeliverable and every followed file's checkpoint freezes behind the
+  lost batch until the next flush thaws it. An inverted pair is quieter
+  and lasts longer: MQL refuses `CLAMP MIN 5 MAX 1` as `E007`, while the
+  same pair arriving from the catalogue installed a clamp whose two
+  halves cancel, so a field declared a range and was not bounded by it.
+- **`store_stream_label:` is gone from the worked example.**
+  [03](03-extraction.md) §7 still showed it in a `patterns:` block while
+  the compiler refuses it outright, so copying the documented example
+  failed to compile.
 
 ## 7. Known gaps worth naming
 
