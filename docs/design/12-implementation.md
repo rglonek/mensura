@@ -3130,6 +3130,27 @@ with it, and `buildExpr` no longer takes a set: a parameter that looks
 like it scopes the resolution, and does not, is what invited the call to
 sit inside the loop in the first place.
 
+### 6.150 Two progress-reporting corrections
+
+- **`--print-interval 0` silences the console and nothing else.**
+  [02](02-ingest.md) §10 describes the progress document as available
+  three independent ways: a JSON file, the console, and samples in the
+  `_mensura_ingest` set. `startReporting` returned early when the print
+  interval was zero *and* no `--progress-file` was given, so silencing
+  the console — the ordinary thing to do under a supervisor that already
+  captures stderr — silently switched off the set that exists so ingest
+  health can be plotted next to the data. The reporter now always runs,
+  on the print interval or on a 30-second default, and only the printing
+  is gated on the flag that names it.
+- **The loss counters reach the ingest set.** `extract_errors`,
+  `oversize_records` and `binary_skipped` were maintained, written to the
+  progress file and left out of `Progress.Report`, so they were plottable
+  nowhere. `oversize_records` in particular exists so that a truncated
+  record is not indistinguishable from data that was never there, which
+  is exactly what it is when the only place it appears is a file nobody
+  has to ask for; §10 of [02](02-ingest.md) lists extraction errors among
+  the fields the set carries.
+
 ### 6.138 Smaller corrections
 
 - **`Print` has the nesting bound the rest of the package has.** The

@@ -573,16 +573,24 @@ func runQuery(argv []string) error {
 	return enc.Encode(resp)
 }
 
+// defaultReportInterval is how often progress is published when
+// --print-interval is zero, which silences the console and nothing else.
+const defaultReportInterval = 30 * time.Second
+
 // startReporting publishes progress on a timer and returns a stop
 // function. Progress goes to a file, to stderr, and into the store, so an
 // ingest that cannot reach its store is still observable.
 func startReporting(ctx context.Context, ing *ingest.Ingest, sink *ingest.Sink, c commonFlags) func() {
-	if c.printEvery <= 0 && c.progress == "" {
-		return func() {}
-	}
+	// The three channels are independent, and --print-interval names only
+	// one of them. Returning early when it is zero switched off the
+	// progress file and the `_mensura_ingest` samples as well, so an
+	// operator who silenced the console -- the ordinary thing to do under
+	// a supervisor that already captures stderr -- silently lost the set
+	// that exists so ingest health can be plotted next to the data
+	// (02-ingest.md section 10). Only the printing below is gated on it.
 	interval := c.printEvery
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = defaultReportInterval
 	}
 	done := make(chan struct{})
 	stopped := make(chan struct{})
