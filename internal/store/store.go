@@ -1215,6 +1215,19 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		}
 		if start.Add(width).Before(now.Add(-retention)) {
 			if err := s.db.DropSet(name); err != nil {
+				// A shard that is already gone is not a failed drop.
+				// The set list this loop walks is a snapshot, and an
+				// admin drop, a second sweep or the manual
+				// /v1/admin/retention/run can remove the same shard
+				// between the snapshot and this call -- so the sweep
+				// abandoned every remaining shard, logged an ERROR
+				// describing a race rather than a fault, and left data
+				// past its horizon until the next tick. Removing what is
+				// already removed is what this function asks for.
+				if errors.Is(err, engine.ErrUnknownSet) {
+					emptied[logical] = struct{}{}
+					continue
+				}
 				return dropped, err
 			}
 			dropped++
@@ -1365,6 +1378,17 @@ func (s *Store) DropShards(name string) (int, error) {
 	shards, _ := s.shardsFor(name, math.MinInt64, math.MaxInt64)
 	for _, shard := range shards {
 		if err := s.db.DropSet(shard); err != nil {
+			// Already gone, for the reason the retention sweep tolerates
+			// it: this shard list is a snapshot, and the background sweep
+			// drops aged-out shards of the very set an operator is
+			// deleting. The delete answered 500, stopped at the first
+			// such shard and never reached ForgetSet, so the catalogue
+			// went on advertising fields and a time range for data that
+			// really had gone -- a failure report for a deletion that
+			// succeeded.
+			if errors.Is(err, engine.ErrUnknownSet) {
+				continue
+			}
 			return dropped, err
 		}
 		dropped++
