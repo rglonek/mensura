@@ -32,6 +32,25 @@ type parser struct {
 // the deepest predicate in the documentation is three.
 const MaxPredicateDepth = 64
 
+// MaxSelectFields and MaxByLabels bound the *width* of a query, as
+// MaxPredicateDepth bounds its depth.
+//
+// Both are per-row costs in the executor: every selected field is looked
+// up on every scanned row, and every BY slot is resolved through the
+// dictionary and length-prefixed into that row's grouping key. Neither is
+// covered by the datasource ceilings, because a field the catalogue does
+// not carry yields no datapoint and opens no series -- so a query naming
+// a million of them scans at a million map lookups per row with every
+// gate watching a counter that never moves.
+//
+// The numbers are far past anything a dashboard emits: the widest table
+// in the documentation has a handful of columns, and a grouping deeper
+// than a few labels has more series than max_series_per_graph allows.
+const (
+	MaxSelectFields = 1024
+	MaxByLabels     = 64
+)
+
 // Parse turns MQL text into the canonical AST.
 func Parse(src string) (*Query, error) {
 	q, _, err := ParseDiags(src)

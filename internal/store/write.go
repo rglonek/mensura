@@ -2,6 +2,7 @@ package store
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -193,6 +194,10 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 		// describe what the first one committed.
 		acceptedByShard := map[string][]model.Sample{}
 		scheme := s.keyScheme(batch.Set)
+		// Resolved once for the batch, like the key scheme above: the
+		// width is a property of the set, and shardWidth takes three
+		// read locks to answer. See shardNameAt.
+		width := s.shardWidth(batch.Set)
 		for i := range batch.Samples {
 			sm := &batch.Samples[i]
 			idx := index
@@ -219,11 +224,22 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			}
 			row, err := s.rowFor(batch.Set, sm)
 			if err != nil {
+				// A fault the store owns is not a rejection of this
+				// sample. rowFor reports both through one error, and
+				// naming a dictionary write that failed as "this sample
+				// was refused" told the ingester its batch had landed
+				// minus a few rows -- so the checkpoint advanced over
+				// records the store never held. The whole request fails
+				// instead, which the write client classifies as
+				// retryable and the sink holds rather than drops.
+				if errors.Is(err, ErrStoreFault) {
+					return nil, err
+				}
 				resp.Reject(idx, err.Error())
 				continue
 			}
 			pk := model.PrimaryKey(batch.Set, sm, scheme)
-			shard := s.shardName(batch.Set, sm.TSMs)
+			shard := shardNameAt(batch.Set, sm.TSMs, width)
 			byShard[shard] = append(byShard[shard], engine.Record{Key: pk, Row: row})
 			acceptedByShard[shard] = append(acceptedByShard[shard], *sm)
 			resp.Accepted++

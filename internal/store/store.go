@@ -173,6 +173,21 @@ func (s *Store) leaveEngine() { s.engineWG.Done() }
 // back to whatever takes this store's place.
 var ErrClosed = errors.New("store: the store is shutting down")
 
+// ErrStoreFault marks a write failure that belongs to the store rather
+// than to the sample that happened to be in hand.
+//
+// It is the mirror of ErrBadRequest, and the distinction matters for the
+// same reason. rowFor returns one error for two very different things: a
+// sample the store refuses (a bad label value, a cardinality budget spent)
+// and a dictionary record the store could not persist -- a full disk, a
+// transient I/O fault. Write rejected both alike, so an infrastructure
+// failure was reported to the ingester as a *named rejection* of that
+// sample: the batch came back accepted-minus-a-few, the checkpoints
+// advanced over it, and the records were gone with nothing but a WARNING
+// on the ingest side. A fault the store owns has to come back as a 5xx so
+// the client retries the batch it still holds.
+var ErrStoreFault = errors.New("store: the store could not record this write")
+
 // setEntry is the catalogue record for one logical set.
 type setEntry struct {
 	Name       string                        `json:"name"`
@@ -809,7 +824,15 @@ func (s *Store) intern(key, value string) (int32, error) {
 		if fresh {
 			delete(s.dict, key)
 		}
-		return 0, err
+		// Tagged as the store's fault, not the sample's. Write turns a
+		// rowFor error into a named rejection of that one sample and
+		// commits the rest, which is exactly right for a bad label value
+		// and exactly wrong for a full disk: the ingester was told the
+		// batch had been taken, its checkpoint moved past those records,
+		// and the only trace of the loss was a WARNING on its own
+		// console. ErrStoreFault makes Write answer 5xx instead, so the
+		// batch is retried rather than reported as refused.
+		return 0, fmt.Errorf("%w: persisting label %q: %w", ErrStoreFault, key, err)
 	}
 	if int(idx) < len(d.Entries) {
 		d.Entries[idx] = value
@@ -1000,7 +1023,18 @@ func (s *Store) shardWidth(set string) time.Duration {
 // overlaps a query range and when retention may drop it: deriving it from
 // the suffix length would silently mis-size every other configured width.
 func (s *Store) shardName(set string, tsMs int64) string {
-	w := s.shardWidth(set)
+	return shardNameAt(set, tsMs, s.shardWidth(set))
+}
+
+// shardNameAt is shardName against a width the caller already resolved.
+//
+// It exists because shardWidth takes two read locks and calls
+// retentionFor, which takes a third, and the width is a property of the
+// *set* rather than of the sample: resolving it per sample charged a
+// default 1024-sample batch three thousand lock acquisitions for an
+// answer that cannot change within one batch. Write resolves it once, the
+// way it already resolves the key scheme once.
+func shardNameAt(set string, tsMs int64, w time.Duration) string {
 	if w <= 0 {
 		return set + "@" + shardAll
 	}

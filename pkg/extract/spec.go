@@ -1042,7 +1042,7 @@ func (b *BucketSet) compile() error {
 	case strings.HasPrefix(b.Edges, "linear:"):
 		step, err := parseEdge(b.Edges[len("linear:"):])
 		if err != nil {
-			return fmt.Errorf("bucket set %s: bad linear step %q", b.Name, b.Edges[len("linear:"):])
+			return fmt.Errorf("bucket set %s: bad linear step %q: %w", b.Name, b.Edges[len("linear:"):], err)
 		}
 		// A step that does not advance gives every bucket the same lower
 		// bound, and a negative one runs the axis backwards. Either way
@@ -1064,7 +1064,7 @@ func (b *BucketSet) compile() error {
 		for i, p := range parts {
 			v, err := parseEdge(p)
 			if err != nil {
-				return fmt.Errorf("bucket set %s: bad edge %q", b.Name, p)
+				return fmt.Errorf("bucket set %s: bad edge %q: %w", b.Name, p, err)
 			}
 			if i > 0 && v <= b.edges[i-1] {
 				return fmt.Errorf("bucket set %s: explicit edge %v at position %d is not above %v; edges are ascending bucket lower bounds",
@@ -1074,6 +1074,22 @@ func (b *BucketSet) compile() error {
 		}
 	default:
 		return fmt.Errorf("bucket set %s: unknown edges %q", b.Name, b.Edges)
+	}
+	// The computed edges, not only the declared ones. A finite `linear:`
+	// step still overflows once it is multiplied by the bucket position,
+	// and an edge that is not a finite number cannot travel: it lands in
+	// wire.FieldMeta.BucketEdge, and encoding/json refuses to marshal it
+	// -- so the *whole* write request carrying the declaration is
+	// unencodable, which the write client classifies as fatal. The sink
+	// drops that batch outright, reports it to the delivery observers as
+	// a hole, and every followed file's checkpoint freezes behind it.
+	// This is the check `fields: limits:` already gets, on the other
+	// number a spec can put on the wire.
+	for i, e := range b.edges {
+		if !model.IsFinite(e) {
+			return fmt.Errorf("bucket set %s: edge %d works out to %v, which is not a finite number; it cannot be encoded on the wire, so the declaration would make every batch carrying it undeliverable",
+				b.Name, i, e)
+		}
 	}
 	return nil
 }
@@ -1086,8 +1102,20 @@ func (b *BucketSet) compile() error {
 // histogram axis, which is the same failure the config file's own
 // duration parser was moved off Sscanf to avoid. ParseFloat consumes the
 // whole string or fails.
+//
+// A non-finite literal is refused here rather than accepted and carried:
+// ParseFloat reads "inf", "+Inf" and "NaN" without complaint, and the
+// ascending-edge test below cannot catch a NaN because every comparison
+// against one is false.
 func parseEdge(s string) (float64, error) {
-	return strconv.ParseFloat(strings.TrimSpace(s), 64)
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, err
+	}
+	if !model.IsFinite(v) {
+		return 0, fmt.Errorf("%v is not a finite number", v)
+	}
+	return v, nil
 }
 
 // EdgeValues exposes the numeric lower bound of each bucket.

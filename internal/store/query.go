@@ -213,7 +213,7 @@ func (s *Store) plan(q *mql.Query, req *wire.QueryRequest) (*queryPlan, []mql.Di
 		p.fields = append(p.fields, s.resolveField(q.From, fe))
 	}
 
-	expr, exprWarns, impossible := s.buildExpr(q.From, q.Where, proj)
+	expr, exprWarns, impossible := s.buildExpr(q.Where, proj)
 	warns = append(warns, exprWarns...)
 	p.impossible = impossible
 	p.expr = expr
@@ -292,7 +292,16 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 // buildExpr lowers an MQL predicate onto engine expressions, resolving
 // label values through the dictionary so every comparison becomes integer
 // equality at scan time.
-func (s *Store) buildExpr(set string, e mql.Expr, proj map[string]struct{}) (engine.Expr, []mql.Diag, bool) {
+//
+// It takes no set, and that is not an omission: there is one label-value
+// dictionary per key for the whole store (05-storage.md section 8,
+// ADR-004), so the lowering of a predicate is the same expression
+// whichever set it is about to be run against. It used to take one and
+// never read it, which read as if the resolution were set-scoped -- and
+// queryLabelValues called it once per set on that understanding, sweeping
+// the whole dictionary with the clause's regex again for every one of
+// them, on the path a dashboard hits on every variable refresh.
+func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []mql.Diag, bool) {
 	if e.Empty() {
 		return nil, nil, false
 	}
@@ -1196,27 +1205,37 @@ func (s *Store) queryLabelValues(ctx context.Context, q *mql.Query, req *wire.Qu
 	// this quadratic in the shard count on the path a dashboard hits on
 	// every variable refresh.
 	byLogical := s.shardsByLogical()
-	for _, set := range s.setsWithLabel(q.Label) {
+	// Lowered once for every set, not once per set. There is one
+	// dictionary per label key for the whole store (ADR-004), so the
+	// lowering does not depend on the set it will be scanned against --
+	// and the expensive half of it does not care either: a regex clause
+	// is evaluated against every value of the key, up to
+	// max_label_cardinality. Repeating that per set made a variable
+	// refresh cost the dictionary sweep times the number of sets
+	// carrying the label, for an expression that came out identical
+	// every time. The duplicate *warnings* it produced were already
+	// being deduplicated below, which is the same observation one level
+	// up.
+	proj := map[string]struct{}{model.TimestampField: {}, q.Label: {}}
+	expr, warns, impossible := s.buildExpr(q.Where, proj)
+	resp.Warnings = appendNewDiags(resp.Warnings, warns)
+	var projection []string
+	for c := range proj {
+		projection = append(projection, c)
+	}
+	sort.Strings(projection)
+	// A predicate no dictionary value can satisfy reads no shards at all,
+	// which is the same skip scan() makes for a data query.
+	sets := s.setsWithLabel(q.Label)
+	if impossible {
+		sets = nil
+	}
+	for _, set := range sets {
 		if gateErr != "" {
 			break
 		}
-		proj := map[string]struct{}{model.TimestampField: {}, q.Label: {}}
-		expr, warns, impossible := s.buildExpr(set, q.Where, proj)
-		// Deduplicated: the predicate is lowered once per set carrying
-		// the label, and it resolves against one global dictionary, so
-		// every set produced the identical "no values match ..." warning.
-		// A dashboard variable over a store with a dozen sets came back
-		// with a dozen copies of one sentence.
-		resp.Warnings = appendNewDiags(resp.Warnings, warns)
-		if impossible {
-			continue
-		}
 		shards, overlapping := shardsInRange(set, byLogical[set], req.FromMs, req.ToMs)
-		p := &queryPlan{shards: shards, overlapping: overlapping, expr: expr}
-		for c := range proj {
-			p.projection = append(p.projection, c)
-		}
-		sort.Strings(p.projection)
+		p := &queryPlan{shards: shards, overlapping: overlapping, expr: expr, projection: projection}
 		err := s.scan(ctx, p, req, &resp.Stats, func(row engine.Row) bool {
 			v, ok := row[q.Label]
 			if !ok {

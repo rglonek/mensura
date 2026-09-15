@@ -94,6 +94,19 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	if len(q.Select) == 0 {
 		return nil, Diag{"E001", "query selects no fields"}
 	}
+	// The width of a query is bounded for the reason its depth is (see
+	// MaxPredicateDepth). The executor reads every selected field off
+	// every scanned row and builds the grouping key from every BY slot,
+	// so both are per-row costs that nothing else gates: a field the
+	// catalogue does not carry contributes no datapoint, so
+	// max_datapoints_received never fires, and no series, so
+	// max_series_per_graph never fires either. An AST is JSON, and a
+	// body at the store's default max_request_bytes holds on the order
+	// of a million selected names -- which is minutes of CPU per request
+	// on a query-scoped endpoint, with eight of them allowed at once.
+	if len(q.Select) > MaxSelectFields {
+		return nil, Diag{"E007", fmt.Sprintf("query selects %d fields, which is beyond the limit of %d; the executor reads every one of them off every scanned row", len(q.Select), MaxSelectFields)}
+	}
 	// The executor switches on Format with a timeseries default, so an
 	// unrecognised value used to render as a timeseries rather than being
 	// refused: the panel looked right and was the wrong shape.
@@ -265,6 +278,9 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 
 	if err := validateExpr(q, q.Where, s, &warns, 0); err != nil {
 		return warns, err
+	}
+	if len(q.By) > MaxByLabels {
+		return warns, Diag{"E007", fmt.Sprintf("query groups by %d labels, which is beyond the limit of %d; every slot is resolved and length-prefixed into the grouping key of every scanned row", len(q.By), MaxByLabels)}
 	}
 	for _, l := range q.By {
 		if l == "" {

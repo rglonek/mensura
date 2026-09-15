@@ -122,6 +122,15 @@ document is three. The AST is held to the same depth by the validator, so
 an AST that validates is one `Print` can render and the parser can read
 back ([12](12-implementation.md) §6.118).
 
+Two more bound a query's *width*, and they exist for a different reason:
+both are per-row costs in the executor that neither safety gate covers. A
+query may select at most 1024 fields and group by at most 64 labels
+(`E007`). A selected field the catalogue does not carry yields no
+datapoint and opens no series, so `max_datapoints_received` and
+`max_series_per_graph` both watch a counter that never moves while every
+scanned row pays for every name
+([12](12-implementation.md) §6.147).
+
 ## 4. Semantics
 
 ### 4.1 `FROM`
@@ -469,7 +478,7 @@ in tests. Warnings never fail a query; errors always do.
 | `E004` | error | Unknown label key referenced in `WHERE` or `BY` (for `HAS`/`MISSING`, a name that is neither a field nor a label). The catalogue holds every label any accepted sample carried, so a key it does not hold is one no row has: the comparison could never match, and the grouping would put every row in one series |
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
 | `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
-| `E007` | error | `LIMIT` above the datasource maximum |
+| `E007` | error | A value outside its valid range: a `LIMIT` above the datasource maximum or below one, a non-positive `EVERY`, a negative `GAP`, a `CLAMP` whose bounds cross, an empty `IN` list, or a `SELECT`/`BY` wider than the per-row bounds of §3 |
 | `E008` | error | an unknown `FORMAT`, `SSE` mode, `CLAMP ELSE` or query `kind`; `FORMAT logs`/`table` combined with a timeseries-only modifier, with `EVERY` or with `LIMIT SERIES`; a per-field modifier on a `HISTOGRAM()` selection; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |
 | `E010` | error | A `$variable` reached the store unsubstituted, in a comparison value or inside a regex literal. Comparing against the literal text `$host` matches nothing, so the panel would come back empty with nothing saying why; the datasource must interpolate before the query runs |

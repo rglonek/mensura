@@ -246,13 +246,23 @@ func (p *Progress) Report(ctx context.Context, sink *Sink, client string, stream
 			"unmatched_lines": model.Int(snap.UnmatchedLines),
 			"unjoined_lines":  model.Int(snap.UnjoinedLines),
 			"ts_parse_errors": model.Int(snap.TSParseErrors),
-			"batches_sent":    model.Int(sinkStats.Sent),
-			"batches_dropped": model.Int(sinkStats.Dropped),
-			"rejected":        model.Int(sinkStats.Rejected),
-			"lag_bytes":       model.Int(snap.LagBytes),
-			"udp_dropped":     model.Int(snap.UDPDropped),
-			"files_total":     model.Int(int64(snap.FilesTotal)),
-			"files_done":      model.Int(int64(snap.FilesDone)),
+			// The three counters that reached the JSON file and the
+			// console and not this set. 02-ingest.md section 10 lists
+			// extraction errors among the fields the ingest set carries,
+			// and `oversize_records` exists precisely so a truncation is
+			// not indistinguishable from data that was never there --
+			// which it is if the only place it appears is a progress
+			// file nobody asked for.
+			"extract_errors":   model.Int(snap.ExtractErrors),
+			"oversize_records": model.Int(snap.OversizeRecords),
+			"binary_skipped":   model.Int(snap.BinarySkipped),
+			"batches_sent":     model.Int(sinkStats.Sent),
+			"batches_dropped":  model.Int(sinkStats.Dropped),
+			"rejected":         model.Int(sinkStats.Rejected),
+			"lag_bytes":        model.Int(snap.LagBytes),
+			"udp_dropped":      model.Int(snap.UDPDropped),
+			"files_total":      model.Int(int64(snap.FilesTotal)),
+			"files_done":       model.Int(int64(snap.FilesDone)),
 		},
 	})
 }
