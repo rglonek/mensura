@@ -248,43 +248,65 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 // be parsed and then quietly ignored, and `key: offset` in particular
 // would never take effect.
 func (s *Store) applySetMeta(metas []wire.SetMeta) error {
+	// Validated in full before anything is applied, which is the shape
+	// applyFieldMeta already has. Validating and applying in one pass let
+	// a declaration that the *next* entry made the request fail land
+	// anyway: the caller sees a 400 and the store keeps half of what it
+	// refused, so two ingesters sending the same spec could leave the set
+	// with a retention nobody's spec asked for.
+	for _, m := range metas {
+		if err := checkSetMeta(m); err != nil {
+			return err
+		}
+	}
 	for _, m := range metas {
 		if m.Set == "" {
 			continue
 		}
-		if err := model.ValidateSetName(m.Set); err != nil {
-			return &ErrBadRequest{Msg: err.Error()}
-		}
-		// The same exemption applyFieldMeta makes. The ingest-progress set
-		// is the one reserved name a client may write, so refusing to let
-		// it carry a retention or a shard width meant the one set every
-		// ingester produces was also the one set no spec could age out.
-		if model.IsReserved(m.Set) && m.Set != model.IngestSet {
-			return badRequestf("set %q uses the reserved prefix", m.Set)
-		}
 		retention, shard := time.Duration(-1), time.Duration(0)
 		if m.RetentionMs != nil {
-			if *m.RetentionMs < 0 {
-				return badRequestf("set %q: retention must not be negative", m.Set)
-			}
 			retention = time.Duration(*m.RetentionMs) * time.Millisecond
 		}
 		if m.ShardMs != nil {
-			if *m.ShardMs < 0 {
-				return badRequestf("set %q: shard width must not be negative", m.Set)
-			}
 			shard = time.Duration(*m.ShardMs) * time.Millisecond
 		}
 		if m.RetentionMs != nil || m.ShardMs != nil {
 			s.SetRetentionFor(m.Set, retention, shard)
 		}
-		switch m.KeyScheme {
-		case "":
-		case model.KeyContent, model.KeyOffset:
+		if m.KeyScheme != "" {
 			s.SetKeyScheme(m.Set, m.KeyScheme)
-		default:
-			return badRequestf("set %q: unknown key scheme %q (content or offset)", m.Set, m.KeyScheme)
 		}
+	}
+	return nil
+}
+
+// checkSetMeta is the validating half of applySetMeta: everything a
+// client can get wrong about one set declaration, decided before any of
+// them is applied.
+func checkSetMeta(m wire.SetMeta) error {
+	if m.Set == "" {
+		return nil
+	}
+	if err := model.ValidateSetName(m.Set); err != nil {
+		return &ErrBadRequest{Msg: err.Error()}
+	}
+	// The same exemption applyFieldMeta makes. The ingest-progress set
+	// is the one reserved name a client may write, so refusing to let
+	// it carry a retention or a shard width meant the one set every
+	// ingester produces was also the one set no spec could age out.
+	if model.IsReserved(m.Set) && m.Set != model.IngestSet {
+		return badRequestf("set %q uses the reserved prefix", m.Set)
+	}
+	if m.RetentionMs != nil && *m.RetentionMs < 0 {
+		return badRequestf("set %q: retention must not be negative", m.Set)
+	}
+	if m.ShardMs != nil && *m.ShardMs < 0 {
+		return badRequestf("set %q: shard width must not be negative", m.Set)
+	}
+	switch m.KeyScheme {
+	case "", model.KeyContent, model.KeyOffset:
+	default:
+		return badRequestf("set %q: unknown key scheme %q (content or offset)", m.Set, m.KeyScheme)
 	}
 	return nil
 }

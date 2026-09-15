@@ -215,6 +215,13 @@ window = min(rangeMs / maxDataPoints, intervalMs) × 2
 `EVERY` is what alerting rules and exports use, where "however many pixels the
 panel has" is not a sane input.
 
+It is a downsample window, so it is only meaningful where there is a walk to
+window: `FORMAT timeseries` and `FORMAT heatmap`. Under `FORMAT table` or
+`FORMAT logs` it is refused (`E008`) rather than accepted and dropped — the
+tabular executor never reads it, and a clause that silently does nothing is
+the failure the timeseries-only-modifier rule below exists to prevent one
+clause further in.
+
 ### 4.7 `FORMAT`
 
 | Format | Output |
@@ -229,6 +236,11 @@ panel has" is not a sane input.
 `LIMIT SERIES n` and `LIMIT POINTS n` override the datasource safety gates
 downward. They cannot raise a limit above the datasource maximum; that requires
 a datasource setting change, deliberately.
+
+`LIMIT SERIES` bounds a series count, so it applies to `FORMAT timeseries` and
+`FORMAT heatmap`. A tabular format produces rows rather than series and is
+bounded by `LIMIT POINTS`, so `LIMIT SERIES` under `FORMAT table` or
+`FORMAT logs` is refused (`E008`) rather than ignored.
 
 ## 5. Auxiliary query forms
 
@@ -273,6 +285,13 @@ the bucket ([12-implementation.md §6.4](12-implementation.md)). Grouping by a l
 validator refuses it anywhere else (`E008`) rather than planning a query with
 no series in it: a bucket set resolves to no plottable field, so the panel
 would come back empty with nothing to explain why.
+
+For the same reason a bucket set carries no per-field modifier. `RATE`,
+`DELTA`, `NEGATE`, `CLAMP`, `GAP`, `SSE` and `REQUIRED` are all properties of
+the render walk, and the heatmap executor does not run one: it sums bucket
+counts per window. They used to be accepted and dropped in silence, so
+`HISTOGRAM(hdr24) RATE` drew raw counts under a legend the author read as a
+rate; they are now `E008`. `AS` is not a modifier and still names the series.
 
 With `FORMAT timeseries`, `HISTOGRAM(hdr24) PERCENTILE 99` (planned for M5,
 not yet implemented) emits an estimated
@@ -451,8 +470,9 @@ in tests. Warnings never fail a query; errors always do.
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
 | `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
 | `E007` | error | `LIMIT` above the datasource maximum |
-| `E008` | error | an unknown `FORMAT`, `SSE` mode or `CLAMP ELSE`; `FORMAT logs`/`table` combined with a timeseries-only modifier; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
+| `E008` | error | an unknown `FORMAT`, `SSE` mode, `CLAMP ELSE` or query `kind`; `FORMAT logs`/`table` combined with a timeseries-only modifier, with `EVERY` or with `LIMIT SERIES`; a per-field modifier on a `HISTOGRAM()` selection; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |
+| `E010` | error | A `$variable` reached the store unsubstituted, in a comparison value or inside a regex literal. Comparing against the literal text `$host` matches nothing, so the panel would come back empty with nothing saying why; the datasource must interpolate before the query runs |
 | `W101` | warning | Modifiers written in non-canonical order; canonical order applies. Raised by `ParseDiags`, not by validation: the written order does not survive into the AST |
 | `W102` | warning | Counter-kind field selected without `RATE`/`DELTA`, under a format where those apply — never under `FORMAT table`/`logs`, where `E008` refuses them |
 | `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |

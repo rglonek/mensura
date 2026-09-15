@@ -238,6 +238,20 @@ the process dies mid-drain, the rotated file's remaining bytes are recovered on
 restart via the archive glob (`--rotated-glob`, default `<path>{,.1,.0,-*}{,.gz,.zst,.bz2}`)
 matched against the recorded `file_id.fingerprint`.
 
+"To EOF" includes a final record with no newline on it. While a file is live
+such a record is held back — the offset stays before the incomplete bytes and
+the next pass re-reads them whole, because half a line handed to a
+prefix-anchored pattern invents a sample from a number that was cut in two.
+A handle that has been renamed away or unlinked can never grow again, so at
+that moment those bytes are as complete as they will ever be, and they are
+extracted rather than closed over. Batch import and the TCP listener have
+always done this with a trailing unterminated record; the follower did not,
+so the same file produced different data depending on how it was read
+([12-implementation.md §6.142](12-implementation.md)). A handle closed for
+any other reason — the glob missed the path for one sweep, the process is
+shutting down — keeps the record held, because its checkpoint is what
+re-reads it whole.
+
 ### 6.3 Delivery contract
 
 Follow mode is **at-least-once**. Combined with content-addressed primary keys

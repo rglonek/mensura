@@ -844,7 +844,34 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 			return nil, err
 		}
 	}
+	// A default is classified exactly as the capture it stands in for is:
+	// a name the profile or the pattern declares as a label fills the
+	// label map, everything else fills the field map.
+	//
+	// It used to fill the fields unconditionally, which broke a
+	// `default_values` entry for a declared label in two ways at once.
+	// On a record where the capture *did* participate the value went to
+	// the labels, so the field slot was still empty and the default fired
+	// as well -- the same name arrived as a label and as a field on one
+	// sample, which is the one shape store.rowFor refuses by name
+	// ("%q is both a label and a field"), so every single record the
+	// pattern produced was rejected by the store, for the life of the
+	// process, with nothing pointing back at the spec. On a record where
+	// it did not, the default landed as a column instead of the label it
+	// was declared to be, so the row fell outside its own BY group and
+	// the catalogue grew a field nobody declared. Compile already reads
+	// these keys as labels -- isDeclaredLabel validates them against the
+	// label charset -- so this is the classification the spec asked for.
 	for k, v := range pat.DefaultValues {
+		if st.isLabel(pat, k) {
+			// An empty default is an absent one, which is the rule the
+			// capture branch above applies to a label: the store refuses
+			// an empty label value outright.
+			if _, ok := labels[k]; !ok && v != "" {
+				labels[k] = v
+			}
+			continue
+		}
 		if _, ok := fields[k]; !ok {
 			fields[k] = model.Coerce(v)
 		}

@@ -898,6 +898,18 @@ func (p *Profile) compile(s *Spec) error {
 			default:
 				return fmt.Errorf("aggregate mode %q: expected increment, sum, max or last", pat.Aggregate.Mode)
 			}
+			// The accumulator synthesises `field` as a *column* on the
+			// row it emits, so declaring that name as a label is a
+			// classification the rest of the pipeline cannot honour: the
+			// compile-time name check reads it as a label while
+			// aggregator.emit writes it as a field, and on a pattern that
+			// also captures it the emitted sample carries the name twice
+			// -- once in each map -- which store.rowFor refuses by name
+			// for every record the window ever produces.
+			if isDeclaredLabel(p, pat, pat.Aggregate.Field) {
+				return fmt.Errorf("pattern for set %q aggregates into %q, which is also declared as a label; the accumulator synthesises a field column, so the two declarations cannot both hold -- rename one of them",
+					pat.Set, pat.Aggregate.Field)
+			}
 			// Every `on` key has to be both captured and classified as a
 			// label, or the accumulator cannot key a window on it: the
 			// stream reports "aggregation key %q is not a declared
