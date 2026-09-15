@@ -2937,6 +2937,75 @@ where the file is very likely still being written — nor by `closeAll` at
 shutdown. Both of those leave a checkpoint behind, and that checkpoint is
 what re-reads the record whole on the next pass.
 
+### 6.143 An aggregation window's span reaches back over the records that fed it
+
+`extract.Stream` holds a checkpoint back to the oldest record it is still
+buffering: `HeldFrom` reports that floor and a driver that checkpoints byte
+offsets may not acknowledge past it, because a record that produced no
+sample yet is not a record that has been dealt with (§6.60). The floor is
+computed from the *spans* of the open multiline buffers and aggregation
+windows — the first and last position each one absorbed.
+
+A window's span only ever grew forwards. `aggregate()` recorded
+`a.lastMark = max(a.lastMark, st.mark)` and nothing else, on the assumption
+that a record folded into a window is always at or past the position that
+opened it. That assumption is false for exactly one shape, and it is an
+ordinary one: a buffered multiline record is processed under the mark of
+the line that *opened* it (`processBuffered`, §6.117) and is flushed by a
+later line, so a record whose first line sits at offset 800 can be folded
+into a window that a record at offset 1000 opened. The window's span then
+began after bytes that are part of it.
+
+`HeldFrom` reported that later position, the driver acknowledged it, and a
+replay from there met the continuation lines with no buffer open — so the
+window was rebuilt *without* that record's value. Nothing had delivered the
+window yet, so there was no duplicate to collapse and no diagnostic to
+read: the contribution was simply gone, and the number the store ended up
+holding was one the source never reported. It needed a restart, a hole
+rewind (§6.24) or an SSH reconnect to happen while the window was open,
+which on a stream with multiline records and a per-minute `every` is a
+matter of when rather than whether.
+
+The span now grows in both directions: a record that reaches a window from
+behind lowers `a.mark`, and `lowerHoldMark` repositions the window's entry
+so the hold list stays in mark order — which is what lets `holdFloor` make
+its one backward pass and `pruneHolds` reason about what can no longer
+constrain a checkpoint. `Flush` and `FlushIdle` also drop a buffered record
+from the map *after* it has been processed rather than before, which is
+what `Process` already did: while the buffer is still there it pins the
+floor at its own mark, and `pruneHolds` — which runs from inside
+`process()` whenever a window opens — may only discard what is behind the
+floor.
+
+`TestHeldFloorSurvivesACrashAtEveryRecord` is the general form: randomised
+streams of multiline, aggregating and plain records, crashed after every
+one of them, checked so that every sample the uninterrupted run produced
+appears either in what was delivered before the crash or in the replay from
+the floor.
+
+### 6.144 A shard that is already gone is not a failed drop
+
+`DropShards` and `RunRetention` both walk a *snapshot* of the physical set
+list and then drop what they found. They race each other by construction:
+the background sweep drops the aged-out shards of the very set an operator
+is deleting, `POST /v1/admin/retention/run` runs a second sweep beside the
+timer, and two admin deletes of one set overlap. `engine.DropSet` answers
+`ErrUnknownSet` for a shard that has gone in between, and both callers
+returned it as a failure.
+
+On the admin path that is a 500 for a deletion that succeeded: the loop
+stopped at the first missing shard, so the rest of the set was left on
+disk, and `ForgetSet` was never reached — the catalogue went on advertising
+fields and a time range for data that really had gone, and only another
+delete could clear it. On the sweep it abandoned the rest of the pass, so
+every other shard past its horizon stayed until the next tick, under an
+`ERROR retention sweep: engine: unknown set` line that describes a race
+rather than a fault.
+
+Both now skip a shard that is already gone and carry on. Removing what is
+already removed is what both functions ask for, and it is the only reading
+under which either is idempotent.
+
 ### 6.138 Smaller corrections
 
 - **`Print` has the nesting bound the rest of the package has.** The
@@ -2952,6 +3021,13 @@ what re-reads the record whole on the next pass.
   `mql.CheckPredicateDepth` is what the two print surfaces now gate on;
   it checks the predicate and nothing else, so a half-built query with no
   `SELECT` still prints.
+- **An oversize sample post is too large, not malformed.**
+  `POST /ingest/v1/samples` decoded through a `LimitReader` at
+  `maxHTTPBodyBytes`, so a body that overran the cap was handed to
+  `encoding/json` truncated and the sender was told "unexpected end of
+  JSON input" — which sends it looking for a bug in what it encoded. The
+  lines endpoint beside it already reads one byte past the cap and answers
+  413 with "split it across requests" (§6.113); this one now does the same.
 - **`--listen-query` exists.** The read-only surface was reachable from a
   config file and from nowhere else, while the other three listeners each
   had a flag — so the one listener an operator publishes to Grafana, the

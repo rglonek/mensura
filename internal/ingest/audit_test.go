@@ -147,3 +147,38 @@ func TestProgressNamesEachDeclinedPathOnce(t *testing.T) {
 		t.Fatalf("the list grew to %d, past the cap of %d", n, maxNamedPaths)
 	}
 }
+
+// A sample post larger than the listener's body cap is too large, not
+// malformed. The decoder used to be handed a body truncated exactly at
+// the cap, so the sender was told "unexpected end of JSON input" -- which
+// sends it looking for a bug in what it encoded -- instead of the 413 the
+// lines endpoint beside it already answers.
+func TestHTTPSamplesRefusesABodyPastTheLimit(t *testing.T) {
+	r := auditReceiver(t, ReceiveOptions{Mode: "logs", Listener: "http"})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.serveHTTP(ctx, ln) }()
+	defer func() { cancel(); <-done }()
+
+	// A valid JSON prefix and enough samples to run past the cap, so the
+	// decoder never reaches the end of the document.
+	var b strings.Builder
+	b.WriteString(`{"set":"app","samples":[`)
+	for b.Len() <= maxHTTPBodyBytes {
+		b.WriteString(`{"ts_ms":1700000000000,"fields":{"v":{"i":1}}},`)
+	}
+	b.WriteString(`{"ts_ms":1700000000000,"fields":{"v":{"i":1}}}]}`)
+
+	resp, err := http.Post("http://"+ln.Addr().String()+"/ingest/v1/samples", "application/json", strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a body past the limit answered %d; the sender is owed the refusal rather than a report that its JSON is malformed", resp.StatusCode)
+	}
+}

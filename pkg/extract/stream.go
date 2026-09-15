@@ -422,6 +422,20 @@ func (st *Stream) holdRecord(buf *mlBuffer, through int64) {
 	st.addHold(holdEntry{mark: buf.mark, last: last})
 }
 
+// lowerHoldMark repositions an open window's hold entry after its start
+// mark has moved backwards, so the list stays in mark order.
+//
+// The entry is always there to find: pruneHolds never drops a live one.
+func (st *Stream) lowerHoldMark(key string, a *aggregator) {
+	for i := range st.holds {
+		if st.holds[i].a == a && st.holds[i].key == key {
+			st.holds = append(st.holds[:i], st.holds[i+1:]...)
+			break
+		}
+	}
+	st.addHold(holdEntry{mark: a.mark, key: key, a: a})
+}
+
 // addHold inserts one entry, keeping the list in mark order.
 func (st *Stream) addHold(e holdEntry) {
 	i := len(st.holds)
@@ -624,10 +638,18 @@ func (st *Stream) Flush() ([]Result, []error) {
 		if !ok {
 			continue
 		}
-		delete(st.multiline, m.StartContains)
 		// Partial results are kept even when process reports an error:
 		// it returns the windows it closed alongside the failure.
+		//
+		// The buffer is dropped *after* the record has been processed,
+		// which is what Process already does: while it is still in the
+		// map it pins holdFloor to its own mark, and pruneHolds -- which
+		// runs from inside process() whenever a window is opened -- may
+		// only discard what is behind the floor. Deleting first let the
+		// floor rise past this record for the length of its own
+		// extraction.
 		r, err := st.processBuffered(buf)
+		delete(st.multiline, m.StartContains)
 		out = append(out, r...)
 		if err != nil {
 			errs = append(errs, err)
@@ -696,12 +718,16 @@ func (st *Stream) FlushIdle(now time.Time) ([]Result, []error) {
 		if !ok || now.Sub(buf.seen) < m.idleTimeout {
 			continue
 		}
-		delete(st.multiline, m.StartContains)
 		st.holdRecord(buf, 0)
 		// The verdict travels, exactly as Flush's does: on a stream quiet
 		// enough to need an idle flush, this is the only judgement that
 		// record ever receives.
+		//
+		// Dropped after the record is processed, for the reason Flush
+		// drops it after: the open buffer is what holds the floor at this
+		// record's own mark while process() prunes.
 		r, err := st.processBuffered(buf)
+		delete(st.multiline, m.StartContains)
 		out = append(out, r...)
 		if err != nil {
 			errs = append(errs, err)
@@ -1040,8 +1066,26 @@ func (st *Stream) aggregate(pat *Pattern, patIdx int, set string, ts time.Time, 
 	// or not it moves the value: a replay that started inside the span
 	// would absorb it into a different window, so the span is what
 	// HeldFrom has to see.
+	//
+	// The span grows in both directions, because a record can reach a
+	// window from *behind* its start. A buffered multiline record is
+	// processed under the mark of the line that opened it (see
+	// processBuffered), and it is flushed by a later line -- so a record
+	// whose first line sits at offset 800 can be folded into a window
+	// that a record at offset 1000 opened. Only the forward half used to
+	// be recorded, so the window's span began after the bytes part of it
+	// came from: HeldFrom reported a floor past them, the driver
+	// acknowledged it, and a replay from there met the continuation lines
+	// with no buffer open and rebuilt the window *without* that record's
+	// value. The window is still open, so nothing had delivered it yet --
+	// the contribution was simply gone, silently, and the number the
+	// store ended up holding was one the source never reported.
 	if st.mark > a.lastMark {
 		a.lastMark = st.mark
+	}
+	if st.mark < a.mark {
+		a.mark = st.mark
+		st.lowerHoldMark(key, a)
 	}
 	if !usable {
 		// Nothing to fold. `increment` counts the occurrence regardless;

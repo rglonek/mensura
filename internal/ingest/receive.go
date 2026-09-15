@@ -745,8 +745,22 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
-		if err := json.NewDecoder(io.LimitReader(req.Body, maxHTTPBodyBytes)).Decode(&body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// One byte of headroom past the cap, so a body that overran it is
+		// distinguishable from one that ended on it. A plain LimitReader
+		// at the cap handed the decoder a truncated document, so a sender
+		// that posted too much was told its JSON was malformed --
+		// "unexpected end of JSON input" -- which sends it looking for a
+		// bug in what it encoded. The lines endpoint beside it already
+		// answers 413 and says to split the request.
+		limited := &io.LimitedReader{R: req.Body, N: maxHTTPBodyBytes + 1}
+		derr := json.NewDecoder(limited).Decode(&body)
+		if limited.N == 0 {
+			http.Error(w, fmt.Sprintf("request body is larger than the limit of %d bytes; split it across requests", maxHTTPBodyBytes),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
+		if derr != nil {
+			http.Error(w, derr.Error(), http.StatusBadRequest)
 			return
 		}
 		if err := model.ValidateSetName(body.Set); err != nil {
