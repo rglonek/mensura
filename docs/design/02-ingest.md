@@ -359,6 +359,19 @@ at the limit ends part-way through a record, and extracting that half is the
 same invention a truncated datagram is. `413` is what the store's write API
 answers for the same condition.
 
+A body the *sender* cut short is answered `400`, and the fragment it ended on
+is discarded rather than extracted. A trailing record with no newline is still
+a record when the body simply ended — nothing more is coming for it — but a
+request that died mid-body leaves half a line, which is the case §7.2 refuses
+a truncated datagram for and §7.1 refuses a cut-short TCP record for.
+
+A record the sink took but could not deliver is answered `503` with
+`Retry-After`, not counted as refused. `Sink.Add` buffers the sample and only
+then flushes, so its error is the verdict of *that flush* and says nothing
+about the line in hand; reporting it as a refusal under a `200` left a sender
+unable to tell a spec that does not match its lines from a store that is down
+([12-implementation.md §6.148](12-implementation.md)).
+
 ## 8. Extraction, aggregation and histograms
 
 The extraction engine is specified in [03-extraction.md](03-extraction.md).

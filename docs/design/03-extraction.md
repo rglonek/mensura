@@ -388,6 +388,16 @@ Rules:
   They are also parsed strictly — a step or an edge that is not entirely a
   number is refused rather than read up to the first byte that does not
   fit, so `linear:5x` is an error and not a step of 5.
+- Every edge must be a finite number, and the compiler checks the
+  *computed* ones, not only the declared ones. `ParseFloat` reads `inf`
+  and `NaN` without complaint, an ascending test cannot catch a NaN
+  because every comparison against one is false, and a finite
+  `linear:` step still overflows once it is multiplied by the bucket
+  position. An edge that cannot be encoded on the wire makes the whole
+  write request carrying the declaration undeliverable, which the write
+  client treats as fatal — so one spec typo costs a batch and freezes
+  every followed file's checkpoint behind it. `fields: limits:` is held
+  to the same rule ([12-implementation.md §6.146](12-implementation.md)).
 
 Bucket-set membership is recorded in the field catalogue, which is how
 `FORMAT heatmap` knows which fields form one histogram

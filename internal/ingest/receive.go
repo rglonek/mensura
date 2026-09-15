@@ -563,6 +563,20 @@ var errRecordCutShort = errors.New("the connection ended mid-record; the fragmen
 // the record the sender meant.
 var errDatagramTooLarge = errors.New("the datagram was larger than --max-datagram-bytes and was discarded rather than extracted from a truncated record")
 
+// errDelivery wraps a failure to hand a record's samples to the sink, so
+// a request/response listener can tell it apart from a record the spec
+// could not read.
+//
+// Sink.Add buffers the sample and only then flushes, so its error is the
+// verdict of *that flush* and never a refusal to take this record --
+// which the comment in handleRecordOutcome already says. Counting it as
+// a refusal on /ingest/v1/lines therefore told a sender that its lines
+// had been rejected, with a reason describing the store's health, for
+// records the sink had in fact accepted and would deliver on the next
+// attempt. The honest answer is the one the store's own API gives for
+// the same condition: back off and come back.
+var errDelivery = errors.New("the record was buffered but delivery to the store is failing")
+
 // maxHTTPBodyBytes bounds one request body on the HTTP listener. The
 // records inside it are bounded separately, by the same record cap every
 // other acquisition path applies.
@@ -689,14 +703,39 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 					http.StatusRequestEntityTooLarge)
 				return
 			}
-			if rec.Oversize {
+			// The same three-way test handleConn applies, and for the
+			// same reason. A trailing record with no newline is a real
+			// record when the body simply ended -- nothing more is
+			// coming for it -- and when it filled the record cap, where
+			// no newline is coming either. It is *not* a record when the
+			// read failed: a client that died mid-body leaves a
+			// fragment, and half a line fed to the extractor does not
+			// fail cleanly, it matches a prefix-anchored pattern and
+			// invents a sample from a number that was cut in two. That
+			// half-record used to be extracted and delivered, and only
+			// then was the request answered 400 -- so a dropped
+			// connection wrote a sample the sender never sent, and the
+			// sender, being told its request failed, sent the whole body
+			// again.
+			oversizeUnterminated := !rec.Terminated && rec.Consumed > recordCap(r.ing.cfg.ReadBufferBytes)
+			if rec.Oversize || oversizeUnterminated {
 				r.ing.cfg.Progress.OversizeRecord()
 			}
-			// A trailing record with no newline is still a record: the
-			// body ended, so nothing more is coming for it.
-			if len(rec.Line) > 0 {
+			usable := rec.Terminated || oversizeUnterminated || errors.Is(rerr, io.EOF)
+			switch {
+			case usable && len(rec.Line) > 0:
 				unusable, err := r.handleRecordOutcome(req.Context(), peer, string(rec.Line))
 				switch {
+				case errors.Is(err, errDelivery):
+					// Not a refusal: the sink took the record and the
+					// store is what is not keeping up. Counting it as
+					// one told the sender its lines had been rejected,
+					// under a 200, with a reason describing the store's
+					// health -- so the honest answer is the store's own
+					// signal for the same condition.
+					w.Header().Set("Retry-After", "1")
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
 				case err != nil:
 					refused++
 					if reason == "" {
@@ -711,6 +750,11 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 					}
 				default:
 					n++
+				}
+			case len(rec.Line) > 0:
+				refused++
+				if reason == "" {
+					reason = errRecordCutShort.Error()
 				}
 			}
 			if rerr != nil {
@@ -916,7 +960,10 @@ func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (
 			return false, err
 		}
 		r.ing.cfg.Progress.AddSamples(1)
-		return false, r.ing.cfg.Sink.AddSample(ctx, set, sample)
+		if err := r.ing.cfg.Sink.AddSample(ctx, set, sample); err != nil {
+			return false, fmt.Errorf("%w: %w", errDelivery, err)
+		}
+		return false, nil
 	}
 	ps, labels, err := r.stream(ctx, peer)
 	if err != nil {
@@ -945,7 +992,7 @@ func (r *receiver) handleRecordOutcome(ctx context.Context, peer, text string) (
 		}
 	}
 	if addErr != nil {
-		return false, addErr
+		return false, fmt.Errorf("%w: %w", errDelivery, addErr)
 	}
 	return perr != nil, nil
 }

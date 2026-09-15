@@ -124,6 +124,13 @@ Notes:
 - `413` — too large.
 - `422` — unknown set while `strict_sets` is on.
 - `429` — over the client's rate/burst budget. `Retry-After` set.
+- `500` — a fault the *store* owns, including a label dictionary record it
+  could not persist. Such a failure used to be reported as a per-sample
+  rejection under `200`, which told the ingester the batch had landed minus a
+  few rows: its checkpoint advanced past them and the records were gone
+  ([12-implementation.md §6.145](12-implementation.md)). A cardinality or
+  label-key budget really spent is still a rejection, because that is a
+  property of what the client sent.
 - `503` — the store is shedding (write queue full, or shutting down).
   `Retry-After` set.
 

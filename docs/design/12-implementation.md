@@ -3006,6 +3006,130 @@ Both now skip a shard that is already gone and carry on. Removing what is
 already removed is what both functions ask for, and it is the only reading
 under which either is idempotent.
 
+### 6.145 A dictionary write that fails is the store's fault, not the sample's
+
+`rowFor` reports two very different things through one error: a sample the
+store refuses — a label value outside the charset, a cardinality budget
+already spent — and a label dictionary record the store could not persist,
+which is a full disk or a transient I/O fault. `Write` turned every one of
+them into a named rejection of that one sample and committed the rest.
+
+For a bad sample that is exactly right, and it is why `ErrBadRequest`
+exists in the other direction: a client-input fault has to be fatal on the
+first attempt so the spec gets fixed, rather than retried forever. For a
+failed `PutDict` it is the worst available answer. The ingester was told
+the batch had landed minus a few rows, so the delivery observers saw a
+successful flush, every followed file's checkpoint advanced past those
+records, and the data was gone — with nothing anywhere but a `WARNING
+store rejected 1 sample(s)` line on the ingester's own console, naming a
+sample that was never the problem.
+
+`intern` now tags that failure with `ErrStoreFault` and `Write` returns it
+rather than rejecting the sample, so the request comes back 500.
+`wire.Client` classifies that as retryable, the sink holds the batch it
+still has, and nothing is acknowledged. The cardinality and label-key
+refusals are untouched: those really are properties of what the client
+sent.
+
+### 6.146 A bucket-set edge that is not a number cannot be declared
+
+`fields: limits:` has been checked for a non-finite bound since §6.123:
+YAML reads `.nan` and `.inf` as real float64s, `encoding/json` refuses to
+marshal either, and an unencodable declaration makes the *whole* write
+request carrying it undeliverable — which the write client classifies as
+fatal, so the sink drops that batch outright, reports it to the delivery
+observers as a hole, and every followed file's checkpoint freezes behind
+it.
+
+`bucket_sets: edges:` is the other number a spec puts on the wire, and it
+was not checked. `strconv.ParseFloat` reads `inf`, `+Inf` and `NaN`
+without complaint, so `edges: 'explicit:[1,inf]'` compiled; the ascending
+test could not catch a NaN, because every comparison against one is false;
+and `linear:inf` produced `0 * +Inf`, which is a NaN in the first bucket.
+A finite step is not enough either — `linear:1e308` overflows the moment
+it is multiplied by the bucket position. Every edge reached
+`wire.FieldMeta.BucketEdge` and, if a heatmap was ever drawn from it,
+`heatmapSeriesName`, which named a series `+Inf`.
+
+`parseEdge` now refuses a non-finite literal, and `BucketSet.compile`
+re-checks every *computed* edge, which is where the overflow shows up.
+`check --spec` reports it, which is the point: the failure it prevents
+happens at run time, once, on a batch nobody is looking at.
+
+### 6.147 A query's width is bounded, as its depth is
+
+§6.116 bounded the *depth* of a predicate, because the parser, the
+printer, the validator and the store's lowering are all recursive over one
+shape and Go's stack overflow is not recoverable. The *width* of a query
+was left open, and it is a per-row cost in the executor rather than a
+per-request one: `runTimeseries` reads every selected field off every
+scanned row, and `seriesKey` resolves and length-prefixes every `BY` slot
+into that row's grouping key.
+
+Neither is covered by the datasource ceilings, and the reason is worth
+stating: a selected field the catalogue does not carry yields no datapoint,
+so `max_datapoints_received` never fires, and opens no series, so
+`max_series_per_graph` never fires either. Both gates watch a counter that
+does not move. An AST arrives as JSON, so a body inside the store's
+default 32 MiB `max_request_bytes` names on the order of a million fields —
+a million map lookups per scanned row, on a query-scoped endpoint, with
+`max_concurrent_jobs` of them allowed at once.
+
+`MaxSelectFields` (1024) and `MaxByLabels` (64) are refused as `E007`.
+Both are far past anything a dashboard emits: the widest table in the
+documentation has a handful of columns, and a grouping deeper than a few
+labels already has more series than `max_series_per_graph` allows.
+
+### 6.148 The lines listener frames the way the other two do
+
+`POST /ingest/v1/lines` reads records through `readRecord` (§6.111) but
+judged the last one by `len(rec.Line) > 0` alone. A trailing record with no
+newline really is a record when the body simply ended — nothing more is
+coming for it — and that is the ordinary case this endpoint is used in.
+It is not a record when the *read* failed: a client that died mid-request
+leaves a fragment, and half a line handed to the extractor does not fail
+cleanly, it matches a prefix-anchored pattern and invents a sample from a
+number that was cut in two. `handleConn` refuses a cut-short TCP record for
+exactly that reason and `serveUDP` refuses a truncated datagram for it;
+this was the third acquisition path. The fragment was extracted and
+delivered, and only *then* was the request answered 400 — so a dropped
+connection wrote a sample the sender never sent, and the sender, told its
+request had failed, sent the whole body again.
+
+The same handler also counted a *delivery* failure as a refusal of the
+record. `Sink.Add` buffers the sample and only then flushes, so its error
+is the verdict of that flush and says nothing about the line in hand —
+which `handleRecordOutcome`'s own comment already says. Reporting it as
+`"refused": 1` under a 200, with a reason describing the store's health,
+left a sender unable to tell a spec that does not match its lines from a
+store that is down, for records the sink had in fact accepted. A delivery
+failure is now `errDelivery` and answers 503 with `Retry-After`, which is
+the signal the store itself uses for the same condition and the only one
+`wire.Client` honours.
+
+### 6.149 A LABELS filter is lowered once, not once per set
+
+`queryLabelValues` walks every set carrying the label and lowered the
+predicate again for each of them. `buildExpr` took a set name to do it
+with — and never read it, because there is one label-value dictionary per
+key for the whole store ([05](05-storage.md) §8, ADR-004). Every lowering
+therefore produced the identical expression, the identical projection and
+the identical diagnostics; §6.117 already deduplicated the *warnings*
+that duplication produced, which is the same observation one level in.
+
+What it cost is not cosmetic. A regex clause is evaluated once against
+every value of the key — up to `max_label_cardinality`, 100 000 by
+default — so a dashboard variable written as
+`LABELS host WHERE dc =~ /^eu/` swept the whole dictionary once per set
+carrying `host`, on the path a dashboard hits on every variable refresh.
+That is the shape §6.117 removed from `shardsFor` in the same function,
+arriving through the predicate instead of the shard list.
+
+The lowering now happens once before the loop and the projection is built
+with it, and `buildExpr` no longer takes a set: a parameter that looks
+like it scopes the resolution, and does not, is what invited the call to
+sit inside the loop in the first place.
+
 ### 6.138 Smaller corrections
 
 - **`Print` has the nesting bound the rest of the package has.** The

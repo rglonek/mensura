@@ -2,6 +2,7 @@ package store
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -219,6 +220,17 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 			}
 			row, err := s.rowFor(batch.Set, sm)
 			if err != nil {
+				// A fault the store owns is not a rejection of this
+				// sample. rowFor reports both through one error, and
+				// naming a dictionary write that failed as "this sample
+				// was refused" told the ingester its batch had landed
+				// minus a few rows -- so the checkpoint advanced over
+				// records the store never held. The whole request fails
+				// instead, which the write client classifies as
+				// retryable and the sink holds rather than drops.
+				if errors.Is(err, ErrStoreFault) {
+					return nil, err
+				}
 				resp.Reject(idx, err.Error())
 				continue
 			}
