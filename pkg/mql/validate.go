@@ -49,6 +49,19 @@ type Schema interface {
 func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	var warns []Diag
 
+	// The kind is checked before anything reads it, for the reason the
+	// format is: the store switches on it with a data-query default, so
+	// an unrecognised value executed as a timeseries query instead of
+	// being refused -- `{"kind":"Labels"}` came back as "query has no
+	// FROM set", naming the wrong clause, and a misspelt data-query kind
+	// ran with nothing saying the AST was not what the builder produces.
+	// An absent kind is a data query, which is what MarshalJSON writes
+	// and what every hand-authored panel omits.
+	switch q.Kind {
+	case "", KindQuery, KindSets, KindFields, KindLabels, KindLabelKeys:
+	default:
+		return nil, Diag{"E008", fmt.Sprintf("unknown query kind %q: expected query, sets, fields, labels or label_keys", q.Kind)}
+	}
 	if q.Kind == KindSets {
 		return nil, nil
 	}
@@ -140,6 +153,19 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 					return nil, Diag{"E009", fmt.Sprintf("unknown bucket set %q on set %q", fe.Histogram, q.From)}
 				}
 			}
+			// A bucket set resolves to no rendered field, so none of the
+			// per-field modifiers has anywhere to be applied: the heatmap
+			// executor sums bucket counts per window and never builds a
+			// render.Spec at all. They used to be accepted and dropped in
+			// silence, so `HISTOGRAM(hdr24) RATE` drew raw counts under a
+			// legend the author read as a rate -- the same
+			// declared-and-ignored failure the table/logs rule below
+			// refuses, on the one selection shape it did not cover. AS is
+			// not a modifier and still names the series.
+			if m := modifierNames(fe.Modifiers); len(m) > 0 {
+				return nil, Diag{"E008", fmt.Sprintf("HISTOGRAM(%s) cannot carry %s: a bucket set is reduced by sum per window, so a per-field modifier has no series to apply to",
+					fe.Histogram, strings.Join(m, ", "))}
+			}
 			continue
 		}
 		info, known := FieldInfo{}, false
@@ -218,6 +244,24 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			}
 		}
 	}
+	// The query-level half of the same rule. A tabular format does no
+	// downsampling and has no series, so EVERY -- which is nothing but a
+	// downsample window -- and LIMIT SERIES -- which bounds a series
+	// count -- are read by nothing on that path: runTabular never looks
+	// at either. They were accepted and dropped in silence, which is
+	// exactly what the per-field rule above exists to stop one clause
+	// further out, and Explain went on reporting a downsample_window the
+	// executor would never use. 06-query.md section 4.7 says a tabular
+	// format does no downsampling and that LIMIT POINTS is the bound that
+	// applies to it.
+	if format == FormatTable || format == FormatLogs {
+		if q.EveryMs != nil {
+			return nil, Diag{"E008", fmt.Sprintf("EVERY is a downsample window and FORMAT %s does no downsampling; LIMIT POINTS is what bounds it", format)}
+		}
+		if q.Limits.Series != nil {
+			return nil, Diag{"E008", fmt.Sprintf("LIMIT SERIES bounds a series count and FORMAT %s produces rows, not series; LIMIT POINTS is what bounds it", format)}
+		}
+	}
 
 	if err := validateExpr(q, q.Where, s, &warns, 0); err != nil {
 		return warns, err
@@ -274,6 +318,37 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		}
 	}
 	return warns, nil
+}
+
+// modifierNames lists the per-field modifiers an expression carries, in
+// the canonical order Print emits them, so a diagnostic can name exactly
+// what it is refusing rather than saying "a modifier".
+func modifierNames(m Modifiers) []string {
+	var out []string
+	switch {
+	case m.Delta && m.PerSecond:
+		out = append(out, "RATE")
+	case m.Delta:
+		out = append(out, "DELTA")
+	case m.PerSecond:
+		out = append(out, "PER SECOND")
+	}
+	if m.Negate {
+		out = append(out, "NEGATE")
+	}
+	if m.Clamp != nil {
+		out = append(out, "CLAMP")
+	}
+	if m.GapMs != nil {
+		out = append(out, "GAP")
+	}
+	if m.SSE != nil {
+		out = append(out, "SSE")
+	}
+	if m.Required {
+		out = append(out, "REQUIRED")
+	}
+	return out
 }
 
 // CheckPredicateDepth refuses a predicate that nests deeper than

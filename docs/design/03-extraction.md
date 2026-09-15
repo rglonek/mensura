@@ -318,6 +318,25 @@ Semantics:
    therefore an extraction error rather than a row of empty strings, which
    is what `default_values` is there to prevent.
 
+   A default is classified exactly as the capture it stands in for is (§5):
+   a key the profile or the pattern declares as a label fills the label, and
+   an empty default is an absent one there, as an empty capture is. It used
+   to fill the *fields* unconditionally, which broke a default for a
+   declared label in both directions at once. Where the capture did
+   participate the value went to the labels, so the field slot was still
+   empty and the default fired as well — the sample then carried the same
+   name as a label *and* as a field, which is the one shape the store
+   refuses by name, so every record the pattern produced was rejected for
+   the life of the process with nothing pointing back at the spec. Where it
+   did not, the default landed as a column instead of the label it was
+   declared to be, so the row fell outside its own `BY` group and the
+   catalogue grew a field nobody declared
+   ([12-implementation.md §6.135](12-implementation.md)).
+
+   The field an `aggregate:` synthesises is a column by construction, so
+   declaring that same name as a label is refused at compile time rather
+   than producing the same label-and-field collision from the other side.
+
 ## 8. Bucket sets (histograms / heatmaps)
 
 Histogram layouts are declared, not compiled in. A tool that hard-codes "24

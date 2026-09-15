@@ -970,7 +970,65 @@ func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
 // retire closes a tailer whose path now holds -- or will hold -- a
 // different file, and rewinds its checkpoint so the replacement is read
 // from its beginning.
-func (f *follower) retire(ctx context.Context, t *tailer) { f.closeTailer(ctx, t, true) }
+func (f *follower) retire(ctx context.Context, t *tailer) {
+	f.drainFinalRecord(ctx, t)
+	f.closeTailer(ctx, t, true)
+}
+
+// drainFinalRecord extracts the bytes left after the read head on a
+// handle that can never grow again.
+//
+// read() holds an unterminated record back on purpose: the offset stays
+// before the incomplete bytes and the next pass re-reads them whole,
+// because a line read mid-write must not be delivered as if it were the
+// whole record -- a prefix-anchored pattern matches half a line and
+// invents a sample from a number that was cut in two. But once the file
+// has been renamed away or unlinked, no next pass is coming, and those
+// bytes are as complete as they will ever be. Every other acquisition
+// path extracts such a record: batch import processes a trailing line
+// with no newline, and handleConn does when the sender closes cleanly.
+// The follower closed the handle over it, so the same file produced
+// different data depending on how it was read -- which is the reason
+// read() gives for consuming an over-long record rather than discarding
+// it, one case along.
+//
+// It is called only from retire(), never from retireKeepingCheckpoint or
+// from closeAll. Both of those close a handle whose file may still be
+// being written -- a glob that missed a path for one sweep, a shutdown --
+// and the checkpoint they leave behind is what re-reads those bytes whole
+// on the next pass.
+func (f *follower) drainFinalRecord(ctx context.Context, t *tailer) {
+	if t == nil || t.file == nil {
+		return
+	}
+	if _, err := t.file.Seek(t.offset, io.SeekStart); err != nil {
+		return
+	}
+	rec, err := readRecord(bufio.NewReaderSize(t.file, 64<<10), f.opts.MaxRecordBytes)
+	// Anything terminated was already taken by read(), and a read that
+	// failed for any reason other than reaching the end of the file says
+	// nothing about what those bytes are.
+	if rec.Terminated || len(rec.Line) == 0 || (err != nil && !errors.Is(err, io.EOF)) {
+		return
+	}
+	recStart := t.offset
+	if rec.Oversize {
+		f.ing.cfg.Progress.OversizeRecord()
+	}
+	f.ing.cfg.Progress.AddRecord(int64(rec.Consumed))
+	t.ex.Mark(recStart)
+	results, perr := t.ex.Process(string(rec.Line))
+	f.ing.recordOutcome(perr)
+	f.ing.cfg.Progress.AddSamples(int64(len(results)))
+	for n, res := range results {
+		_ = f.ing.cfg.Sink.Add(ctx, res, t.labels, keyHint(t.stream, offsetPos(recStart), n))
+	}
+	t.offset = recStart + int64(rec.Consumed)
+	// Published before closeTailer flushes the extractor, so the samples
+	// this record fed into an open multiline buffer or aggregation window
+	// go out with the rest of it.
+	f.syncPending(t)
+}
 
 // retireKeepingCheckpoint closes a tailer whose path is simply no longer
 // in the followed set, leaving its resume record on disk untouched.

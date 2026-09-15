@@ -930,8 +930,9 @@ merely names its operator labels does not:
 | `L002` | no | a capture that is neither a declared label nor a `fields:` entry, so it lands as an untyped gauge |
 | `L003` | no | a `fields:` declaration no pattern captures, so its metadata reaches no column |
 | `L004` | no | a declared label no pattern captures and that is not a stream label |
+| `L005` | no | a capture that is *not* declared as a label but whose name is one the acquisition layer attaches as a stream label; the sample would carry the name as a label and as a field, which the store refuses outright |
 
-Failing on all four alike was wrong in a way the L004 text said out loud:
+Failing on all of them alike was wrong in a way the L004 text said out loud:
 its own message ends "if it comes from `identity:` or --label it is
 attached by the stream and needs no declaration here", and declaring such
 a label in `defaults.labels` — which is where the documentation puts it —
@@ -2800,6 +2801,141 @@ the engine — `Write`, `Compact`, `Flush`, `RunRetention`,
 same 30-second bound `drainJobs` uses, saying so if it expires. Nothing
 new starts once `Close` has begun: each of those answers `ErrClosed`,
 which the HTTP layer already renders as a `503` with `Retry-After`.
+
+### 6.139 A `default_values` entry for a declared label is a label
+
+`default_values:` fills "the captures the matching regex did not produce"
+([03](03-extraction.md) §7.5), and §5 of that document says a named capture
+becomes a label or a field according to how the profile classifies it. The
+defaults did not follow the classification: `process()` wrote every one of
+them into the field map, unconditionally, whatever the spec had declared.
+
+That broke a default for a declared label in both directions at once, and a
+profile as ordinary as
+
+```yaml
+labels: [status]
+patterns:
+  - set: app
+    search: 'req'
+    extract: ['req(?: status=(?P<status>[a-z]+))? ms=(?P<ms>\d+)']
+    default_values: {status: unknown}
+```
+
+hit both on alternating records. On a line where the capture *did*
+participate, the value went to the labels — so the field slot was still
+empty, the default fired as well, and the sample carried `status` as a label
+**and** as a field. That is the one shape `store.rowFor` refuses by name
+(`"status" is both a label and a field`), so every such record came back as a
+named rejection: the write API reported `accepted: 0`, the ingester logged a
+collapsed warning, and nothing anywhere pointed at the spec. On a line where
+it did not participate, the default landed as a column instead of the label
+it was declared to be — so the row fell outside its own `BY` group and the
+catalogue grew a `status` field nobody declared.
+
+The defaults are now classified exactly as the captures they stand in for
+are, through the same `Stream.isLabel` the capture loop uses, and an empty
+default is an absent one for a label just as an empty capture is (the store
+refuses an empty label value outright). The compile-time name check already
+read these keys as labels — `isDeclaredLabel` validates them against the
+label charset — so this is the classification the spec was already being held
+to.
+
+The mirror case is refused rather than reclassified: an `aggregate:` block
+synthesises its `field` as a column by construction, so a spec that also
+declares that name as a label is a contradiction the pipeline cannot honour,
+and `Profile.compile` now says so instead of emitting the same
+label-and-field collision from the other side.
+
+`Lint` gained `L005` for the third way into it, which no rule covered: a
+capture the profile does **not** declare as a label, whose name is one the
+acquisition layer attaches as a stream label anyway — `host` and `source`
+always, plus every name an `identity:` rule can produce. Such a pattern's
+every sample carries the name twice and is refused by the store, and the only
+trace was a line in the store's log on the far side of the sink. It is
+advisory rather than fatal for the reason L004 is: an `identity:` rule scoped
+by `match_path` does not apply to every stream, so a pattern in another
+profile may legitimately own the name.
+
+### 6.140 A clause that is read by nothing is refused, not dropped
+
+Three declarations were accepted by the validator and then read by no
+executor, which is the failure the unknown-`FORMAT` check
+([§6.40](12-implementation.md)) and the timeseries-only-modifier rule were
+both added to prevent: the panel looks right and is the wrong shape.
+
+- **Per-field modifiers on a `HISTOGRAM()` selection.** A bucket set
+  resolves to no rendered field: `plan()` expands it into bucket columns and
+  appends nothing to `p.fields`, and `runHeatmap` sums counts per window
+  without ever building a `render.Spec`. So `RATE`, `DELTA`, `NEGATE`,
+  `CLAMP`, `GAP`, `SSE` and `REQUIRED` were parsed, validated, stored in the
+  panel and then discarded — `HISTOGRAM(hdr24) RATE` drew raw counts under a
+  legend the author read as a rate. Now `E008`, naming the modifiers it
+  refuses. `AS` is not a modifier and still names the series.
+- **`EVERY` and `LIMIT SERIES` under `FORMAT table` or `FORMAT logs`.**
+  `EVERY` is a downsample window and a tabular format does no downsampling
+  ([06](06-query.md) §4.7); `LIMIT SERIES` bounds a series count and a
+  tabular format produces rows. `runTabular` reads neither. Both are now
+  `E008`, which is the same rule the per-field modifiers on those formats
+  already follow. The *grammar* still accepts both, so `Print` → `Parse`
+  stays total for an AST stored before the rule existed.
+- **`Explain` reported a `downsample_window` for a tabular query.** The
+  number described a stage that does not run, on the one endpoint whose
+  contract is that it describes the plan the executor runs. It now reports
+  zero for `FORMAT table` and `FORMAT logs`.
+
+An unrecognised `kind` was the fourth: `Store.Query` switches on it with a
+data-query default, so `{"kind": "Labels"}` executed as a timeseries query
+and came back as "query has no FROM set", naming the wrong clause. It is now
+`E008` naming the kind, the way an unrecognised `format` is. An absent kind
+is still a data query — that is what `MarshalJSON` writes and what every
+hand-authored panel omits. `E010`, which the validator has emitted since
+§6.14, was also missing from [06](06-query.md) §12's table of codes; the
+table's own claim is that every diagnostic has one.
+
+### 6.141 Two smaller store corrections
+
+- **A label key whose first value could not be written is not left
+  behind.** `intern` allocates the dictionary before it persists the value,
+  so a `PutDict` that failed — a full disk, a transient fault — left an
+  empty dictionary in the map. Nothing ever removes one, and it is not
+  recoverable from disk either, so it spent one of `max_label_keys`
+  ([§6.136](12-implementation.md)) on a key that can never answer a lookup:
+  the same slow leak of a budget the hole put back on the free list beside
+  it exists to avoid, one level up.
+- **`applySetMeta` validates every declaration before it applies any.**
+  `applyFieldMeta` has always had that shape. `applySetMeta` validated and
+  applied in one pass, so an entry that the *next* one made the request fail
+  landed anyway: the caller got a 400 and the store kept half of what it
+  refused, which for `sets:` means a retention and a shard width nobody's
+  spec asked for, persisted in the catalogue.
+
+### 6.142 A rotated file's last record survives even without its newline
+
+`follower.read` holds an unterminated record back: the offset stays before
+the incomplete bytes and the next pass re-reads them whole. That is right
+while the file is live — a line read mid-write, handed to a prefix-anchored
+pattern, invents a sample from a number that was cut in two, which is the
+failure the TCP listener discards a cut-short record for.
+
+It is wrong at the one moment there is no next pass. `checkRotation` retires
+a handle when the path no longer resolves to it (rename-and-create) or when
+the inode has been unlinked, and those bytes can never grow again: they are
+as complete as they will ever be. The handle was closed over them anyway, so
+a writer killed mid-line, or a rotation that landed between a record and its
+newline, lost that record silently — while batch import processed the same
+trailing bytes (`len(rec.Line) > 0 || rec.Terminated`) and `handleConn`
+processed them when a sender closed cleanly. "The same file produces
+different data depending on how it was read" is the reason `read` gives for
+consuming an over-long record rather than discarding it; this is the same
+principle one case along.
+
+`drainFinalRecord` runs from `retire()` and from nowhere else. It is
+deliberately not called by `retireKeepingCheckpoint` — the path that leaves
+the followed set, which `filepath.Glob` reports for an unreadable directory,
+where the file is very likely still being written — nor by `closeAll` at
+shutdown. Both of those leave a checkpoint behind, and that checkpoint is
+what re-reads the record whole on the next pass.
 
 ### 6.138 Smaller corrections
 

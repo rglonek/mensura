@@ -760,6 +760,7 @@ func (s *Store) intern(key, value string) (int32, error) {
 	s.dictMu.Lock()
 	defer s.dictMu.Unlock()
 	d, ok = s.dict[key]
+	fresh := !ok
 	if !ok {
 		// The key budget, checked before the dictionary is allocated. It
 		// is the same shape as the value budget below: loud and early,
@@ -798,6 +799,15 @@ func (s *Store) intern(key, value string) (int32, error) {
 		// function exists to defend.
 		if reused {
 			d.holes = append(d.holes, idx)
+		}
+		// A key this call created holds nothing, was never persisted and
+		// is not recoverable from disk, so leaving it behind spent one of
+		// MaxLabelKeys on a dictionary that can never answer a lookup --
+		// permanently, because nothing ever removes one. That is the same
+		// slow leak of a budget the hole above is put back to avoid, one
+		// level up.
+		if fresh {
+			delete(s.dict, key)
 		}
 		return 0, err
 	}

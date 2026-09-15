@@ -1328,8 +1328,14 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 	if window < 0 {
 		window = 0
 	}
-	if q.Format == mql.FormatHeatmap {
+	switch q.Format {
+	case mql.FormatHeatmap:
 		window = heatmapWindow(q, req)
+	case mql.FormatTable, mql.FormatLogs:
+		// runTabular does no downsampling at all, so any number here
+		// describes a stage of the plan that does not run. Explain may
+		// not report a plan that is not the plan.
+		window = 0
 	}
 	return map[string]any{
 		"shards":            p.shards,

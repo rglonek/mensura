@@ -42,6 +42,11 @@ func (l Lint) String() string {
 // four alike, so declaring the operator label the README's own example
 // passes (`--label dc=eu-west-1`) in `defaults.labels` failed the build --
 // with a message that itself said the label needs no declaration.
+//
+// L005 is advisory for the reason L004 is: the stream-label set it
+// compares against is the union of every `identity:` rule's captures, and
+// a rule scoped by `match_path` does not apply to every stream, so a
+// pattern in another profile may legitimately capture that name.
 func (l Lint) Fatal() bool { return l.Code == "L001" }
 
 // Fatal reports whether any finding in a set is fatal.
@@ -162,6 +167,25 @@ func (p *Profile) lintCaptures(streamLabels map[string]struct{}) []Lint {
 				continue
 			}
 			if _, ok := pat.labelSet[name]; ok {
+				continue
+			}
+			// A capture the profile does not classify as a label is a
+			// *field*, and the acquisition layer attaches the stream's
+			// own labels to every sample it produces -- host and source
+			// always, plus whatever `identity:` discovers. A field whose
+			// name collides with one of those arrives at the store as a
+			// label and a field on the same sample, which store.rowFor
+			// refuses by name ("%q is both a label and a field"): every
+			// record the pattern produces is rejected, one at a time, for
+			// the life of the process, and the only trace is a line in
+			// the store's log on the far side of the sink. It is decidable
+			// here, from the spec alone.
+			if _, ok := streamLabels[name]; ok {
+				out = append(out, Lint{
+					Profile: p.Name, Code: "L005",
+					Msg: fmt.Sprintf("pattern for set %q captures %q as a field, but %q is a stream label the acquisition layer attaches to every sample; the store refuses a sample that carries one name as both, so every record this pattern produces would be rejected -- declare it in `labels:` or capture it under another name",
+						pat.Set, name, name),
+				})
 				continue
 			}
 			if _, ok := p.Fields[name]; ok {
