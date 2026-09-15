@@ -1023,7 +1023,18 @@ func (s *Store) shardWidth(set string) time.Duration {
 // overlaps a query range and when retention may drop it: deriving it from
 // the suffix length would silently mis-size every other configured width.
 func (s *Store) shardName(set string, tsMs int64) string {
-	w := s.shardWidth(set)
+	return shardNameAt(set, tsMs, s.shardWidth(set))
+}
+
+// shardNameAt is shardName against a width the caller already resolved.
+//
+// It exists because shardWidth takes two read locks and calls
+// retentionFor, which takes a third, and the width is a property of the
+// *set* rather than of the sample: resolving it per sample charged a
+// default 1024-sample batch three thousand lock acquisitions for an
+// answer that cannot change within one batch. Write resolves it once, the
+// way it already resolves the key scheme once.
+func shardNameAt(set string, tsMs int64, w time.Duration) string {
 	if w <= 0 {
 		return set + "@" + shardAll
 	}

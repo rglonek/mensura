@@ -3151,6 +3151,21 @@ sit inside the loop in the first place.
   has to ask for; §10 of [02](02-ingest.md) lists extraction errors among
   the fields the set carries.
 
+### 6.151 The shard width is resolved once per batch, not once per sample
+
+`shardName` asked `shardWidth` for the width of every sample it routed,
+and `shardWidth` takes two read locks and calls `retentionFor`, which
+takes a third. The width is a property of the *set*, and the set is fixed
+for the whole of a `model.Batch`, so a default 1024-sample batch paid
+three thousand lock acquisitions for an answer that could not change
+inside it — on the hottest path in the system, with every other writer in
+the process contending for the same two mutexes.
+
+`Write` now resolves it once per batch, the way it already resolves the
+key scheme once, and `shardNameAt` takes the width the caller has. It is
+resolved after `applySetMeta`, so a `set_meta` declaration in the same
+request still shapes the batch that travels with it ([04](04-wire-protocol.md) §3.3).
+
 ### 6.138 Smaller corrections
 
 - **`Print` has the nesting bound the rest of the package has.** The

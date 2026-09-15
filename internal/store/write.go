@@ -194,6 +194,10 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 		// describe what the first one committed.
 		acceptedByShard := map[string][]model.Sample{}
 		scheme := s.keyScheme(batch.Set)
+		// Resolved once for the batch, like the key scheme above: the
+		// width is a property of the set, and shardWidth takes three
+		// read locks to answer. See shardNameAt.
+		width := s.shardWidth(batch.Set)
 		for i := range batch.Samples {
 			sm := &batch.Samples[i]
 			idx := index
@@ -235,7 +239,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 				continue
 			}
 			pk := model.PrimaryKey(batch.Set, sm, scheme)
-			shard := s.shardName(batch.Set, sm.TSMs)
+			shard := shardNameAt(batch.Set, sm.TSMs, width)
 			byShard[shard] = append(byShard[shard], engine.Record{Key: pk, Row: row})
 			acceptedByShard[shard] = append(acceptedByShard[shard], *sm)
 			resp.Accepted++
