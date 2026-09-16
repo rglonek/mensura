@@ -274,9 +274,28 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 	case m.Clamp != nil:
 		rf.spec.ClampMin, rf.spec.ClampMax = m.Clamp.Min, m.Clamp.Max
 		rf.spec.ClampElseRaw = m.Clamp.Else == "raw"
-	case known && (info.LimitMin != nil || info.LimitMax != nil) && limitsOrdered(info):
+	case known && !m.Negate && (info.LimitMin != nil || info.LimitMax != nil) && limitsOrdered(info):
 		// A field that declared limits gets the counter-reset escape hatch
 		// wired up by default.
+		//
+		// Never under NEGATE. The declared limits describe the field's own
+		// values, and NEGATE deliberately renders their mirror image, so
+		// every point of a non-negative field falls outside them -- and
+		// this default carries ELSE RAW, which 07-downsampling.md section
+		// 3 stage 6 says "undoes both DELTA and NEGATE". So the ordinary
+		// declaration `limits: {min: 0}` on a counter silently replaced
+		// every negated point with the raw sample:
+		// `SELECT tx NEGATE` drew the counter the right way up, and
+		// `SELECT tx RATE NEGATE` -- the mirrored-axis panel the modifier
+		// exists for -- drew the raw counter instead of the rate, three
+		// orders of magnitude out, with no diagnostic anywhere. That is
+		// the same silent substitution a crossed limit pair was refused
+		// for (limitsOrdered), reached through a declaration that is
+		// correct.
+		//
+		// An explicit CLAMP still wins above, which is what "metadata
+		// supplies defaults only" means: a default that cancels the
+		// modifier written beside it is not a default.
 		rf.spec.ClampMin, rf.spec.ClampMax = info.LimitMin, info.LimitMax
 		rf.spec.ClampElseRaw = true
 	}

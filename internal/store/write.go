@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -29,6 +30,12 @@ func (e *ErrBadRequest) Error() string { return e.Msg }
 func badRequestf(format string, args ...any) error {
 	return &ErrBadRequest{Msg: fmt.Sprintf(format, args...)}
 }
+
+// maxDeclaredDurationMs is the largest millisecond count a time.Duration
+// can hold, which is what a declared retention or shard width is converted
+// into. Roughly 292 years; every real declaration is many orders of
+// magnitude below it.
+const maxDeclaredDurationMs = int64(math.MaxInt64) / int64(time.Millisecond)
 
 // idempotencyCache remembers recently committed request keys so a retry
 // that crossed with its own success does not write twice.
@@ -318,6 +325,21 @@ func checkSetMeta(m wire.SetMeta) error {
 	}
 	if m.ShardMs != nil && *m.ShardMs < 0 {
 		return badRequestf("set %q: shard width must not be negative", m.Set)
+	}
+	// Bounded at the top as well as the bottom. applySetMeta converts
+	// these with `time.Duration(ms) * time.Millisecond`, and that product
+	// overflows int64 past ~292 years: the wrapped value is usually
+	// negative, so SetRetentionFor's own `>= 0` and `> 0` tests drop it
+	// and the set silently keeps the store's defaults -- a declaration
+	// taken and not acted on, which is what every other check here
+	// refuses. For the values that wrap positive it is worse: the set is
+	// retained on a horizon nobody wrote. extract.Compile refuses the same
+	// pair in a spec; this is the door the write API leaves.
+	if m.RetentionMs != nil && *m.RetentionMs > maxDeclaredDurationMs {
+		return badRequestf("set %q: retention %d ms is beyond the %d ms a duration can hold", m.Set, *m.RetentionMs, maxDeclaredDurationMs)
+	}
+	if m.ShardMs != nil && *m.ShardMs > maxDeclaredDurationMs {
+		return badRequestf("set %q: shard width %d ms is beyond the %d ms a duration can hold", m.Set, *m.ShardMs, maxDeclaredDurationMs)
 	}
 	switch m.KeyScheme {
 	case "", model.KeyContent, model.KeyOffset:

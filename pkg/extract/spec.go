@@ -235,6 +235,14 @@ const defaultScanLines = 500
 // meaning anything.
 const maxPow2Buckets = 64
 
+// maxDeclaredDurationMs is the largest millisecond count a time.Duration
+// can hold, which is what the store converts a `sets:` retention or shard
+// width into. Past it the product wraps, and the store then either drops
+// the declaration in silence or keeps the set on a horizon nobody wrote;
+// the store refuses such a value too, but only per write, so a spec that
+// declares one is better caught by `check`.
+const maxDeclaredDurationMs = int64(math.MaxInt64) / int64(time.Millisecond)
+
 // Load reads and compiles a spec, following includes relative to the
 // including file.
 func Load(path string) (*Spec, error) {
@@ -411,6 +419,9 @@ func (s *Spec) Compile() error {
 			if ms < 0 {
 				return fmt.Errorf("extract: set %s retention %q must not be negative", name, opt.Retention)
 			}
+			if ms > maxDeclaredDurationMs {
+				return fmt.Errorf("extract: set %s retention %q is beyond the %d ms a duration can hold; the store converts it to a time.Duration and the product would wrap", name, opt.Retention, maxDeclaredDurationMs)
+			}
 			opt.retentionMs = &ms
 		}
 		if opt.Shard != "" {
@@ -420,6 +431,9 @@ func (s *Spec) Compile() error {
 			}
 			if ms <= 0 {
 				return fmt.Errorf("extract: set %s shard %q must be positive", name, opt.Shard)
+			}
+			if ms > maxDeclaredDurationMs {
+				return fmt.Errorf("extract: set %s shard %q is beyond the %d ms a duration can hold; the store converts it to a time.Duration and the product would wrap", name, opt.Shard, maxDeclaredDurationMs)
 			}
 			opt.shardMs = &ms
 		}

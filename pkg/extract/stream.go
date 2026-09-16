@@ -429,7 +429,14 @@ func (st *Stream) holdRecord(buf *mlBuffer, through int64) {
 func (st *Stream) lowerHoldMark(key string, a *aggregator) {
 	for i := range st.holds {
 		if st.holds[i].a == a && st.holds[i].key == key {
-			st.holds = append(st.holds[:i], st.holds[i+1:]...)
+			// The shift leaves a copy of the last entry behind the new
+			// length, so it is cleared: the backing array is what the
+			// collector traces, and a stale entry there pins a window
+			// nothing refers to any more.
+			n := len(st.holds)
+			copy(st.holds[i:], st.holds[i+1:])
+			st.holds[n-1] = holdEntry{}
+			st.holds = st.holds[:n-1]
 			break
 		}
 	}
@@ -488,6 +495,15 @@ func (st *Stream) pruneHolds() {
 			if st.live(e) || (e.endMark() >= floor && e.endMark() > e.mark) {
 				kept = append(kept, e)
 			}
+		}
+		// The discarded tail is cleared for the reason aggQueue.Pop
+		// clears the slot it pops: compacting in place shortens the
+		// slice but leaves the dropped entries in the backing array,
+		// and each one holds an aggregation key and a pointer to the
+		// window it named -- which holds copies of the opening record's
+		// maps. Pruning that frees nothing is not pruning.
+		for i := len(kept); i < len(st.holds); i++ {
+			st.holds[i] = holdEntry{}
 		}
 		st.holds = kept
 	}
@@ -1215,6 +1231,17 @@ func (q *aggQueue) Pop() any {
 	old := *q
 	n := len(old)
 	e := old[n-1]
+	// Cleared, not merely resliced. Shortening a slice leaves the element
+	// in the backing array, and the garbage collector traces the array
+	// rather than the length -- so every window this queue ever emitted
+	// stayed reachable through its *aggregator, which holds a copy of the
+	// opening record's label and field maps and the whole record line.
+	// The queue's high-water mark is maxOpenWindows, and one stream can
+	// live for the life of the process (a followed file, a peer, an SSH
+	// connection), so the retention was the peak footprint rather than
+	// the live one: the cap this heap exists to enforce was never given
+	// back.
+	old[n-1] = aggEntry{}
 	*q = old[:n-1]
 	return e
 }

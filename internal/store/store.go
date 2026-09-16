@@ -1228,7 +1228,7 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		return 0, ErrClosed
 	}
 	defer s.leaveEngine()
-	dropped, forgotten := 0, 0
+	dropped, forgotten, trimmed := 0, 0, 0
 	emptied := map[string]struct{}{}
 	for _, name := range s.db.Sets() {
 		i := strings.LastIndex(name, "@")
@@ -1281,6 +1281,21 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	// per-set dictionaries that ADR-004 rejected, not a sweep here.
 	for logical := range emptied {
 		if live, _ := s.shardsFor(logical, math.MinInt64, math.MaxInt64); len(live) > 0 {
+			// The set survives, but its oldest data does not. FirstTSMs
+			// is only ever lowered -- observeSet takes the minimum of
+			// what it is handed -- so nothing raised it when the shards
+			// holding those instants were range-deleted, and the
+			// catalogue went on advertising a start time with nothing
+			// under it for as long as the set existed. That number is
+			// what the query builder offers as "all data" and what the
+			// plugin's health check prints, so a store with a month of
+			// retention and a year of history reported a year and
+			// answered an empty panel for eleven months of it. The
+			// oldest surviving shard's start is the earliest instant the
+			// set can still hold.
+			if s.raiseFirstSeen(logical, oldestShardStartMs(live)) {
+				trimmed++
+			}
 			continue
 		}
 		// forgetAgedSet, not ForgetSet: what the shards took with them
@@ -1312,12 +1327,64 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 	// range whose shards have just been range-deleted. Logged rather than
 	// returned, so a failure to persist does not read as a failed sweep --
 	// the shards really are gone.
-	if forgotten > 0 {
+	if forgotten+trimmed > 0 {
 		if err := s.saveCatalogue(); err != nil {
-			s.cfg.Logger.Printf("ERROR saving catalogue after retention emptied %d set(s): %v", forgotten, err)
+			s.cfg.Logger.Printf("ERROR saving catalogue after retention emptied %d set(s) and trimmed the observed start of %d: %v", forgotten, trimmed, err)
 		}
 	}
 	return dropped, nil
+}
+
+// oldestShardStartMs is the earliest instant the shards of a set can still
+// hold. Shards arrive oldest first from shardsInRange.
+//
+// An unsharded "@all" shard covers every instant, so it reports zero: a
+// set that has one has no floor to raise and its observed start stands.
+func oldestShardStartMs(shards []string) int64 {
+	if len(shards) == 0 {
+		return 0
+	}
+	i := strings.LastIndex(shards[0], "@")
+	if i < 0 {
+		return 0
+	}
+	suffix := shards[0][i+1:]
+	if suffix == shardAll {
+		return 0
+	}
+	start, _, err := parseShardSuffix(suffix)
+	if err != nil {
+		return 0
+	}
+	return start.UnixMilli()
+}
+
+// raiseFirstSeen moves a set's observed start forward to an instant its
+// surviving shards can actually hold, and reports whether it moved.
+//
+// It only ever raises. observeSet lowers it from the samples themselves,
+// so the two together keep the reported range inside the data: nothing
+// else could raise it, because the rows that held the older instants were
+// removed by a range delete that walks no rows.
+func (s *Store) raiseFirstSeen(name string, floorMs int64) bool {
+	if floorMs <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	e, ok := s.catalogue[name]
+	if !ok || e.FirstTSMs == 0 || e.FirstTSMs >= floorMs {
+		s.mu.Unlock()
+		return false
+	}
+	e.FirstTSMs = floorMs
+	if e.LastTSMs < floorMs {
+		// A last timestamp behind the surviving floor describes an empty
+		// range; the floor is the only instant still defensible.
+		e.LastTSMs = floorMs
+	}
+	s.mu.Unlock()
+	s.catVer.Add(1)
+	return true
 }
 
 // ForgetSet removes every trace of a logical set from the catalogue: its

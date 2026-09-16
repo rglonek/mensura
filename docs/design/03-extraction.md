@@ -162,7 +162,9 @@ value removes the bound instead of setting one; an `idle_timeout` that is
 negative or zero is never *not* elapsed, so every buffered record is flushed on
 the next tick and the rule joins nothing. A declaration that quietly does the
 opposite of what it says is refused, the way `identity.scan_lines` and a
-negative `sets:` retention are.
+`sets:` retention that is negative — or larger than the ~292 years a
+`time.Duration` can hold, past which the store's own conversion wraps and
+drops the declaration in silence — are.
 Timestamp regression inside a multiline record is an error for that record,
 not a silent join.
 
@@ -253,7 +255,9 @@ store's catalogue, and is served to the plugin. Effects:
 - `max_interval` becomes the default `GAP` for that field, so gap detection is
   right by default instead of being a per-panel chore.
 - `limits` become the default `CLAMP … ELSE RAW`, which is the counter-reset
-  escape hatch pre-wired.
+  escape hatch pre-wired — except under `NEGATE`, where the declared range
+  describes values the query is deliberately mirroring
+  ([06](06-query.md) §4.3).
 - `unit_hint` populates the frame's field config so panels get units without
   manual configuration.
 
