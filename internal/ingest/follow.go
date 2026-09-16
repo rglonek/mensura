@@ -1176,6 +1176,19 @@ func (f *follower) flushIdle(ctx context.Context) {
 	tailers := f.snapshotTailers()
 	now := time.Now()
 	for _, t := range tailers {
+		// A tailer that owes a rewind is about to be seeked back and
+		// re-read, and applyRewind then *discards* whatever the extractor
+		// holds precisely because it was built from those bytes.
+		// Emitting it here first delivers a window the replay is about to
+		// rebuild -- and a window closed early by an idle tick covers
+		// fewer records than the rebuilt one, so the two carry different
+		// values under one timestamp and one label set: they do not
+		// collapse under a content key, and the panel gains a point
+		// nothing measured. The read loop skips a tailer in this state
+		// for the same reason.
+		if t.rewindOwed() {
+			continue
+		}
 		results, verdicts := t.ex.FlushIdle(now)
 		for _, err := range verdicts {
 			f.ing.recordOutcome(err)

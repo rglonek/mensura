@@ -358,10 +358,22 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 			results, err := stream.Process(string(rec.Line))
 			i.recordOutcome(err)
 			i.cfg.Progress.AddSamples(int64(len(results)))
+			// Every sample of this record is queued before the failure is
+			// reported. Sink.Add buffers the sample and only then
+			// flushes, so its error is that flush's verdict rather than a
+			// refusal to take the sample -- returning on the first one
+			// left the record half delivered while the samples before it
+			// were already on their way to the store. The follow and
+			// receive paths finish the record for the same reason; this
+			// was the last one that did not.
+			var addErr error
 			for n, r := range results {
-				if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, offsetPos(recStart), n)); err != nil {
-					return err
+				if aerr := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, offsetPos(recStart), n)); aerr != nil && addErr == nil {
+					addErr = aerr
 				}
+			}
+			if addErr != nil {
+				return addErr
 			}
 		}
 		if rerr != nil {
@@ -376,12 +388,13 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		i.recordOutcome(verr)
 	}
 	i.cfg.Progress.AddSamples(int64(len(flushed)))
+	var flushErr error
 	for n, r := range flushed {
-		if err := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, flushPos(0), n)); err != nil {
-			return err
+		if aerr := i.cfg.Sink.Add(ctx, r, labels, keyHint(streamID, flushPos(0), n)); aerr != nil && flushErr == nil {
+			flushErr = aerr
 		}
 	}
-	return nil
+	return flushErr
 }
 
 // inWindow reports whether a timestamp falls inside --from/--to, with the

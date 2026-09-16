@@ -61,10 +61,14 @@ sets:                       # optional per-set overrides (retention, etc.)
 A stream is bound to exactly one profile at open time, by the first `select:`
 that matches. Selection may use `path_glob`, `content_contains` (a literal
 search over the first `scan_bytes`, default 64 KiB), `label_equals`, or
-`listener` (for `receive` inputs). A stream that matches no profile is either
-ignored or routed to `default_profile:`, and the decision is counted and
-logged — silently dropping unmatched files is the failure mode that wastes an
-afternoon.
+`listener` (for `receive` inputs). A stream that matches no profile is
+ignored, and the decision is counted and logged — silently dropping
+unmatched files is the failure mode that wastes an afternoon. (`follow`
+also reconsiders such a path once a minute, because the file may be
+replaced by one that does match.) A `default_profile:` catch-all is
+described in earlier drafts and is **not implemented**; the spec decoder
+refuses unknown keys, so a spec that sets it fails to compile rather than
+having it quietly ignored.
 
 Every `path_glob` is compiled at spec-compile time. `filepath.Match`
 reports a malformed pattern as an error *alongside* "did not match", so a
@@ -111,8 +115,12 @@ Behaviour:
   matched is cached per stream and tried first on every subsequent line, so
   the steady state is one regex match. A miss falls back to the full scan and
   re-caches.
-- `anchor: prefix` skips the regex entirely once the format is known, slicing a
-  fixed prefix — the common fast path.
+- `anchor: prefix` requires the match to start at byte 0, which is what
+  stops a timestamp-shaped substring in the middle of a record being read
+  as the record's own. It is a constraint, not a shortcut: the regex still
+  runs, because a layout's rendered width is not fixed in general (a
+  single-digit day, a variable-width zone) and slicing a prefix on that
+  assumption would cut the wrong bytes.
 - Records without a parseable timestamp are counted per stream and reported;
   they are never assigned "now", because a wrong timestamp is worse than a
   dropped sample on an operational dashboard.
@@ -121,8 +129,12 @@ Behaviour:
   catalogue.
 - Year-less formats (classic syslog) resolve the year per `assume_year`, with
   a December→January rollover rule: if applying the assumed year produces a
-  timestamp more than 24 h in the future relative to the previous record, the
-  year is decremented.
+  timestamp more than **half a year** ahead of the previous record, the year
+  is decremented. The threshold is half a year rather than a day because
+  the two shapes it has to tell apart are a real wrap, which lands about
+  eleven months ahead, and an ordinary gap in the log — a weekly cron
+  file, a host that was off over a weekend. A day-wide threshold called
+  every one of those a wrap and threw the records a year into the past.
 
 ## 4. Framing
 
@@ -197,9 +209,10 @@ pattern's own `labels:`) becomes a label; every other named capture becomes a
 field. One list, one rule, and it is visible in the spec rather than inferred
 from a value's shape.
 
-Cardinality guard: the store rejects a label whose distinct-value count exceeds
-`max_label_cardinality` (default 100 000 per label), returning `400` with the
-label named. Unbounded labels (request IDs, URLs with parameters) are the
+Cardinality guard: the store refuses a sample whose label would take a key
+past `max_label_cardinality` (default 100 000 distinct values per label),
+naming the label in that sample's rejection — the write is a partial
+rejection, not a `400`, so the rest of the batch still lands. Unbounded labels (request IDs, URLs with parameters) are the
 classic way to destroy a metrics system; the failure is loud and early.
 
 ## 6. Field metadata
