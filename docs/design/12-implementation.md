@@ -3375,6 +3375,79 @@ first error afterwards, which is also what makes the three acquisition
 paths read the same way.
 
 
+### 6.160 Declared limits no longer undo an explicit `NEGATE`
+
+A field's `limits:` become the query layer's default `CLAMP … ELSE RAW`
+([03](03-extraction.md) §7.4, [06](06-query.md) §4.2), and `ELSE RAW`
+substitutes the pre-transform sample — which [07](07-downsampling.md) §3
+stage 6 says "undoes both `DELTA` and `NEGATE`". That is exactly right for
+the counter reset it was built for, and exactly wrong beside `NEGATE`: the
+declared range describes the field's own values, `NEGATE` renders their
+mirror image, so on the single most ordinary declaration there is —
+`limits: {min: 0}` on a counter — *every* point fell outside the range and
+was replaced by the raw sample.
+
+`SELECT tx NEGATE` therefore drew the counter the right way up, and
+`SELECT tx RATE NEGATE` — the mirrored-axis panel the modifier exists for —
+drew the raw counter instead of the rate, three orders of magnitude out,
+with no warning anywhere. It is the same silent substitution a crossed
+limit pair was refused for (§6.152), reached through a declaration that is
+correct.
+
+`resolveField` now installs the declared-limits default only when the query
+does not negate. An explicit `CLAMP` still wins over the declaration either
+way, which is what "metadata supplies defaults only" has to mean: a default
+that cancels the modifier written beside it is not a default.
+
+### 6.161 Retention raises a set's observed start
+
+Dropping a shard is one range delete, which walks no rows — and
+`setEntry.FirstTSMs` is only ever *lowered*, by `observeSet`, from the
+samples themselves. So nothing moved it when the shards holding the oldest
+instants were deleted, and the catalogue went on advertising a start time
+with nothing under it for as long as the set existed: the number the query
+builder offers as "all data" and the one the plugin's health check prints.
+A store keeping a month of a year's history reported the year and answered
+an empty panel for eleven months of it.
+
+`RunRetention` now raises `FirstTSMs` to the start of the oldest surviving
+shard for every set it swept, alongside the `forgetAgedSet` pass that
+already handles a set whose every shard has gone. An unsharded `@all`
+shard covers every instant, so a set that has one has no floor to raise and
+its observed start stands.
+
+### 6.162 A closed aggregation window is released, not merely unlinked
+
+`aggQueue.Pop` shortened the heap's slice without clearing the slot it
+popped, and `pruneHolds` compacted the hold list in place without clearing
+the tail it dropped. The garbage collector traces the backing array rather
+than the length, so every aggregation window a stream ever emitted stayed
+reachable through its `*aggregator` — which holds copies of the opening
+record's label and field maps and the whole record line — and every pruned
+hold entry kept its aggregation key alive with it.
+
+The queue's high-water mark is `maxOpenWindows` (100 000) and a stream can
+live for the life of the process (a followed file, a peer, an SSH
+connection), so what was retained was the *peak* footprint rather than the
+live one: the cap this heap exists to enforce was never given back. Both
+sites now zero what they drop.
+
+### 6.163 A declared duration a `time.Duration` cannot hold
+
+`applySetMeta` converts a spec's `retention:` and `shard:` with
+`time.Duration(ms) * time.Millisecond`, and that product overflows int64
+past roughly 292 years. The wrapped value is usually negative, so
+`SetRetentionFor`'s own `>= 0` and `> 0` tests dropped it and the set
+silently kept the store's defaults — a declaration taken and not acted on,
+which is what §6.157's range check on `mql.ParseDuration` and every other
+check in `checkSetMeta` exist to refuse. For the values that wrap positive
+it is worse: the set is retained on a horizon nobody wrote.
+
+`extract.Compile` refuses such a value in a spec, so `check` catches it,
+and `checkSetMeta` refuses it as an `ErrBadRequest` for anything that
+reaches the write API another way.
+
+
 ## 7. Known gaps worth naming
 
 - **Documented ingest behaviour that does not exist.** [02](02-ingest.md)

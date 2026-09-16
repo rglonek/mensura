@@ -157,10 +157,19 @@ first or last per datasource setting.
 | `PER SECOND` | Divide by the raw elapsed seconds between this and the previous sample. | 7 |
 | `RATE` | Sugar for `DELTA PER SECOND`. | 4 + 7 |
 | `NEGATE` | Multiply by −1 after delta conversion. Mirrored-axis panels. | 5 |
-| `CLAMP MIN a, MAX b [ELSE RAW\|BOUND]` | Range clamp. `ELSE RAW` (default when field metadata declares limits) substitutes the raw pre-transform sample — the counter-reset escape hatch. `ELSE BOUND` clamps to the bound. | 6 |
+| `CLAMP MIN a, MAX b [ELSE RAW\|BOUND]` | Range clamp. `ELSE RAW` (default when field metadata declares limits, except under `NEGATE` — see below) substitutes the raw pre-transform sample — the counter-reset escape hatch. `ELSE BOUND` clamps to the bound. | 6 |
 | `GAP d` | Declared ticker cadence. Two consecutive samples further apart than `d` produce a null connect-break one millisecond before the later sample. Default: the field's `max_interval` metadata; `GAP 0` disables. | 1 |
 | `SSE n\|REPEAT\|OFF` | Singular-series extension for a series that renders as one point. Default `0`. | tail |
 | `REQUIRED` | Fail the query up front if the field is absent from the catalogue, instead of drawing nothing. | plan |
+
+The declared-limits default is *not* installed when the query also asks for
+`NEGATE`. The limits describe the field's own values and `NEGATE` renders
+their mirror image, so under the ordinary declaration `limits: {min: 0}`
+every negated point falls outside the range — and `ELSE RAW` substitutes
+the pre-transform sample, which undoes both `DELTA` and `NEGATE`
+([07](07-downsampling.md) §3 stage 6). `SELECT tx RATE NEGATE` would draw
+the raw counter instead of the mirrored rate. An explicit `CLAMP` always
+wins over the declaration, negated or not.
 
 The stage numbers refer to [07-downsampling.md](07-downsampling.md) and are the
 whole point: the modifiers *are* the per-bin control surface from the
