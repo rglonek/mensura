@@ -154,10 +154,11 @@ on a timer and on clean shutdown.
 {
   "stream": "8f3c…",
   "path": "/var/log/nginx/access.log",
-  "file_id": {"dev": 2049, "ino": 3410221, "fingerprint": "b41a…"},
+  "fingerprint": "v2:b41a…",
+  "fingerprint_bytes": 4096,
   "offset": 918273645,
   "acked_offset": 918200000,
-  "updated": "2026-08-28T10:41:02Z"
+  "updated_unix": 1787918400
 }
 ```
 
@@ -203,9 +204,27 @@ Rules:
   key. Before that, a restart was the only way out, so a few seconds of store
   unavailability stopped checkpointing every followed file until someone
   noticed.
-- `file_id.fingerprint` is a hash of the first 256 bytes of the file. It is what
-  makes rotation detection correct on filesystems where inode numbers are
-  reused (and over SSH, where inodes are not directly observable).
+- `fingerprint` is what makes rotation detection correct on filesystems
+  where inode numbers are reused, and it is a hash of the bytes this
+  stream has *already consumed* rather than of a fixed prefix:
+  `fingerprint_bytes` records the width, which grows with the read offset
+  up to a 4 KiB cap. That window is the one that answers the question
+  being asked. Appending cannot change bytes behind the read offset, so
+  the hash does not move on a growing file, while a truncate, a
+  copytruncate or a rewrite in place changes it immediately — at any file
+  size, including a file shorter than the window. A fixed prefix could
+  only be compared once the file was longer than it, which left every
+  short file with nothing but a size test, and a copytruncate that grows
+  back defeats that. The original form was 64 bits over a fixed 256-byte
+  window; rotated logs routinely share their first 256 bytes (a startup
+  banner, a templated first line), and a false match makes a restarting
+  follower seek into the middle of a *different* file and skip everything
+  before that point. Checkpoints written by that build are still
+  recognised, by the absence of the `v2:` prefix, so an upgrade does not
+  re-read every followed file.
+- The remote follower keeps the same field but fills it with the file's
+  identity as the far end reports it (`ls -Li`), because a tail cannot
+  hash what it has not been sent (§6.4).
 
 ## 6. Log rotation
 

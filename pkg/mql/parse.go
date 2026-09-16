@@ -349,11 +349,29 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 	// a semantic (06-query.md section 4.3), so the flags below are set the
 	// same way whichever order they arrived in.
 	lastRank, outOfOrder := 0, false
-	mark := func(k string, rank int) error {
-		if seen[k] {
-			return &ParseError{p.cur().pos, "E006: modifier " + k + " given twice"}
+	// mark records what a modifier sets, not only what it is called.
+	//
+	// RATE is documented as sugar for DELTA PER SECOND (06-query.md
+	// section 3), so `x RATE DELTA` sets Delta twice -- and it was
+	// accepted, folded away and printed back as `x RATE`, while the
+	// spelling `x DELTA DELTA` was refused as E006. A duplicate that
+	// silently disappears is the case E006 exists for, whichever of the
+	// three spellings wrote it. Naming the *written* keyword in the
+	// message keeps the diagnostic pointing at the text the author
+	// typed.
+	mark := func(what string, rank int, sets ...string) error {
+		for _, k := range sets {
+			if !seen[k] {
+				continue
+			}
+			if k == what {
+				return &ParseError{p.cur().pos, "E006: modifier " + what + " given twice"}
+			}
+			return &ParseError{p.cur().pos, "E006: modifier " + what + " also sets " + k + ", which an earlier modifier on this field already set"}
 		}
-		seen[k] = true
+		for _, k := range sets {
+			seen[k] = true
+		}
 		if rank < lastRank {
 			outOfOrder = true
 		}
@@ -370,12 +388,12 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 	for {
 		switch {
 		case p.acceptKeyword("RATE"):
-			if err := mark("RATE", 1); err != nil {
+			if err := mark("RATE", 1, "RATE", "DELTA", "PER SECOND"); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Delta, fe.Modifiers.PerSecond = true, true
 		case p.acceptKeyword("DELTA"):
-			if err := mark("DELTA", 1); err != nil {
+			if err := mark("DELTA", 1, "DELTA"); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Delta = true
@@ -383,22 +401,22 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			if err := p.expectKeyword("SECOND"); err != nil {
 				return fe, err
 			}
-			if err := mark("PER SECOND", 2); err != nil {
+			if err := mark("PER SECOND", 2, "PER SECOND"); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.PerSecond = true
 		case p.acceptKeyword("NEGATE"):
-			if err := mark("NEGATE", 3); err != nil {
+			if err := mark("NEGATE", 3, "NEGATE"); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Negate = true
 		case p.acceptKeyword("REQUIRED"):
-			if err := mark("REQUIRED", 7); err != nil {
+			if err := mark("REQUIRED", 7, "REQUIRED"); err != nil {
 				return fe, err
 			}
 			fe.Modifiers.Required = true
 		case p.acceptKeyword("GAP"):
-			if err := mark("GAP", 5); err != nil {
+			if err := mark("GAP", 5, "GAP"); err != nil {
 				return fe, err
 			}
 			d, err := p.duration()
@@ -407,7 +425,7 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			}
 			fe.Modifiers.GapMs = &d
 		case p.acceptKeyword("SSE"):
-			if err := mark("SSE", 6); err != nil {
+			if err := mark("SSE", 6, "SSE"); err != nil {
 				return fe, err
 			}
 			s, err := p.sse()
@@ -416,7 +434,7 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			}
 			fe.Modifiers.SSE = s
 		case p.acceptKeyword("CLAMP"):
-			if err := mark("CLAMP", 4); err != nil {
+			if err := mark("CLAMP", 4, "CLAMP"); err != nil {
 				return fe, err
 			}
 			c, err := p.clamp()
@@ -568,15 +586,15 @@ func ParseDuration(s string) (int64, error) {
 	}
 	switch s[i:] {
 	case "ms":
-		return int64(n), nil
+		return scaleDuration(s, n, 1)
 	case "s":
-		return int64(n * 1000), nil
+		return scaleDuration(s, n, 1000)
 	case "m":
-		return int64(n * 60_000), nil
+		return scaleDuration(s, n, 60_000)
 	case "h":
-		return int64(n * 3_600_000), nil
+		return scaleDuration(s, n, 3_600_000)
 	case "d":
-		return int64(n * 86_400_000), nil
+		return scaleDuration(s, n, 86_400_000)
 	case "":
 		// A bare zero carries no unit because every unit gives the same
 		// answer, and it is the form both halves of this package already
@@ -596,6 +614,36 @@ func ParseDuration(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid duration %q: a number other than 0 needs a unit (ms, s, m, h or d)", s)
 	}
 	return 0, fmt.Errorf("invalid duration unit in %q: expected ms, s, m, h or d", s)
+}
+
+// maxIntFloat is 2^63: the first float64 magnitude an int64 cannot hold.
+// It is exactly representable, so the comparisons in scaleDuration are
+// exact rather than approximate.
+const maxIntFloat = float64(1 << 63)
+
+// scaleDuration converts a unit count to milliseconds, and refuses a
+// result the millisecond count cannot hold.
+//
+// The multiplication used to be converted on trust, and converting a
+// float outside the int64 range is undefined by the Go spec -- amd64
+// yields the indefinite value and arm64 saturates -- so the same spec
+// text produced two different durations on two architectures, both of
+// them numbers nobody wrote. `retention: 99999999999999999999d` came out
+// as the *most negative* int64 on amd64 and as the largest positive one
+// on arm64: the first is caught downstream by a sign check, the second is
+// a retention of 292 million years that every later check accepts. The
+// same conversion is already range-checked in model.Value.AsInt,
+// extract's aggregator.emit and extract's epochMillis, and for the same
+// reason: a number this function cannot represent is not a number it may
+// guess at.
+func scaleDuration(text string, n, unitMs float64) (int64, error) {
+	ms := n * unitMs
+	// Written as a positive test so a NaN -- which no comparison against
+	// is ever true -- is refused rather than converted.
+	if !(ms >= -maxIntFloat && ms < maxIntFloat) {
+		return 0, fmt.Errorf("duration %q is beyond the range a millisecond count can hold", text)
+	}
+	return int64(ms), nil
 }
 
 func (p *parser) parsePredicate() (Expr, error) { return p.parseOr() }

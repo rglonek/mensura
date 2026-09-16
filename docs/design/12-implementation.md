@@ -3294,8 +3294,104 @@ populated.
   the compiler refuses it outright, so copying the documented example
   failed to compile.
 
+### 6.156 A rewind delivered the very state it was about to re-read
+
+A dropped batch freezes a followed stream's resume point, and the first
+delivery that succeeds afterwards thaws it and asks the reader to start
+again from the frozen offset (§6.30). Everything the extractor is holding
+at that moment — an open multiline record, a half-filled aggregation
+window — was built from bytes behind that offset, so the replay rebuilds
+it. The local follower knows this: `applyRewind` calls `Flush()` and
+*discards* the result.
+
+Two paths did not. `followRemotePath` drains the extractor at the end of
+every connection and hands what it gets to the sink, and the connection a
+rewind produces is one the rewind itself killed — so on the SSH follow
+this happened on every hole recovery, not occasionally. The local idle
+flush and the remote one could both reach a tailer between the thaw and
+the seek and emit the same state a tick early.
+
+The duplicate does not collapse, which is what makes it worse than an
+ordinary replay. A window closed early covers fewer records than the one
+the replay rebuilds, so the two carry *different values* under one
+timestamp and one label set: a content-addressed key sees two distinct
+rows, an offset key sees two distinct rows, and the panel gains a short
+column beside the real one with `W301` as the only hint. That is exactly
+the "partial row nobody measured" that `holdFloor`'s pull-back
+([02](02-ingest.md) §5) exists to prevent, arriving through the flush
+instead of through the floor.
+
+All three now test the same predicate — `tailer.rewindOwed` and
+`remoteProgress.rewindPending` — that the read loops already tested. The
+extraction verdicts go with the discarded results: every record inside
+that state is judged again on the replay, so keeping them would
+double-count `unmatched_lines` and its neighbours.
+
+### 6.157 A duration out of range is refused, not converted
+
+`mql.ParseDuration` multiplies a unit count by a millisecond factor and
+converted the result on trust. Converting a float outside the `int64`
+range is undefined by the Go spec — amd64 yields the indefinite value and
+arm64 saturates — so one spec produced two different durations on two
+architectures, neither of them the one written.
+`retention: 99999999999999999999d` came out as the most negative `int64`
+on amd64, which a later sign check catches, and as the largest positive
+one on arm64, which is a retention of 292 million years that every later
+check accepts.
+
+This is the function the extraction spec reads `retention:`, `shard:` and
+`max_interval:` through ([06](06-query.md) §3), as well as `EVERY` and
+`GAP` in the query text, so the value reaches the store as a set's
+policy. The same conversion is already range-checked in
+`model.Value.AsInt` (§6.96), in extract's `aggregator.emit` (§6.75) and in
+its `epochMillis`: a number this function cannot represent is not a
+number it may guess at.
+
+### 6.158 `RATE` beside its own halves is a duplicate
+
+`RATE` is sugar for `DELTA PER SECOND` ([06](06-query.md) §3), so
+`x RATE DELTA` sets `Delta` twice. It was accepted, folded away and
+printed back as plain `x RATE`, while `x DELTA DELTA` — the same
+duplicate, differently spelled — was refused as `E006`. A duplicate
+modifier that silently disappears is the case `E006` exists for, and a
+limit clause was given the same treatment in §6.154 for the same reason.
+
+The parser now records what a modifier *sets* rather than only what it is
+called, so all five spellings are refused. The message names the keyword
+that was written, not the flag it collides with, so the diagnostic still
+points at the text the author typed. `DELTA PER SECOND` is unaffected: it
+is two modifiers setting two different flags, and it still means `RATE`.
+
+### 6.159 Batch import finishes the record before it reports a failure
+
+`Sink.Add` buffers the sample and only then flushes, so its error is the
+verdict of *that flush* rather than a refusal to take the sample in hand.
+The follow path (§6.24), the receive path and the remote tail were all
+changed to queue every sample of a record before returning the first such
+error; batch import still returned from the middle of one, so the samples
+before the failure were on their way to the store and the rest of the
+same record never existed. It now finishes the record and returns the
+first error afterwards, which is also what makes the three acquisition
+paths read the same way.
+
+
 ## 7. Known gaps worth naming
 
+- **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
+  describes three things the code does not do, and they are named here
+  rather than left reading as features. A rotated file's undrained tail is
+  said to be recovered on restart "via the archive glob"
+  (`--rotated-glob`, `--catch-up-rotated`): there is no such flag and no
+  such sweep, so a process that dies part-way through draining a renamed
+  handle loses whatever was left in it — the replacement is still read
+  from offset 0, because the stored fingerprint no longer matches. §6.3
+  says `mensura-ingest check` warns about an occurrence-counting pattern
+  under `key: content`; the lint set is `L001`–`L005` and holds no such
+  check, and deciding "no numeric capture" from a spec alone is guesswork,
+  because extraction coerces per value. §7.1 offers TLS on the receive
+  listeners and a client-certificate subject mapped to stream labels, plus
+  per-connection byte-rate caps: the listeners are plaintext, and the only
+  per-connection bounds are `--max-connections` and the idle timeout.
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
   React editor exists a panel must carry the AST in its query model. The
   backend's `parse`/`print` resources exist precisely so the frontend never

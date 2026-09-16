@@ -266,6 +266,24 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		_, err = i.runRemoteTail(ctx, opts, path, target, rs, ex, labels, progress, box.identity(), lag, persistOwed)
 		rs.mergeStats(i.cfg.Progress)
 		flushed, pos, verdicts := rs.flushAll()
+		// Discarded, not delivered, when a hole has cleared: the tail was
+		// killed so the next connection can restart at the acknowledged
+		// offset, and everything the extractor still holds was built from
+		// bytes behind that offset -- so the replay rebuilds it. Handing
+		// it to the sink first writes the window twice, and the two
+		// copies are not the same row: the one flushed here closed early
+		// and carries fewer records than the one the replay produces, so
+		// they land at one timestamp with two different values and
+		// neither a content key nor an offset key collapses them. The
+		// local follower discards exactly this state on the same signal
+		// (applyRewind); only this path delivered it.
+		//
+		// The verdicts go with it: every record inside that state is
+		// judged again on the replay, so keeping them here would
+		// double-count the pipeline's own counters.
+		if progress.rewindPending() {
+			flushed, verdicts = nil, nil
+		}
 		for _, verr := range verdicts {
 			i.recordOutcome(verr)
 		}
@@ -676,12 +694,17 @@ func (p *remoteProgress) markHoled() (int64, bool) {
 	return p.acked, true
 }
 
-// rewindOwedForTest reports whether a rewind is still pending.
-func (p *remoteProgress) rewindOwedForTest() bool {
+// rewindPending reports whether the tail still owes a seek back to the
+// acknowledged offset. Nothing the extractor is holding may be delivered
+// while it does: those bytes are about to be read again.
+func (p *remoteProgress) rewindPending() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.rewindOwed
 }
+
+// rewindOwedForTest reports whether a rewind is still pending.
+func (p *remoteProgress) rewindOwedForTest() bool { return p.rewindPending() }
 
 func (p *remoteProgress) pendingOffset() int64 {
 	p.mu.Lock()
@@ -1026,6 +1049,16 @@ func remoteIdleTick(idle time.Duration) time.Duration {
 // remoteFlushIdle emits whatever the extractor has held past the
 // profile's idle timeout and republishes the offset that releases.
 func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target string, labels map[string]string, progress *remoteProgress, now time.Time) {
+	// A hole that has cleared is asking for this connection to be killed
+	// and restarted at the acknowledged offset, and the select above can
+	// reach this tick first. Whatever the extractor holds was built from
+	// bytes the replay is about to read again, so emitting it now leaves
+	// a short window beside the one the replay rebuilds -- same instant,
+	// same labels, different value, and no key collapses the pair. The
+	// local follower skips its idle flush in the same state.
+	if progress.rewindPending() {
+		return
+	}
 	at, verdicts := rs.flushIdle(now, func(results []extract.Result, pos string) {
 		i.cfg.Progress.AddSamples(int64(len(results)))
 		for n, r := range results {
