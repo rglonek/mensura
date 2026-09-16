@@ -3166,6 +3166,92 @@ key scheme once, and `shardNameAt` takes the width the caller has. It is
 resolved after `applySetMeta`, so a `set_meta` declaration in the same
 request still shapes the batch that travels with it ([04](04-wire-protocol.md) §3.3).
 
+### 6.152 A declared limit whose bounds cross drew the raw counter
+
+`resolveField` installs a field's declared limits as its *default clamp*,
+with the counter-reset escape hatch wired up (`ClampElseRaw`). That is
+what makes a declared range useful: a `DELTA` that goes negative because
+the counter restarted is replaced by the raw sample rather than by the
+bound.
+
+With `limit_min` above `limit_max`, *every* value falls outside the range,
+so every rendered point was replaced by its raw sample. A `RATE` query on
+a counter declaring `min: 100, max: 1` therefore drew the raw counter —
+1007, 1014, 1021 where the rate is 7 — with no error, no warning and a
+perfectly plausible-looking line. Both the other surfaces that can express
+the same pair already refuse it: MQL answers `E007` for
+`CLAMP MIN 5 MAX 1` ([06](06-query.md) §12) and `extract.Compile` refuses
+`limits: {min: 5, max: 1}` in a spec (§6.146's neighbour). The write API
+was the one door left open, and it is the door a third-party writer or an
+ingester built before that check comes through.
+
+`applyFieldMeta`'s validating pass now refuses a crossed pair as an
+`ErrBadRequest`, alongside the kind, the names and the bucket index it
+already checks — so nothing new can be persisted. `resolveField`
+additionally ignores a crossed pair it finds in the catalogue rather than
+installing it, because a pair an earlier build already wrote is on disk
+for good: not bounding a field the declaration meant to bound is the
+smaller and far more visible error of the two.
+
+The same pass refuses a negative `max_interval_ms` or `max_interval_s`.
+Neither matched an arm of the merge switch, so the declaration was
+accepted, stored as zero, and then reported by `W103` as a field with *no*
+declared cadence at all — a declaration the store takes and does not act
+on, which is the case every other check there exists to refuse.
+
+### 6.153 A predicate no value can satisfy skips the shards, whatever its shape
+
+`isAlwaysFalse` is what lets a query that cannot match anything read no
+shards at all, rather than opening each one and walking it with a filter
+that can never be true. It only recognised the equality arms, so
+`host = "typo"` skipped the scan while `host =~ /typo/` — which the
+lowering folds to exactly the same `engine.Const(false)` — read the whole
+time range off disk to arrive at the same empty answer. It is also the arm
+a dashboard variable lands on, where the range is the panel's and the sets
+are every set carrying the label ([06](06-query.md) §5).
+
+It now mirrors every arm of the lowering that folds to a constant: the
+regex match, and a disjunction all of whose arms are impossible. A
+*negated* match is deliberately absent — it lowers to an existence test,
+not to a constant, so a key with no matching value still matches rows.
+
+### 6.154 Two duplicate-clause gaps in MQL
+
+[06](06-query.md) §12 lists a duplicate clause within one query under
+`E006`, and two shapes fell through it.
+
+`LIMIT SERIES 10, SERIES 5` parsed: the loop accepts either keyword on
+every pass and the AST holds one value per gate, so whichever was written
+last silently won. A safety limit is precisely the clause where "the one
+you wrote second quietly took effect" is worth knowing. The parser now
+refuses a second `SERIES` or `POINTS`.
+
+`BY host, host` validated: a repeated grouping slot is not a wider
+grouping, it is the same grouping rendered twice. `seriesKey`
+length-prefixes the label's value once per slot and `seriesName` joins the
+slots with `" : "`, so every series drew as `web1 : web1 : cpu`, while
+costing a second dictionary lookup on every scanned row. `Validate` now
+answers `E006`, which is what two selected fields sharing a display name
+already get.
+
+### 6.155 A bucket set could silently overwrite a pattern's captures
+
+`expand()` writes the histogram into the same field map the named captures
+were collected into, and it runs afterwards — so any column the bucket set
+produces overwrites a capture of the same name, replacing the count the
+source reported with a number derived from somewhere else. The row is well
+formed and the heatmap draws, so nothing at run time says so.
+
+Only the `tail` collision was refused ([03](03-extraction.md) §8), and it
+is the least likely of the three: a bucket set naming its buckets
+`fast`/`slow`, or deriving `<bucket>plus` columns from names like those,
+collides with an ordinary capture far more readily than the literal word
+`tail` does. `Profile.compile` now holds every column a bucket set writes
+— the buckets, the cumulative columns and the tail — to the rule the tail
+already had. `total_field` stays exempt: it is the one name a bucket set
+*reads* rather than writes, and capturing it is the only way it is ever
+populated.
+
 ### 6.138 Smaller corrections
 
 - **`Print` has the nesting bound the rest of the package has.** The

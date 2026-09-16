@@ -529,6 +529,30 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		if m.BucketSet != "" && (m.BucketIndex < 0 || m.BucketIndex >= maxBucketIndex) {
 			return badRequestf("%s.%s: bucket index %d is outside 0..%d", m.Set, m.Field, m.BucketIndex, maxBucketIndex-1)
 		}
+		// The declared cadence, held to the rule the spec compiler holds
+		// it to. A negative value matched neither arm of the switch
+		// below, so it was accepted, stored as zero, and then reported
+		// by W103 as a field with no declared cadence at all -- a
+		// declaration the store takes and does not act on, which is the
+		// case every other check here exists to refuse.
+		if m.MaxIntervalMs < 0 {
+			return badRequestf("%s.%s: max_interval_ms %d must not be negative", m.Set, m.Field, m.MaxIntervalMs)
+		}
+		if m.MaxIntervalS < 0 {
+			return badRequestf("%s.%s: max_interval_s %d must not be negative", m.Set, m.Field, m.MaxIntervalS)
+		}
+		// Declared limits become the *default clamp* the query layer
+		// installs for this field, with the counter-reset escape hatch
+		// wired up -- so a pair whose bounds cross does not merely fail
+		// to bound anything, it replaces every rendered value with the
+		// raw sample. Under RATE that means the panel draws the raw
+		// counter instead of the rate, and nothing anywhere says so.
+		// MQL refuses `CLAMP MIN 5 MAX 1` as E007 and extract.Compile
+		// refuses the same pair in a spec; the write API was the one
+		// door it could still come through.
+		if m.LimitMin != nil && m.LimitMax != nil && *m.LimitMin > *m.LimitMax {
+			return badRequestf("%s.%s: limit_min %g is above limit_max %g; a clamp whose bounds cross does not bound anything, it substitutes the raw sample for every point", m.Set, m.Field, *m.LimitMin, *m.LimitMax)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

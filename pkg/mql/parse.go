@@ -288,12 +288,24 @@ func (p *parser) parseDataQuery() (*Query, error) {
 				if err != nil {
 					return nil, err
 				}
+				// Refused rather than overwritten. The AST holds one
+				// value per gate, so `LIMIT SERIES 10, SERIES 5` kept
+				// whichever was written last and said nothing -- and a
+				// limit is exactly the clause where "the one you wrote
+				// second silently won" is worth knowing. 06-query.md
+				// section 12 lists a duplicate clause under E006.
+				if q.Limits.Series != nil {
+					return nil, &ParseError{p.cur().pos, "E006: LIMIT SERIES given twice"}
+				}
 				v := int(n)
 				q.Limits.Series = &v
 			case p.acceptKeyword("POINTS"):
 				n, err := p.integer()
 				if err != nil {
 					return nil, err
+				}
+				if q.Limits.Points != nil {
+					return nil, &ParseError{p.cur().pos, "E006: LIMIT POINTS given twice"}
 				}
 				v := int(n)
 				q.Limits.Points = &v

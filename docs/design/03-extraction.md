@@ -369,9 +369,16 @@ Rules:
   everything at or above bucket 03), computed at ingest so the query path stays
   a scan.
 - `tail` captures counts beyond the declared buckets, in a field named
-  literally `tail`. A pattern feeding a `tail: true` bucket set may not also
-  capture a group by that name; the compiler refuses the clash rather than
-  letting one silently overwrite the other.
+  literally `tail`.
+- A pattern feeding a bucket set may not capture a group named after **any**
+  column that set writes — a bucket, a `<bucket>plus` column, or `tail`. The
+  histogram is expanded after the named captures have been collected and into
+  the same field map, so it would silently overwrite the captured value: the
+  count the source reported replaced by a number derived from somewhere else,
+  on a row that is well formed and a heatmap that draws. The compiler names
+  the clash instead. `total_field` is the exception, because it is the one
+  name a bucket set *reads* rather than writes: capturing it is the only way
+  it is ever populated.
 - Every column a bucket set writes must be a distinct name: the buckets
   themselves, the `<bucket>plus` columns `cumulative:` derives, the `tail`
   column and the `total_field` capture all land on one row. A repeated

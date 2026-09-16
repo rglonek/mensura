@@ -195,6 +195,29 @@ resolved last-writer-wins **and recorded**: `GET /v1/catalogue` reports
 `conflicts[]`, and the plugin shows a warning in the builder. Silent
 disagreement is the thing to avoid; picking a winner is fine.
 
+Every field of a declaration is validated before any of it is applied, and a
+declaration the store cannot act on comes back `400` naming the offending key
+rather than being stored and quietly ignored:
+
+- `set` and `field` against the identifier charsets, with the reserved prefix
+  refused except for `_mensura_ingest`;
+- `kind` against the four the query validator recognises — an unrecognised one
+  reaches a dashboard as metadata that looks declared and behaves as absent;
+- `bucket_index` against `0..4095`, because it is used as an allocation size;
+- `max_interval_ms` and `max_interval_s` as non-negative — a negative cadence
+  was stored as zero and then reported by `W203`/`W103` as no cadence at all;
+- `limits` as an ordered pair. The declared limits become the field's *default
+  clamp* with the counter-reset escape hatch wired up ([07](07-downsampling.md)
+  §6), so `min` above `max` does not merely fail to bound the field, it
+  replaces every rendered point with its raw sample — a `RATE` query draws the
+  raw counter. MQL refuses the same pair as `E007` and the extraction spec
+  refuses it at compile time; this is the third door.
+
+A `400` is fatal for the write client, so the batch that carried the bad
+declaration is dropped once and the declaration is discarded rather than
+resent with every later batch ([02](02-ingest.md) §7). That is the same
+handling an unknown `kind` has always had.
+
 ## 6. Primary keys and deduplication
 
 The store assigns each row a primary key. Two schemes, selected per set (spec

@@ -274,7 +274,7 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 	case m.Clamp != nil:
 		rf.spec.ClampMin, rf.spec.ClampMax = m.Clamp.Min, m.Clamp.Max
 		rf.spec.ClampElseRaw = m.Clamp.Else == "raw"
-	case known && (info.LimitMin != nil || info.LimitMax != nil):
+	case known && (info.LimitMin != nil || info.LimitMax != nil) && limitsOrdered(info):
 		// A field that declared limits gets the counter-reset escape hatch
 		// wired up by default.
 		rf.spec.ClampMin, rf.spec.ClampMax = info.LimitMin, info.LimitMax
@@ -287,6 +287,20 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 		}
 	}
 	return rf
+}
+
+// limitsOrdered reports whether a field's declared limits are a range.
+//
+// applyFieldMeta refuses a crossed pair now, so nothing new can get in;
+// this is for a catalogue an earlier build already wrote. The pair has to
+// be ignored rather than installed, because the default clamp carries the
+// counter-reset escape hatch: with min above max *every* value falls
+// outside the range, so every rendered point is replaced by its raw
+// sample and a RATE query silently draws the raw counter instead. Not
+// bounding a field the declaration meant to bound is the smaller and far
+// more visible error of the two.
+func limitsOrdered(info mql.FieldInfo) bool {
+	return info.LimitMin == nil || info.LimitMax == nil || *info.LimitMin <= *info.LimitMax
 }
 
 // buildExpr lowers an MQL predicate onto engine expressions, resolving
@@ -418,8 +432,19 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 	return expr, warns, impossible
 }
 
-// isAlwaysFalse reports whether the top level of a predicate is a single
-// comparison that no dictionary value can satisfy.
+// isAlwaysFalse reports whether a predicate is one no dictionary value can
+// satisfy, so the scan can skip every shard instead of opening each one and
+// walking it with a constant-false filter.
+//
+// It mirrors the arms of the lowering above that fold to engine.Const(false),
+// and a regex is one of them: `pool =~ /nosuch/` produced the same empty
+// answer as `pool = "nosuch"` while reading the whole time range off disk to
+// get there, because only the equality arms were recognised here. The
+// regex arm is also the one a dashboard variable lands on, where the range
+// is the panel's and the sets are every set carrying the label.
+//
+// A negated match is deliberately absent: it lowers to an existence test,
+// not to a constant, so a key with no matching value still matches rows.
 func isAlwaysFalse(e mql.Expr, s *Store) bool {
 	switch {
 	case e.Eq != nil:
@@ -432,12 +457,28 @@ func isAlwaysFalse(e mql.Expr, s *Store) bool {
 			}
 		}
 		return true
+	case e.Match != nil:
+		re, err := regexp.Compile(e.Match.Regex)
+		if err != nil {
+			// The lowering folds an uncompilable regex to false too.
+			return true
+		}
+		vals, _ := s.labelIndicesMatching(e.Match.Label, re.MatchString)
+		return len(vals) == 0
 	case len(e.And) > 0:
 		for _, sub := range e.And {
 			if isAlwaysFalse(sub, s) {
 				return true
 			}
 		}
+	case len(e.Or) > 0:
+		// A disjunction can only be impossible when every arm is.
+		for _, sub := range e.Or {
+			if !isAlwaysFalse(sub, s) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

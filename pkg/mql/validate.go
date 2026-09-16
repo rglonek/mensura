@@ -282,10 +282,23 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	if len(q.By) > MaxByLabels {
 		return warns, Diag{"E007", fmt.Sprintf("query groups by %d labels, which is beyond the limit of %d; every slot is resolved and length-prefixed into the grouping key of every scanned row", len(q.By), MaxByLabels)}
 	}
+	seenBy := make(map[string]bool, len(q.By))
 	for _, l := range q.By {
 		if l == "" {
 			return warns, Diag{"E001", "BY names an empty label; every grouping slot needs a label key"}
 		}
+		// A repeated grouping slot is not a wider grouping, it is the
+		// same grouping rendered twice: the key length-prefixes the
+		// label's value once per slot and the legend joins the slots
+		// with " : ", so `BY host, host` drew every series as
+		// "web1 : web1 : cpu" while costing a second dictionary lookup
+		// on every scanned row. 06-query.md section 12 lists a duplicate
+		// clause within one query under E006, which is also what two
+		// selected fields sharing a display name get.
+		if seenBy[l] {
+			return warns, Diag{"E006", fmt.Sprintf("BY names %q twice; a repeated grouping slot renders the same value twice in the legend and groups nothing further", l)}
+		}
+		seenBy[l] = true
 		// E004, as 06-query.md section 12 says of an unknown label key
 		// "referenced in WHERE or BY" -- not a warning, and not W203,
 		// whose documented meaning is a field the catalogue has not seen

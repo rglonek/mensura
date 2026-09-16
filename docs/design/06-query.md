@@ -196,6 +196,11 @@ Predicates address **labels** (interned strings) and field presence.
   `false`, which is propagated: `host = "typo"` returns an empty result with the
   warning `W201: no values match host = "typo"`. The alternative — dropping the
   clause and returning everything — turns a typo into a wrong graph at 03:00.
+  A predicate that folds to a constant `false` at the *top* level also reads
+  no shards at all: every form that folds counts, the equality and `IN` arms,
+  a regex matching no value, and a disjunction all of whose arms are
+  impossible. (A negated match does not fold — it lowers to an existence
+  test, so a key with no matching value still matches rows.)
 - `HAS field` / `MISSING field` map to the engine's `Exists` predicate, which
   reads a column off the row. A row's columns are its labels and its fields
   alike, so either may be named; a name that is neither is `E004`.
@@ -477,7 +482,7 @@ in tests. Warnings never fail a query; errors always do.
 | `E003` | error | Unknown field on set, and the field is `REQUIRED` |
 | `E004` | error | Unknown label key referenced in `WHERE` or `BY` (for `HAS`/`MISSING`, a name that is neither a field nor a label). The catalogue holds every label any accepted sample carried, so a key it does not hold is one no row has: the comparison could never match, and the grouping would put every row in one series |
 | `E005` | error | Modifier not legal for the field's kind (e.g. `DELTA` on a string field) |
-| `E006` | error | Duplicate modifier, duplicate clause, or duplicate display name within one query |
+| `E006` | error | Duplicate modifier, duplicate display name, a repeated `LIMIT SERIES`/`LIMIT POINTS` (the AST holds one value per gate, so the later one would silently win), or a `BY` label named twice (a repeated grouping slot renders the same value twice in the legend and groups nothing further) |
 | `E007` | error | A value outside its valid range: a `LIMIT` above the datasource maximum or below one, a non-positive `EVERY`, a negative `GAP`, a `CLAMP` whose bounds cross, an empty `IN` list, or a `SELECT`/`BY` wider than the per-row bounds of §3 |
 | `E008` | error | an unknown `FORMAT`, `SSE` mode, `CLAMP ELSE` or query `kind`; `FORMAT logs`/`table` combined with a timeseries-only modifier, with `EVERY` or with `LIMIT SERIES`; a per-field modifier on a `HISTOGRAM()` selection; `HISTOGRAM()` outside `FORMAT heatmap`, or `FORMAT heatmap` without one |
 | `E009` | error | `HISTOGRAM()` names an unknown bucket set |

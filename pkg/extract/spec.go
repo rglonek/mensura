@@ -850,20 +850,38 @@ func (p *Profile) compile(s *Spec) error {
 			if !ok {
 				return fmt.Errorf("pattern references unknown bucket set %q", pat.BucketSet)
 			}
-			// `tail: true` writes a field literally called "tail"
-			// (03-extraction.md section 8), so a pattern that also
-			// captures something by that name would have one silently
-			// overwrite the other -- expand() runs after the captures
-			// are collected, so the histogram tail always won. Naming
-			// the clash at compile time is the only way the spec author
-			// finds out.
-			if bs.Tail {
-				for _, name := range patternCaptureNames(pat) {
-					if name == tailField {
-						return fmt.Errorf("pattern for set %q captures %q, which is also the field bucket set %s writes for `tail: true`; rename one of them",
-							pat.Set, tailField, bs.Name)
-					}
+			// Every column the bucket set writes, not only the `tail`
+			// one.
+			//
+			// expand() runs after the captures have been collected and
+			// writes straight into the same field map, so whatever it
+			// produces silently overwrites a capture of the same name --
+			// the count the source actually reported replaced by a
+			// number derived from somewhere else, on a row that is well
+			// formed and a heatmap that draws. Only the `tail` collision
+			// was refused, and it is the least likely of the three: a
+			// bucket set naming its buckets `fast`/`slow`, or deriving
+			// `<bucket>plus` columns from names like those, collides
+			// with an ordinary capture far more readily than the literal
+			// word "tail" does. `total_field` is exempt because it *is*
+			// a capture: expand() reads it rather than writing it.
+			written := map[string]string{}
+			for _, b := range bs.Buckets {
+				written[b] = "a bucket of"
+				if bs.Cumulative {
+					written[b+"plus"] = "a cumulative column of"
 				}
+			}
+			if bs.Tail {
+				written[tailField] = "the `tail: true` column of"
+			}
+			for _, name := range patternCaptureNames(pat) {
+				what, clash := written[name]
+				if !clash {
+					continue
+				}
+				return fmt.Errorf("pattern for set %q captures %q, which is also %s bucket set %s; the histogram is expanded after the captures are collected, so it would silently overwrite the captured value -- rename one of them",
+					pat.Set, name, what, bs.Name)
 			}
 			// process() refuses a bucket-set pattern that captured no
 			// histogram payload, per record, for the life of the
