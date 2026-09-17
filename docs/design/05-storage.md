@@ -283,9 +283,22 @@ itself:
 | `_mensura_ingest` | Ingest progress samples (see below) |
 
 `_mensura_ingest` is a normal metric set, so ingest health is queryable with
-ordinary MQL. Its labels are `client`, `input`, `stream`; its fields are
-`bytes_read`, `records`, `samples`, `unmatched_lines`, `ts_parse_errors`,
-`batches_sent`, `batches_retried`, `batches_dropped`, `lag_bytes`,
-`udp_dropped`, `files_total`, `files_done`. Clients may write it despite the
-reserved prefix — it is the one exception, and it is allowed only for samples
-carrying the client's own `client` label.
+ordinary MQL. Its label is `client`, plus whatever the operator passed as
+`--label`; its fields are `bytes_read`, `records`, `samples`,
+`unmatched_lines`, `unjoined_lines`, `ts_parse_errors`, `extract_errors`,
+`oversize_records`, `binary_skipped`, `batches_sent`, `batches_retried`,
+`batches_dropped`, `samples_dropped`, `samples_unencodable`, `rejected`,
+`lag_bytes`, `udp_dropped`, `files_total`, `files_done`. Clients may write it
+despite the reserved prefix — it is the one exception, and it is allowed only
+for samples carrying the client's own `client` label.
+
+The three delivery counters measure three different things and are named for
+them. `batches_sent` and `batches_dropped` count *batches* — written and
+abandoned — and `batches_retried` counts the batches that were put back in the
+buffer after the write client ran out of its own retries, which is the only
+field that distinguishes "the store is pushing back and the ingester is
+holding on" from "delivery is healthy". `samples_dropped` is what the drops
+cost in samples, from every cause: an abandoned batch, a buffer that filled
+while delivery was held, and whatever was still buffered at shutdown.
+`samples_unencodable` counts samples refused before they entered a buffer, so
+the store never sees them and cannot report them.

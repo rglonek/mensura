@@ -364,6 +364,30 @@ func (t *tailer) rewindOwed() bool {
 	return t.rewind
 }
 
+// replayOwed reports whether the bytes this tailer's extractor is still
+// holding are going to be read a second time, so anything it is holding
+// must not be emitted early.
+//
+// Two states say so, and they are the same state a moment apart. A tailer
+// that owes a *rewind* is about to be seeked back to the acknowledged
+// offset; a tailer that is *holed* has had its acknowledged offset frozen
+// there and cannot move it again until a later flush thaws it -- so
+// whichever way the process leaves this state, the records behind that
+// offset are read again, from here or from the next start.
+//
+// Closing an aggregation window early over those records is the one loss
+// a replay does not repair. The early window covers fewer records than
+// the one the replay rebuilds, so the pair lands at a single timestamp
+// with a single label set carrying two different values: a content key
+// hashes the values, so it does not collapse them, and an offset key
+// hints a flush sequence number that does not repeat either. The panel
+// gains a point nothing measured.
+func (t *tailer) replayOwed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.holed || t.rewind
+}
+
 // takeRewind reports whether the poll goroutine owes this tailer a seek
 // back to the acked offset, and clears the request.
 func (t *tailer) takeRewind() (int64, bool) {
@@ -941,6 +965,34 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 	return nil
 }
 
+// drainOrDiscard is drainExtractor for a caller that leaves this
+// tailer's resume offset where it is, so the bytes the extractor is
+// holding will be read again: a shutdown, or a path that has left the
+// followed set and keeps its checkpoint.
+//
+// In that state the flush is thrown away rather than delivered, which is
+// exactly what applyRewind does with the same buffers and for the same
+// reason -- the replay rebuilds them. Emitting first writes an
+// early-closed window beside the rebuilt one, at one timestamp and one
+// label set with two different values, and no key collapses that pair.
+//
+// The rotation paths deliberately do not come through here. retire() and
+// the truncate branch of checkRotation replace the bytes rather than
+// re-read them -- the renamed file is gone and the rewritten one starts
+// at zero -- so whatever the extractor holds there is the only copy of
+// those records and has to go to the sink.
+func (f *follower) drainOrDiscard(ctx context.Context, t *tailer) {
+	if t.replayOwed() {
+		// Flushed all the same, so the extractor is left empty for
+		// whatever picks this path up next; the results are dropped, and
+		// the verdicts with them, because every record inside them is
+		// judged again on the replay.
+		_, _ = t.ex.Flush()
+		return
+	}
+	f.drainExtractor(ctx, t)
+}
+
 // drainExtractor flushes whatever the extractor still holds -- an open
 // multiline record, a half-filled aggregation window -- into the sink.
 func (f *follower) drainExtractor(ctx context.Context, t *tailer) {
@@ -1048,7 +1100,16 @@ func (f *follower) retireKeepingCheckpoint(ctx context.Context, t *tailer) {
 }
 
 func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
-	f.drainExtractor(ctx, t)
+	if rewind {
+		// A rotation: the checkpoint is zeroed below and the replacement
+		// is read from its beginning, so nothing re-reads the bytes this
+		// extractor was filled from. Its contents are the only copy.
+		f.drainExtractor(ctx, t)
+	} else {
+		// The checkpoint stays where it is, so a tailer whose resume
+		// offset is frozen would have this flush rebuilt on top of it.
+		f.drainOrDiscard(ctx, t)
+	}
 	// A retired tailer leaves f.tailers below, so persistOwed will never
 	// see it again: whatever a coalesced commit deferred has to go to disk
 	// here or be lost, and losing it means re-reading those bytes when the
@@ -1186,7 +1247,16 @@ func (f *follower) flushIdle(ctx context.Context) {
 		// collapse under a content key, and the panel gains a point
 		// nothing measured. The read loop skips a tailer in this state
 		// for the same reason.
-		if t.rewindOwed() {
+		//
+		// A *holed* tailer is skipped on the same grounds. Its resume
+		// offset is frozen at the acknowledged one and cannot move again
+		// until a later flush thaws it -- and thawing is what asks for
+		// the re-read -- so whether delivery recovers or the process
+		// restarts first, these records are read a second time either
+		// way. Waiting for the rewind flag alone left every idle tick of
+		// the outage free to emit the short window this guard exists to
+		// prevent, and an outage is exactly when there are many of them.
+		if t.replayOwed() {
 			continue
 		}
 		results, verdicts := t.ex.FlushIdle(now)
@@ -1211,7 +1281,13 @@ func (f *follower) flushIdle(ctx context.Context) {
 
 func (f *follower) closeAll(ctx context.Context) {
 	for _, t := range f.snapshotTailers() {
-		f.drainExtractor(ctx, t)
+		// drainOrDiscard, not drainExtractor: a shutdown leaves every
+		// checkpoint where it is, so a tailer whose resume offset is
+		// frozen -- holed by a dropped batch, or already asked to rewind
+		// -- has these very bytes read again by the next start. The
+		// window it holds is rebuilt there, longer, and the pair does not
+		// collapse.
+		f.drainOrDiscard(ctx, t)
 		if t.file != nil {
 			_ = t.file.Close()
 			t.file = nil
