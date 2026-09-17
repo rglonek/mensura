@@ -254,9 +254,12 @@ store's catalogue, and is served to the plugin. Effects:
   (not error) when a counter is plotted raw.
 - `max_interval` becomes the default `GAP` for that field, so gap detection is
   right by default instead of being a per-panel chore.
-- `limits` become the default `CLAMP … ELSE RAW`, which is the counter-reset
-  escape hatch pre-wired — except under `NEGATE`, where the declared range
-  describes values the query is deliberately mirroring
+- `limits` become the field's default `CLAMP`. Under `DELTA` it carries
+  `ELSE RAW`, which is the counter-reset escape hatch pre-wired; everywhere
+  else it carries `ELSE BOUND`, because `ELSE RAW` substitutes the
+  pre-transform sample and with no transform in front of it that is the
+  value itself. Under `NEGATE` no default is installed at all, because the
+  declared range describes values the query is deliberately mirroring
   ([06](06-query.md) §4.3).
 - `unit_hint` populates the frame's field config so panels get units without
   manual configuration.

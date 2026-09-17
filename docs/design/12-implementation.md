@@ -152,6 +152,11 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Label *keys* are bounded, and a known key still works | `internal/store/label_keys_test.go:TestNewLabelKeysAreBounded`, `…:TestAKnownLabelKeyStillWorksAtTheLimit` |
 | Closing waits for the writes as well as the queries | `internal/store/close_drain_test.go:TestCloseWaitsForAnInFlightEngineOperation`, `…:TestEngineOperationsRefuseAfterClose` |
 | `Print` carries the nesting bound the parser and validator carry | `pkg/mql/print_depth_test.go:TestCheckPredicateDepthRefusesWhatParseRefuses`, `internal/store/label_keys_test.go:TestPrintRefusesAPredicateDeeperThanTheGrammar` |
+| Declared limits bound a gauge, and still escape under `DELTA` | `internal/store/declared_limits_test.go:TestDeclaredLimitsBoundAGauge`, `…:TestDeclaredLimitsKeepTheHatchUnderDelta`, `…:TestExplicitClampStillWins` |
+| The hold floor is the same number without walking the whole list | `pkg/extract/hold_floor_test.go:TestHoldFloorMatchesReference`, `…:TestHoldFloorCostDoesNotGrowWithOpenWindows` |
+| A series that emits nothing still answers with arrays | `internal/store/declared_limits_test.go:TestEmptySeriesIsAListNotNull` |
+| One `--idle-flush` means one thing on both followers | `internal/ingest/regression_test.go:TestRemoteIdleTickIsBounded` |
+| A declaration repeated verbatim leaves the catalogue version alone | `internal/store/declaration_churn_test.go:TestRepeatedDeclarationsDoNotMoveTheVersion`, `…:TestForgettingAnUnknownSetIsNotAChange` |
 
 ## 5. Implementation status
 
@@ -3567,6 +3572,110 @@ endpoint whose whole job is to show the plan was showing a plan with the
 clamp missing from it. `clamp_min`, `clamp_max`, `sse` and `required` now
 travel with the rest of the resolved field, and a clamp the executor will
 not install is absent rather than reported.
+
+
+### 6.169 A declared `limits:` pair that bounded nothing
+
+A field's `limits:` become the query layer's default clamp (§6.160,
+§6.168), and that default carried `ELSE RAW` unconditionally. `ELSE RAW`
+substitutes the *pre-transform* sample, and stage 3 of the walk sets
+`val = raw`: the only stages between it and the clamp are `DELTA` and
+`NEGATE`, and `NEGATE` already withholds the default. So for every query
+without `DELTA` the clamp was provably a no-op — it replaced each
+out-of-range value with itself.
+
+That is the shape [03](03-extraction.md) §6 uses as its example.
+`cpu_pct` is declared a gauge with `limits: {min: 0, max: 100}`, and a
+source reporting 150 drew 150 while `Explain` reported `clamp_min: 0` and
+`clamp_max: 100` as if the bounds were in force. A declaration the store
+validates, persists, serves from `/v1/catalogue` and names in the plan,
+and then does not act on, is the same failure `store_stream_label:` and
+`on_parse_error: drop-stream` are refused for — reached, this time,
+through a declaration that is entirely correct.
+
+`resolveField` now sets `ClampElseRaw` from the query's own `DELTA`. Under
+`DELTA` the hatch is what it was built for: a counter reset makes one
+difference briefly negative, and the new raw counter is small, legitimate
+and interpretable where the bound is not. Everywhere else the bound is the
+only reading under which the declaration bounds anything. An explicit
+`CLAMP … ELSE RAW` is still honoured wherever it is written, and `NEGATE`
+still withholds the default entirely.
+
+### 6.170 The hold floor no longer walks every open window
+
+`Stream.holdFloor` is what `HeldFrom` answers with, and `HeldFrom` runs
+once per record on every driver that checkpoints byte offsets — the local
+follower's `syncPending` and the SSH follower's `heldOffset`. It scanned
+`st.holds` twice: once for the smallest live mark, once backwards for an
+emitted span containing it, with a map lookup per entry both times
+(`live` resolves the aggregation key).
+
+`st.holds` is kept in mark order precisely so that "HeldFrom reads only
+the first live entry" is true, and the scan did not use it. The cost was
+therefore linear in the number of open aggregation windows, on the ingest
+hot path, and `maxOpenWindows` allows 100 000 of them. Measured at 50 000
+open windows it was 2.0 ms per record — about 500 records a second —
+against 4.1 µs at 100. The condition that produces it is an
+`aggregate.on` key with more values than its author expected, which is
+the case the cap itself was added for (§6.112): the guard against running
+out of memory handed the pipeline a throughput cliff instead.
+
+The first live entry now ends the forward scan, and the backward pass
+runs only over the entries ahead of it — everything at or after it has a
+mark at or above the floor, which the existing test already skipped. The
+answer is unchanged, and `hold_floor_test.go` asserts that against a
+reference implementation of the old walk over randomised streams. The
+same measurement is now 1.8 µs at 50 000 windows, flat in the window
+count.
+
+### 6.171 A series that emits nothing answers with arrays
+
+`wire.Series.TSMs` and `.Values` carry no `omitempty`, so a series that
+produced no points travelled as `"ts_ms": null, "values": null`. A series
+can legitimately produce none: `SELECT x DELTA` over a single sample
+consumes it to seed the previous value. This is the same distinction
+`QueryResponse.Series` and `LabelValues.Values` were changed for — a
+consumer should not have to tell "no points" apart from "no array" — and
+it was the one list in the response still able to answer null.
+
+
+### 6.172 One `--idle-flush` means one thing on both followers
+
+`--idle-flush` is documented as how long a partial multiline record or a
+half-filled aggregation window may wait, and the two followers read it
+differently. The SSH one ticks at half the value, for the reason its own
+comment gives: a ticker running at exactly the bound fires, at worst, a
+whole period after a record became due, so the record waits twice what
+was asked for. The local one ticked at exactly the value.
+
+So the same number bought a 45-second worst case over SSH and a
+60-second one on a followed file — and on a quiet file this tick is also
+what releases the checkpoint an open aggregation window is holding back,
+so the resume offset lagged with it. `remoteIdleTick` is now
+`idleTick` and lives beside `defaultIdleFlush`, where both followers
+read it.
+
+
+### 6.173 A declaration repeated verbatim moved the catalogue version
+
+`CatalogueVersion` is the version of the catalogue *schema* and its own
+contract is that only a real change moves it: it is the validator on
+`/v1/catalogue` and the number every client watches for a metadata
+change (§6.45). `applyFieldMeta` compares before it bumps, and so does
+`SetRetentionFor`. `SetKeyScheme` did not — it wrote the scheme and
+incremented, whatever was already there.
+
+So a spec with a `sets: {app: {key: offset}}` block moved the version on
+every write that carried the declaration. Each one missed every cached
+ETag, woke everything watching the number, and made `Write` persist the
+whole catalogue record, because that persist is conditional on the
+version having moved (§6.109). `Sink.DeclareSets` sends the block once
+per ingest process, so the sink itself pays this once per start; any
+client that repeats its declarations pays it per request.
+
+`ForgetSet` had the same shape one step along: an admin drop of a name
+the catalogue never held moved the version too. Both now compare first,
+and a set this call creates still counts as a change.
 
 
 ## 7. Known gaps worth naming

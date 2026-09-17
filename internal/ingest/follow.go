@@ -61,7 +61,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
-	idle := time.NewTicker(opts.IdleFlush)
+	idle := time.NewTicker(idleTick(opts.IdleFlush))
 	defer idle.Stop()
 	for {
 		select {
@@ -109,6 +109,26 @@ const noProfileRetry = time.Minute
 // shared by the local and the remote follower so one --idle-flush means
 // one thing.
 const defaultIdleFlush = 30 * time.Second
+
+// idleTick is how often the idle question is asked, given the bound the
+// operator set. It is bounded below so a very short --idle-flush cannot
+// turn into a busy loop, and asking twice per bound is what makes a
+// record wait at most that bound rather than twice it: a ticker running
+// at exactly the bound fires, at worst, a whole period after the record
+// became due.
+//
+// Both followers read it, because --idle-flush is one flag. The local
+// one used to tick at exactly its value while the remote one halved it,
+// so the same number meant a 60-second worst case on a followed file and
+// a 45-second one over SSH -- and on a quiet file it is this tick that
+// releases the checkpoint an open aggregation window is holding back.
+func idleTick(idle time.Duration) time.Duration {
+	tick := idle / 2
+	if tick < time.Second {
+		tick = time.Second
+	}
+	return tick
+}
 
 type follower struct {
 	ing  *Ingest

@@ -371,17 +371,36 @@ func (st *Stream) holdFloor() (int64, bool) {
 			oldest, held = b.mark, true
 		}
 	}
-	for _, e := range st.holds {
-		if st.live(e) && (!held || e.mark < oldest) {
+	// The list is in mark order, so the *first* live entry carries the
+	// smallest live mark and no later one can lower the floor. Walking
+	// the rest of them anyway made this O(open windows) -- with a map
+	// lookup per entry, since `live` resolves the key -- on a function
+	// the follow paths call once per record through HeldFrom. At the
+	// 100 000-window cap maxOpenWindows allows that is milliseconds of
+	// scanning per line, which is a throughput cliff reached by nothing
+	// worse than an `aggregate.on` key with more values than the spec
+	// author expected -- the very case the cap was added for.
+	firstLive := len(st.holds)
+	for i, e := range st.holds {
+		if !st.live(e) {
+			continue
+		}
+		firstLive = i
+		if !held || e.mark < oldest {
 			oldest, held = e.mark, true
 		}
+		break
 	}
 	if !held {
 		return 0, false
 	}
-	for i := len(st.holds) - 1; i >= 0; i-- {
+	// Only the entries ahead of the first live one can still contain the
+	// floor. Everything at or after it has a mark at or above the first
+	// live entry's, which is at or above the floor, and the test below
+	// would skip every one of them.
+	for i := firstLive - 1; i >= 0; i-- {
 		e := st.holds[i]
-		if e.mark >= oldest || st.live(e) {
+		if e.mark >= oldest {
 			continue
 		}
 		if e.endMark() >= oldest {

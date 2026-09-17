@@ -360,12 +360,28 @@ func (s *Store) keyScheme(set string) model.KeyScheme {
 
 // SetKeyScheme records how a set's rows are keyed. Offset keying keeps
 // every occurrence distinct; content keying makes replays idempotent.
+//
+// Only a real change moves CatalogueVersion, which is the rule every other
+// declaration path here already follows. It used to bump unconditionally,
+// so a spec declaring `key:` for a set made each write carrying that
+// declaration move the version -- which misses every client's
+// /v1/catalogue ETag, wakes everything watching catalogue_version for a
+// metadata change, and makes Write persist the whole catalogue record
+// because it sees the version has moved. A declaration repeated verbatim
+// is not a change.
 func (s *Store) SetKeyScheme(set string, scheme model.KeyScheme) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	_, known := s.catalogue[set]
 	e := s.entryLocked(set)
+	// entryLocked creates the entry, so a set this call brought into the
+	// catalogue is a change even when the scheme it carries is the one
+	// the zero value already held.
+	changed := !known || e.KeyScheme != scheme
 	e.KeyScheme = scheme
-	s.catVer.Add(1)
+	s.mu.Unlock()
+	if changed {
+		s.catVer.Add(1)
+	}
 }
 
 // rowFor turns a sample into an engine row: the timestamp, one integer

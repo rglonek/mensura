@@ -157,7 +157,7 @@ first or last per datasource setting.
 | `PER SECOND` | Divide by the raw elapsed seconds between this and the previous sample. | 7 |
 | `RATE` | Sugar for `DELTA PER SECOND`. | 4 + 7 |
 | `NEGATE` | Multiply by −1 after delta conversion. Mirrored-axis panels. | 5 |
-| `CLAMP MIN a, MAX b [ELSE RAW\|BOUND]` | Range clamp. `ELSE RAW` (default when field metadata declares limits, except under `NEGATE` — see below) substitutes the raw pre-transform sample — the counter-reset escape hatch. `ELSE BOUND` clamps to the bound. | 6 |
+| `CLAMP MIN a, MAX b [ELSE RAW\|BOUND]` | Range clamp. `ELSE RAW` substitutes the raw pre-transform sample — the counter-reset escape hatch; `ELSE BOUND` clamps to the bound. When field metadata declares limits the escape is the default under `DELTA` and the bound is the default everywhere else — see below. | 6 |
 | `GAP d` | Declared ticker cadence. Two consecutive samples further apart than `d` produce a null connect-break one millisecond before the later sample. Default: the field's `max_interval` metadata; `GAP 0` disables. | 1 |
 | `SSE n\|REPEAT\|OFF` | Singular-series extension for a series that renders as one point. Default `0`. | tail |
 | `REQUIRED` | Fail the query up front if the field is absent from the catalogue, instead of drawing nothing. | plan |
@@ -170,6 +170,16 @@ the pre-transform sample, which undoes both `DELTA` and `NEGATE`
 ([07](07-downsampling.md) §3 stage 6). `SELECT tx RATE NEGATE` would draw
 the raw counter instead of the mirrored rate. An explicit `CLAMP` always
 wins over the declaration, negated or not.
+
+Which escape the default carries depends on whether there is a transform to
+escape from. `ELSE RAW` substitutes the *pre-transform* sample, and the only
+stages between stage 3's `val = raw` and the clamp are `DELTA` and `NEGATE`
+— so without `DELTA`, `val` and `raw` are the same number and an `ELSE RAW`
+clamp replaces every out-of-range value with itself. The declared-limits
+default therefore carries `ELSE RAW` under `DELTA`, where the counter-reset
+hatch is what it was built for, and `ELSE BOUND` everywhere else, where the
+bound is the only reading under which the declaration bounds anything.
+An explicit `ELSE RAW` is still honoured wherever it is written.
 
 The stage numbers refer to [07-downsampling.md](07-downsampling.md) and are the
 whole point: the modifiers *are* the per-bin control surface from the
