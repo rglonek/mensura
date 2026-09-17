@@ -703,6 +703,27 @@ func (p *remoteProgress) rewindPending() bool {
 	return p.rewindOwed
 }
 
+// replayPending is rewindPending plus the state one moment earlier: a
+// path whose resume offset is frozen by a dropped batch.
+//
+// commitInflight refuses to move `acked` while `holed` is set, so the
+// next connection starts at the frozen offset whether the hole clears
+// (which kills the tail and restarts it there) or the process dies first.
+// Either way the records the extractor is holding are read again, and an
+// aggregation window closed early over them is rebuilt longer -- one
+// timestamp, one label set, two different values, and no key collapses
+// the pair.
+//
+// It is deliberately *not* used at the end of a connection. A connection
+// ends on a rotation as well as on a failure, and `tail -F` has already
+// moved to the replacement by then, so what the extractor holds from the
+// old file is the only copy of it.
+func (p *remoteProgress) replayPending() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.holed || p.rewindOwed
+}
+
 // rewindOwedForTest reports whether a rewind is still pending.
 func (p *remoteProgress) rewindOwedForTest() bool { return p.rewindPending() }
 
@@ -1056,7 +1077,14 @@ func (i *Ingest) remoteFlushIdle(ctx context.Context, rs *remoteStream, target s
 	// a short window beside the one the replay rebuilds -- same instant,
 	// same labels, different value, and no key collapses the pair. The
 	// local follower skips its idle flush in the same state.
-	if progress.rewindPending() {
+	//
+	// replayPending, not rewindPending: a path frozen by a dropped batch
+	// is in the same position a moment earlier, because its acknowledged
+	// offset cannot move again until a flush thaws it -- and the thaw is
+	// what kills the connection and restarts it there. An outage is
+	// exactly when there are many idle ticks, so waiting for the rewind
+	// flag left every one of them free to emit a short window.
+	if progress.replayPending() {
 		return
 	}
 	at, verdicts := rs.flushIdle(now, func(results []extract.Result, pos string) {

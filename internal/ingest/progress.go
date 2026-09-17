@@ -257,12 +257,32 @@ func (p *Progress) Report(ctx context.Context, sink *Sink, client string, stream
 			"oversize_records": model.Int(snap.OversizeRecords),
 			"binary_skipped":   model.Int(snap.BinarySkipped),
 			"batches_sent":     model.Int(sinkStats.Sent),
-			"batches_dropped":  model.Int(sinkStats.Dropped),
-			"rejected":         model.Int(sinkStats.Rejected),
-			"lag_bytes":        model.Int(snap.LagBytes),
-			"udp_dropped":      model.Int(snap.UDPDropped),
-			"files_total":      model.Int(int64(snap.FilesTotal)),
-			"files_done":       model.Int(int64(snap.FilesDone)),
+			// The three delivery counters, each measuring what its name
+			// says. `batches_dropped` used to carry SinkStats.Dropped,
+			// which counts *samples*: every drop site adds the size of
+			// what it lost, so a dashboard panel titled "batches dropped"
+			// read three orders of magnitude high and an operator sizing
+			// a retry budget against it was reading a number about
+			// something else. FatalDrop is the batch count.
+			//
+			// `batches_retried` is the one 05-storage.md names and
+			// nothing ever published. It is the counter that separates
+			// "the store is pushing back and the ingester is holding on"
+			// from "delivery is healthy" -- the two states that look
+			// identical on every other field here, because a requeued
+			// batch is neither sent nor dropped.
+			"batches_retried": model.Int(sinkStats.Retried),
+			"batches_dropped": model.Int(sinkStats.FatalDrop),
+			// What the drops actually cost, under a name that says so.
+			"samples_dropped": model.Int(sinkStats.Dropped),
+			// Samples refused before they could be buffered, which the
+			// store never sees and so can never report.
+			"samples_unencodable": model.Int(sinkStats.Unencodable),
+			"rejected":            model.Int(sinkStats.Rejected),
+			"lag_bytes":           model.Int(snap.LagBytes),
+			"udp_dropped":         model.Int(snap.UDPDropped),
+			"files_total":         model.Int(int64(snap.FilesTotal)),
+			"files_done":          model.Int(int64(snap.FilesDone)),
 		},
 	})
 }

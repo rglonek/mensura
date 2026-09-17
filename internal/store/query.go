@@ -180,6 +180,12 @@ type resolvedField struct {
 	label string // display name
 	spec  render.Spec
 	meta  *wire.FieldMeta
+	// required is the REQUIRED modifier. It is not part of render.Spec
+	// because it is a *plan* stage -- it becomes an existence predicate
+	// on the scan -- but Explain reports the resolved field, and a
+	// modifier that shapes the scan and appears nowhere in the plan is
+	// the kind of omission Explain exists to close.
+	required bool
 }
 
 func (s *Store) plan(q *mql.Query, req *wire.QueryRequest) (*queryPlan, []mql.Diag, error) {
@@ -245,7 +251,7 @@ func (s *Store) plan(q *mql.Query, req *wire.QueryRequest) (*queryPlan, []mql.Di
 // supplies defaults only: an explicit modifier always wins, and the
 // resolved result is what Explain reports, so nothing is invisible.
 func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
-	rf := resolvedField{name: fe.Field, label: fe.Name()}
+	rf := resolvedField{name: fe.Field, label: fe.Name(), required: fe.Modifiers.Required}
 	m := fe.Modifiers
 	rf.spec = render.Spec{
 		Delta:     m.Delta,
@@ -306,6 +312,19 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 		}
 	}
 	return rf
+}
+
+// sseName renders the resolved singular-series-extension mode the way an
+// MQL author wrote it, so Explain does not report a numeric enum.
+func sseName(sse render.SSE) string {
+	switch sse.Mode {
+	case render.SSERepeat:
+		return "repeat"
+	case render.SSEOff:
+		return "off"
+	default:
+		return fmt.Sprintf("const %g", sse.Value)
+	}
 }
 
 // limitsOrdered reports whether a field's declared limits are a range.
@@ -1389,11 +1408,32 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 	}
 	fields := make([]map[string]any, 0, len(p.fields))
 	for _, f := range p.fields {
-		fields = append(fields, map[string]any{
+		out := map[string]any{
 			"field": f.name, "as": f.label,
 			"delta": f.spec.Delta, "per_second": f.spec.PerSecond, "negate": f.spec.Negate,
 			"gap_ms": f.spec.GapMs, "clamp_else_raw": f.spec.ClampElseRaw,
-		})
+			"sse": sseName(f.spec.SSE), "required": f.required,
+		}
+		// The bounds themselves, not only the escape hatch flag.
+		//
+		// resolveField's contract is that "the resolved result is what
+		// Explain reports, so nothing is invisible", and the one thing
+		// it resolved that Explain did not report was the clamp a
+		// field's declared `limits:` install by default. That default
+		// carries ELSE RAW, which substitutes the pre-transform sample,
+		// so when it misfires it does not draw a bounded series -- it
+		// draws the raw counter under a RATE legend, with no
+		// diagnostic. Twice now that has been a bug (a crossed pair on
+		// disk, and the interaction with NEGATE), and both times the
+		// endpoint whose whole job is to show the plan was showing a
+		// plan with the clamp missing from it.
+		if f.spec.ClampMin != nil {
+			out["clamp_min"] = *f.spec.ClampMin
+		}
+		if f.spec.ClampMax != nil {
+			out["clamp_max"] = *f.spec.ClampMax
+		}
+		fields = append(fields, out)
 	}
 	// Clamped exactly as the executor clamps it, and taken from the same
 	// place: reporting a window the executor would never use makes

@@ -663,10 +663,26 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 				Edges:   append([]float64(nil), stored.Edges...),
 				Unit:    stored.Unit,
 			}
+			// Each slice is grown against its own length, not against
+			// the other's. The two are written in lockstep here and so
+			// are always the same length -- but "always" is a property
+			// of this function, and the record they are read back from
+			// is JSON on disk, which a half-written save, a hand edit or
+			// an older build can leave with a bucket list longer than
+			// its edge list. Growing both by `len(bs.Buckets) <= index`
+			// preserves that difference, so the assignment below then
+			// ran off the end of Edges and panicked -- on the write
+			// path, which in plugin mode is the process that owns the
+			// data directory. The lengths are reconciled on the way
+			// through, which is the repair this function is in a
+			// position to make.
 			for len(bs.Buckets) <= m.BucketIndex {
 				bs.Buckets = append(bs.Buckets, "")
+			}
+			for len(bs.Edges) < len(bs.Buckets) {
 				bs.Edges = append(bs.Edges, 0)
 			}
+			bs.Edges = bs.Edges[:len(bs.Buckets)]
 			bs.Buckets[m.BucketIndex] = m.Field
 			bs.Edges[m.BucketIndex] = m.BucketEdge
 			if m.Unit != "" {

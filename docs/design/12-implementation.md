@@ -917,10 +917,10 @@ dead: its destination set is never written, and nothing at run time says
 so, because the record did match something. An empty `search` is the
 extreme case and shadows every pattern after it.
 
-`Spec.Lint` reports four codes, split by `Lint.Fatal()` into the one that
-describes a broken spec and the three that describe a working one that
+`Spec.Lint` reports six codes, split by `Lint.Fatal()` into the two that
+describe a broken spec and the four that describe a working one that
 declares more than it uses. `check` prints both, under separate headings,
-and exits non-zero only on the fatal one — so a spec with a dead pattern
+and exits non-zero only on the fatal ones — so a spec with a dead pattern
 fails the pipeline that runs it instead of shipping, while a spec that
 merely names its operator labels does not:
 
@@ -930,7 +930,19 @@ merely names its operator labels does not:
 | `L002` | no | a capture that is neither a declared label nor a `fields:` entry, so it lands as an untyped gauge |
 | `L003` | no | a `fields:` declaration no pattern captures, so its metadata reaches no column |
 | `L004` | no | a declared label no pattern captures and that is not a stream label |
-| `L005` | no | a capture that is *not* declared as a label but whose name is one the acquisition layer attaches as a stream label; the sample would carry the name as a label and as a field, which the store refuses outright |
+| `L005` | no | a capture that is *not* declared as a label but whose name is one an `identity:` rule can attach as a stream label; where that rule applies, the sample carries the name as a label and as a field, which the store refuses outright |
+| `L006` | yes | the same collision on `host` or `source`, which no rule has to supply because every acquisition path defaults them — so it happens on *every* record and the pattern can never store a row |
+
+`L005` is advisory because an `identity:` rule scoped by `match_path` does
+not apply to every stream, so a pattern in another profile may legitimately
+capture that name. `host` and `source` have no such escape: the local
+follower fills them from the hostname and the file's base name, and a
+receiver from the peer address and the listener name, whenever identity
+discovery and `--label` have not. A pattern that captures either as a field
+therefore has every one of its records rejected by `store.rowFor` — for the
+life of the process, with the only trace a line in the *store's* log — which
+is the same "the spec compiles and the pipeline writes nothing" outcome
+`L001` is fatal for, so it is `L006` rather than `L005`.
 
 Failing on all of them alike was wrong in a way the L004 text said out loud:
 its own message ends "if it comes from `identity:` or --label it is
@@ -3447,11 +3459,120 @@ it is worse: the set is retained on a horizon nobody wrote.
 and `checkSetMeta` refuses it as an `ErrBadRequest` for anything that
 reaches the write API another way.
 
+### 6.164 A frozen checkpoint no longer emits the window its replay rebuilds
+
+§6.156 stopped two paths delivering buffered extractor state while a
+*rewind* was owed. The freeze that precedes the rewind was left uncovered,
+and it lasts far longer: `markHoled` pins a tailer's resume offset at the
+last acknowledged one and `commitInflight` refuses to move it until a
+later flush thaws it, so for the whole of a store outage those records are
+guaranteed to be read a second time — by the rewind if delivery recovers,
+by the next start if it does not.
+
+Three places closed a window over them anyway. `flushIdle` fires once per
+`--idle-flush` for the length of the outage, which is where most of them
+came from; `closeAll` drains every tailer on shutdown, which leaves the
+checkpoint exactly where the freeze left it; and `retireKeepingCheckpoint`
+does the same for a path that has left the followed glob — which
+`filepath.Glob` reports for a directory it cannot read, so one NFS blip
+is enough. The SSH follower's idle tick had the same shape.
+
+The loss is the one a replay does not repair. An early-closed aggregation
+window covers fewer records than the one the replay rebuilds, so the pair
+lands at a single timestamp under a single label set carrying two
+different values: a content key hashes the values and an offset key hints
+a flush sequence number, and neither collapses them. The panel gains a
+point nothing measured.
+
+`tailer.replayOwed` (`holed || rewind`) and `remoteProgress.replayPending`
+are the test, and `follower.drainOrDiscard` is the drain that honours it —
+it flushes the extractor and throws the result away, exactly as
+`applyRewind` does with the same buffers.
+
+The rotation paths deliberately do *not* use it. `retire()` and the
+truncate branch of `checkRotation` replace the bytes rather than re-read
+them — the renamed file is gone, the rewritten one starts at zero — so
+what the extractor holds there is the only copy of those records and has
+to reach the sink. The same reasoning keeps the SSH follower's
+end-of-connection `flushAll` on `rewindPending` alone: a connection also
+ends on a rotation, and `tail -F` has already moved to the replacement.
+
+### 6.165 The ingest set's delivery counters measure what they are named
+
+`_mensura_ingest` published `batches_dropped` from `SinkStats.Dropped`,
+which counts *samples*: every drop site adds the size of what it lost, so
+a panel titled "batches dropped" read orders of magnitude high and an
+operator sizing a retry budget against it was reading a number about
+something else. `SinkStats.FatalDrop` is the batch count and is what the
+field carries now; what the drops cost is published beside it as
+`samples_dropped`.
+
+`batches_retried` is named in [05](05-storage.md) §8 and was never
+published at all, though the sink has counted it since retry exhaustion
+started requeueing rather than shedding (§6.31). It is the only field that
+separates "the store is pushing back and the ingester is holding on" from
+"delivery is healthy": a requeued batch is neither sent nor dropped, so on
+every other counter the two states look identical. `samples_unencodable`
+joins it, because a sample refused before it enters a buffer never reaches
+the store and so can never appear in a rejection count.
+
+The set's label list in [05](05-storage.md) named `input` and `stream`,
+which nothing has ever attached; the document now describes what `Report`
+actually sends.
+
+### 6.166 A drifted bucket-set record is repaired, not indexed past
+
+`applyFieldMeta` grew a bucket set's `Buckets` and `Edges` in lockstep
+against `len(bs.Buckets)`, so a stored record whose two slices had drifted
+apart kept the difference and the edge assignment ran off the end —
+`index out of range` on the write path, which in `mode: plugin` is the
+process that owns the data directory. The lengths are a property of this
+function, but the record is JSON on disk, which a half-written save, a
+hand edit or an older build can leave short. Each slice is now grown
+against its own length and the two are reconciled on the way through,
+which is the repair this function is in a position to make. A short edge
+list is not only a crash risk: `heatmapSeriesName` reads the edge to name
+a series, so a bucket past the end of it drew a series with no name.
+
+### 6.167 A capture named `host` or `source` fails `check`
+
+`L005` warns about a capture that is not declared as a label but whose
+name the acquisition layer attaches as a stream label — the sample then
+carries one name as a label and as a field, which `store.rowFor` refuses
+by name. It was advisory throughout, on the grounds that an `identity:`
+rule scoped by `match_path` does not apply to every stream.
+
+That grounds does not cover `host` and `source`. They are not discovered,
+they are *defaulted*: the local follower fills them from the hostname and
+the file's base name, a receiver from the peer address and the listener
+name, whenever identity discovery and `--label` have not. So a pattern
+capturing either as a field has every record it produces rejected, for the
+life of the process, with the only trace a line in the store's log on the
+far side of the sink — a spec that compiles and stores nothing, which is
+what `L001` is fatal for. That case is now `L006` and fails `check`;
+`L005` keeps its meaning and stays advisory for the identity-derived
+names.
+
+### 6.168 Explain reports the clamp it resolved
+
+`resolveField`'s contract is that "the resolved result is what Explain
+reports, so nothing is invisible", and the one thing it resolved that
+Explain did not report was the clamp a field's declared `limits:` install
+by default. That default carries `ELSE RAW`, so when it misfires it does
+not draw a bounded series — it substitutes the raw pre-transform sample,
+which under `RATE` is the raw counter, orders of magnitude out, with no
+diagnostic. It has been the subject of two bugs already (§6.153's crossed
+pair and §6.160's interaction with `NEGATE`), and through both of them the
+endpoint whose whole job is to show the plan was showing a plan with the
+clamp missing from it. `clamp_min`, `clamp_max`, `sse` and `required` now
+travel with the rest of the resolved field, and a clamp the executor will
+not install is absent rather than reported.
+
 
 ## 7. Known gaps worth naming
 
 - **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
-  describes three things the code does not do, and they are named here
+  describes four things the code does not do, and they are named here
   rather than left reading as features. A rotated file's undrained tail is
   said to be recovered on restart "via the archive glob"
   (`--rotated-glob`, `--catch-up-rotated`): there is no such flag and no
@@ -3459,12 +3580,17 @@ reaches the write API another way.
   handle loses whatever was left in it — the replacement is still read
   from offset 0, because the stored fingerprint no longer matches. §6.3
   says `mensura-ingest check` warns about an occurrence-counting pattern
-  under `key: content`; the lint set is `L001`–`L005` and holds no such
+  under `key: content`; the lint set is `L001`–`L006` and holds no such
   check, and deciding "no numeric capture" from a spec alone is guesswork,
   because extraction coerces per value. §7.1 offers TLS on the receive
   listeners and a client-certificate subject mapped to stream labels, plus
   per-connection byte-rate caps: the listeners are plaintext, and the only
-  per-connection bounds are `--max-connections` and the idle timeout.
+  per-connection bounds are `--max-connections` and the idle timeout. §10
+  offers Prometheus metrics on `--metrics-listen`: `mensura-ingest` has no
+  such flag and serves no metrics endpoint, so the progress document, the
+  console line and the `_mensura_ingest` set are the whole of its
+  telemetry — which is also the one telemetry path that stops working
+  when the store is unreachable.
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
   React editor exists a panel must carry the AST in its query model. The
   backend's `parse`/`print` resources exist precisely so the frontend never

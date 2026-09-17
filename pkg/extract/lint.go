@@ -47,7 +47,17 @@ func (l Lint) String() string {
 // compares against is the union of every `identity:` rule's captures, and
 // a rule scoped by `match_path` does not apply to every stream, so a
 // pattern in another profile may legitimately capture that name.
-func (l Lint) Fatal() bool { return l.Code == "L001" }
+//
+// L006 is the half of L005 where that escape does not exist. `host` and
+// `source` are not discovered, they are *defaulted*: every acquisition
+// path fills them in when nothing else has (the hostname and the file's
+// base name locally, the peer address and the listener name on a
+// receiver), so a pattern that captures either as a field produces a
+// sample carrying one name as a label and as a field on every single
+// record -- which store.rowFor refuses by name, for the life of the
+// process, with nothing pointing back at the spec. A spec that can never
+// store a row is a broken spec, which is what L001 is fatal for.
+func (l Lint) Fatal() bool { return l.Code == "L001" || l.Code == "L006" }
 
 // Fatal reports whether any finding in a set is fatal.
 func Fatal(lints []Lint) bool {
@@ -84,10 +94,21 @@ func (s *Spec) Lint() []Lint {
 	return out
 }
 
+// alwaysAttached are the stream labels no spec can avoid. Every
+// acquisition path fills them in when identity discovery and --label have
+// not: the hostname and the file's base name for a file, the peer address
+// and the listener name for a connection. A capture that collides with
+// one of them therefore collides on every record, which is what makes
+// L006 fatal where L005 is advisory.
+var alwaysAttached = map[string]struct{}{"host": {}, "source": {}}
+
 // identityLabels lists the label names the `identity:` rules can produce,
 // plus the two the acquisition layer always attaches.
 func (s *Spec) identityLabels() map[string]struct{} {
-	out := map[string]struct{}{"host": {}, "source": {}}
+	out := map[string]struct{}{}
+	for k := range alwaysAttached {
+		out[k] = struct{}{}
+	}
 	for i := range s.Identity {
 		r := &s.Identity[i]
 		for _, re := range []*regexp.Regexp{r.matchPath, r.regex} {
@@ -181,8 +202,20 @@ func (p *Profile) lintCaptures(streamLabels map[string]struct{}) []Lint {
 			// the store's log on the far side of the sink. It is decidable
 			// here, from the spec alone.
 			if _, ok := streamLabels[name]; ok {
+				// Fatal for the two names nothing can withhold, advisory
+				// for the rest. An `identity:` rule scoped by
+				// `match_path` does not apply to every stream, so a
+				// pattern in another profile may legitimately capture
+				// its name; `host` and `source` have no such escape --
+				// every acquisition path defaults them -- so a pattern
+				// that captures one as a field has every record it
+				// produces refused by the store.
+				code := "L005"
+				if _, always := alwaysAttached[name]; always {
+					code = "L006"
+				}
 				out = append(out, Lint{
-					Profile: p.Name, Code: "L005",
+					Profile: p.Name, Code: code,
 					Msg: fmt.Sprintf("pattern for set %q captures %q as a field, but %q is a stream label the acquisition layer attaches to every sample; the store refuses a sample that carries one name as both, so every record this pattern produces would be rejected -- declare it in `labels:` or capture it under another name",
 						pat.Set, name, name),
 				})

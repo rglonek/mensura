@@ -137,10 +137,11 @@ profiles:
 	}
 }
 
-// L005: a capture the profile does not classify as a label, whose name is
-// one the acquisition layer attaches as a stream label anyway. Every
+// L006: a capture the profile does not classify as a label, whose name is
+// one the acquisition layer *always* attaches as a stream label. Every
 // sample such a pattern produces carries the name as a label and as a
-// field, and the store refuses all of them.
+// field, and the store refuses all of them -- so it is fatal, and `check`
+// exits non-zero rather than passing a spec that can never store a row.
 func TestLintReportsACaptureThatCollidesWithAStreamLabel(t *testing.T) {
 	spec, err := Parse([]byte(`
 version: 1
@@ -161,21 +162,22 @@ profiles:
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
+	lints := spec.Lint()
 	var found *Lint
-	for i, l := range spec.Lint() {
-		if l.Code == "L005" {
-			found = &spec.Lint()[i]
+	for i, l := range lints {
+		if l.Code == "L006" {
+			found = &lints[i]
 			break
 		}
 	}
 	if found == nil {
-		t.Fatalf("no L005 for a field capture named after a stream label; findings: %v", spec.Lint())
+		t.Fatalf("no L006 for a field capture named after a stream label; findings: %v", lints)
 	}
 	if !strings.Contains(found.Msg, `"host"`) {
-		t.Fatalf("L005 must name the capture: %s", found.Msg)
+		t.Fatalf("L006 must name the capture: %s", found.Msg)
 	}
-	if found.Fatal() {
-		t.Fatal("L005 is advisory: an identity rule scoped by match_path does not apply to every stream")
+	if !found.Fatal() {
+		t.Fatal("`host` is defaulted by every acquisition path, so the collision happens on every record: the spec can never store a row and `check` must fail")
 	}
 	// Declaring it as a label is the fix, and it silences the finding.
 	fixed, err := Parse([]byte(`
@@ -197,8 +199,51 @@ profiles:
 		t.Fatalf("compile: %v", err)
 	}
 	for _, l := range fixed.Lint() {
-		if l.Code == "L005" {
-			t.Fatalf("a declared label still reports L005: %s", l)
+		if l.Code == "L005" || l.Code == "L006" {
+			t.Fatalf("a declared label still reports %s: %s", l.Code, l)
 		}
+	}
+}
+
+// L005 is the other half of the same rule and stays advisory. The name
+// here comes from an `identity:` rule scoped by `match_path`, so it is
+// not attached to every stream: a pattern in a profile that rule does not
+// apply to may legitimately capture it as a field.
+func TestLintKeepsAnIdentityLabelCollisionAdvisory(t *testing.T) {
+	spec, err := Parse([]byte(`
+version: 1
+identity:
+  - match_path: '/(?P<pool>[a-z]+)/app\.log$'
+profiles:
+  - name: p
+    timestamp:
+      formats:
+        - layout: epoch_s
+          regex: '^\d+'
+    patterns:
+      - set: app
+        search: 'req'
+        extract:
+          - 'req pool=(?P<pool>\S+) ms=(?P<ms>\d+)'
+`))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	var found *Lint
+	lints := spec.Lint()
+	for i, l := range lints {
+		if l.Code == "L005" {
+			found = &lints[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no L005 for a capture named after an identity label; findings: %v", lints)
+	}
+	if found.Fatal() {
+		t.Fatal("L005 is advisory: a match_path-scoped identity rule does not apply to every stream")
+	}
+	if Fatal(lints) {
+		t.Fatalf("an advisory finding must not fail `check`: %v", lints)
 	}
 }
