@@ -935,7 +935,7 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		// half-filled window -- and the checkpoint they pin -- until it
 		// dropped. The cadence is the question, not the answer: the
 		// profile's own idle_timeout decides what is actually due.
-		idle := time.NewTicker(remoteIdleTick(opts.IdleFlush))
+		idle := time.NewTicker(idleTick(opts.IdleFlush))
 		defer idle.Stop()
 		for {
 			select {
@@ -1053,18 +1053,6 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 		}
 	}
 	return consumed, waitErr
-}
-
-// remoteIdleTick is how often the idle question is asked. It is bounded
-// below so a very short --idle-flush cannot turn into a busy loop, and
-// asking more than once per timeout is what makes a record wait at most
-// its timeout rather than twice it.
-func remoteIdleTick(idle time.Duration) time.Duration {
-	tick := idle / 2
-	if tick < time.Second {
-		tick = time.Second
-	}
-	return tick
 }
 
 // remoteFlushIdle emits whatever the extractor has held past the

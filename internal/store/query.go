@@ -303,7 +303,33 @@ func (s *Store) resolveField(set string, fe mql.FieldExpr) resolvedField {
 		// supplies defaults only" means: a default that cancels the
 		// modifier written beside it is not a default.
 		rf.spec.ClampMin, rf.spec.ClampMax = info.LimitMin, info.LimitMax
-		rf.spec.ClampElseRaw = true
+		// And the escape hatch is installed only where it can mean
+		// anything, which is under DELTA and nowhere else.
+		//
+		// ELSE RAW substitutes the *pre-transform* sample. Stage 3 of the
+		// walk sets `val = raw` and the only stages between it and the
+		// clamp are DELTA and NEGATE -- and NEGATE has already excluded
+		// itself above -- so without DELTA, `val` and `raw` are the same
+		// number and stage 6 is provably a no-op: it replaces every
+		// out-of-range value with itself.
+		//
+		// That made the declaration inert for exactly the field kind the
+		// documentation uses as its example.
+		// 03-extraction.md section 6 declares `cpu_pct` a gauge with
+		// `limits: {min: 0, max: 100}`, and a source reporting 150 drew
+		// 150, with Explain reporting clamp_min 0 and clamp_max 100 as if
+		// the bounds were in force. A declaration the store takes,
+		// persists, reports in the plan and then does not act on is the
+		// same failure `store_stream_label:` and `on_parse_error:
+		// drop-stream` are refused for, arriving through a declaration
+		// that is correct.
+		//
+		// Under DELTA the hatch is what it was built for: a counter reset
+		// makes one difference briefly negative, and the new raw counter
+		// -- small, legitimate, interpretable -- is a better answer than
+		// the bound. Everywhere else the bound is the only answer that
+		// bounds anything.
+		rf.spec.ClampElseRaw = m.Delta
 	}
 	if known {
 		rf.meta = &wire.FieldMeta{
@@ -621,7 +647,17 @@ func (s *Store) runTimeseries(ctx context.Context, q *mql.Query, req *wire.Query
 				collapsed++
 			}
 		}
-		ser := wire.Series{Name: a.name, Labels: a.labels, Meta: a.field.meta}
+		// The three arrays are lists, never null, for the reason
+		// QueryResponse.Series and LabelValues.Values are: a series can
+		// legitimately emit nothing -- `SELECT x DELTA` over a single
+		// sample consumes it to seed the previous value -- and the JSON
+		// tags carry no omitempty, so such a series travelled as
+		// `"ts_ms": null, "values": null`. A consumer should not have to
+		// tell "no points" apart from "no array".
+		ser := wire.Series{
+			Name: a.name, Labels: a.labels, Meta: a.field.meta,
+			TSMs: []int64{}, Values: []float64{}, IsNull: []bool{},
+		}
 		for _, o := range pts {
 			ts, v, null := o.TSMs, o.Value, o.Null
 			// Screened here, at the wire boundary, and not only on the

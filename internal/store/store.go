@@ -1395,15 +1395,25 @@ func (s *Store) raiseFirstSeen(name string, floorMs int64) bool {
 // same name created afterwards silently inherited the policy of the one
 // that was deleted -- until a restart, which loaded neither, and then it
 // silently did not.
+//
+// Only a real removal moves the version, for the reason a repeated
+// declaration does not: an admin drop of a name the catalogue never held
+// changes nothing, and every client holding the old ETag would refetch a
+// catalogue that had not moved.
 func (s *Store) ForgetSet(name string) {
 	s.mu.Lock()
+	_, known := s.catalogue[name]
 	delete(s.catalogue, name)
 	s.mu.Unlock()
 	s.retentionMu.Lock()
+	_, hadRetention := s.setRetention[name]
+	_, hadShard := s.setShard[name]
 	delete(s.setRetention, name)
 	delete(s.setShard, name)
 	s.retentionMu.Unlock()
-	s.catVer.Add(1)
+	if known || hadRetention || hadShard {
+		s.catVer.Add(1)
+	}
 }
 
 // forgetAgedSet drops what a set's shards took with them -- the fields,

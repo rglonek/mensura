@@ -1853,13 +1853,23 @@ func TestRemoteStreamIdleFlushReleasesHeldBytes(t *testing.T) {
 }
 
 // The tick is bounded below, so a very short --idle-flush cannot turn the
-// watcher into a busy loop.
+// watcher into a busy loop, and it is halved so a record waits at most the
+// bound rather than twice it.
+//
+// Both followers read it. --idle-flush is one flag, and the local follower
+// used to tick at exactly its value while the remote one halved it, so the
+// same number bought a 60-second worst case on a followed file and a
+// 45-second one over SSH -- on a quiet file, this tick is also what
+// releases the checkpoint an open aggregation window is holding back.
 func TestRemoteIdleTickIsBounded(t *testing.T) {
-	if got := remoteIdleTick(time.Millisecond); got < time.Second {
-		t.Fatalf("remoteIdleTick(1ms) = %s, want at least 1s", got)
+	if got := idleTick(time.Millisecond); got < time.Second {
+		t.Fatalf("idleTick(1ms) = %s, want at least 1s", got)
 	}
-	if got := remoteIdleTick(30 * time.Second); got != 15*time.Second {
-		t.Fatalf("remoteIdleTick(30s) = %s, want 15s", got)
+	if got := idleTick(30 * time.Second); got != 15*time.Second {
+		t.Fatalf("idleTick(30s) = %s, want 15s", got)
+	}
+	if got := idleTick(defaultIdleFlush); got*2 > defaultIdleFlush {
+		t.Fatalf("idleTick(%s) = %s: a record can wait longer than the bound it was given", defaultIdleFlush, got)
 	}
 }
 

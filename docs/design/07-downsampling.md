@@ -77,7 +77,10 @@ Per raw sample, in chronological order, in exactly this sequence:
    process restarted, the operator sees the new counter value, which is small,
    legitimate and interpretable, rather than a rendering artefact. Note that it
    undoes both `DELTA` and `NEGATE` — it is a *raw*-value escape, not a partial
-   one.
+   one. With neither of those in front of it, `val` *is* `raw`, so an
+   `ELSE RAW` clamp is a no-op: that is why the default a field's declared
+   `limits:` install carries the escape only under `DELTA`
+   ([06](06-query.md) §4.3).
 7. **Rate normalisation.** With `PER SECOND`: `tr = (last - prev)/1000; if tr >
    0 { val /= tr }`. Uses raw timestamps, not window-relative ones, so the
    reported rate is the real inter-sample rate regardless of where the window
