@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -115,6 +117,18 @@ func loadConfig(path string) (*fileConfig, error) {
 		if c.Hash == "" {
 			return nil, fmt.Errorf("config %s: client %q has no hash", path, c.Name)
 		}
+		// The hash is compared byte for byte against a SHA-256 of the
+		// presented bearer token, so anything that is not 32 bytes of hex
+		// can never match. A truncated paste, a `sha256:` prefix written
+		// twice, or the *secret* pasted where the hash belongs therefore
+		// produced a credential that was loaded, reported as configured
+		// and refused every request -- 401 forever, with the only trace a
+		// WARNING per attempt on a store that looks healthy. It is
+		// decidable here, which is where every other credential mistake
+		// is decided.
+		if err := checkSecretHash(c.Hash); err != nil {
+			return nil, fmt.Errorf("config %s: client %q: %w", path, c.Name, err)
+		}
 		if len(c.Scopes) == 0 {
 			return nil, fmt.Errorf("config %s: client %q has no scopes; it could not do anything", path, c.Name)
 		}
@@ -125,6 +139,18 @@ func loadConfig(path string) (*fileConfig, error) {
 				return nil, fmt.Errorf("config %s: client %q has unknown scope %q (write, query or admin)", path, c.Name, sc)
 			}
 		}
+	}
+	// Bearer mode with nothing to authenticate is a store no client can
+	// reach. authorise() walks an empty client list and answers "not
+	// authorised" to every request, so the write API returns 401 to every
+	// batch -- which wire.Client classifies as an auth failure, so the
+	// ingest sink holds its buffer, retries every 30 seconds and never
+	// makes progress, while the store's log fills with one WARNING per
+	// attempt and its own startup said nothing was wrong. It is the same
+	// class of mistake as `auth.mode: none` on a routable address, caught
+	// at the same moment.
+	if cfg.Auth.Mode == "bearer" && len(cfg.Auth.Clients) == 0 {
+		return nil, fmt.Errorf("config %s: auth.mode is bearer but no auth.clients are configured; every request would be refused as unauthorised", path)
 	}
 	if cfg.Limits.MaxConcurrentRequests != nil {
 		return nil, fmt.Errorf("config %s: limits.max_concurrent_requests is not implemented; use max_concurrent_writes for the write API and max_concurrent_jobs for queries", path)
@@ -151,6 +177,20 @@ func loadConfig(path string) (*fileConfig, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// checkSecretHash holds a configured credential to the shape
+// HashSecret produces: the optional "sha256:" prefix this file's own
+// examples use, then 64 hex characters.
+func checkSecretHash(h string) error {
+	body := strings.TrimPrefix(h, "sha256:")
+	if len(body) != 2*sha256.Size {
+		return fmt.Errorf("hash is %d characters; it must be the %d-character SHA-256 that `mensura-store hash-secret` prints, optionally prefixed with \"sha256:\"", len(body), 2*sha256.Size)
+	}
+	if _, err := hex.DecodeString(strings.ToLower(body)); err != nil {
+		return fmt.Errorf("hash is not hexadecimal; it must be what `mensura-store hash-secret` prints, not the secret itself")
+	}
+	return nil
 }
 
 func (c *fileConfig) toStoreConfig() (store.Config, error) {

@@ -2,15 +2,26 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
 	"time"
 
+	"github.com/rglonek/mensura/internal/engine"
 	"github.com/rglonek/mensura/internal/store"
 	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
 )
+
+// ErrNoLocalEngine is what a proxy-mode datasource answers for the
+// resources only an embedded engine can serve.
+//
+// The store's plan endpoint lives on its loopback-only debug listener
+// (--listen-debug), which by construction no proxy can reach, so
+// forwarding is not an option -- and inventing a plan on this side would
+// describe a query planner that is not the one running the query.
+var ErrNoLocalEngine = errors.New("this datasource proxies to a remote store, so it has no local engine to ask for a plan; run the store in mode: plugin, or query its loopback debug listener directly")
 
 // localService is the embedded implementation: the query engine is a
 // function call away and the LSM iterator runs in this process.
@@ -39,6 +50,15 @@ func (l *localService) Hello(context.Context) (wire.Hello, error) {
 		MaxDataPointsReceived: cfg.MaxDataPointsReceived,
 	}, nil
 }
+
+func (l *localService) Explain(_ context.Context, req *wire.QueryRequest) (map[string]any, error) {
+	if req == nil || req.AST == nil {
+		return nil, fmt.Errorf("explain needs an AST")
+	}
+	return l.store.Explain(req.AST, req)
+}
+
+func (l *localService) EngineStats() (engine.StatsSnapshot, bool) { return l.store.Stats(), true }
 
 func (l *localService) Parse(_ context.Context, text string) (*mql.Query, []mql.Diag, error) {
 	// ParseDiags carries the diagnostics that only the text has: the
@@ -104,6 +124,14 @@ func (r *remoteService) Catalogue(ctx context.Context) (wire.Catalogue, error) {
 	r.cat, r.catAt, r.catOK = cat, time.Now(), true
 	r.mu.Unlock()
 	return cat, nil
+}
+
+func (r *remoteService) Explain(context.Context, *wire.QueryRequest) (map[string]any, error) {
+	return nil, ErrNoLocalEngine
+}
+
+func (r *remoteService) EngineStats() (engine.StatsSnapshot, bool) {
+	return engine.StatsSnapshot{}, false
 }
 
 func (r *remoteService) LabelValues(ctx context.Context, key string) ([]string, error) {

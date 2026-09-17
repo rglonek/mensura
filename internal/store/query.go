@@ -1442,14 +1442,34 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 	if err != nil {
 		return nil, err
 	}
+	// A tabular format runs no render walk at all, so the modifiers
+	// below describe stages that do not execute.
+	//
+	// Validate already refuses an *explicit* DELTA, NEGATE, CLAMP, GAP or
+	// SSE under FORMAT table or logs (E008), but resolveField installs
+	// the catalogue's own defaults whatever the format asks for: a
+	// declared `max_interval` became gap_ms and a declared `limits:` pair
+	// became clamp_min/clamp_max. Explain then reported a clamp and a gap
+	// on a table query that applies neither -- the same lie
+	// downsample_window was zeroed here to stop telling, on the fields
+	// beside it. REQUIRED is the one modifier that really is part of a
+	// tabular plan: it becomes an existence predicate on the scan.
+	tabular := q.Format == mql.FormatTable || q.Format == mql.FormatLogs
 	fields := make([]map[string]any, 0, len(p.fields))
 	for _, f := range p.fields {
 		out := map[string]any{
-			"field": f.name, "as": f.label,
-			"delta": f.spec.Delta, "per_second": f.spec.PerSecond, "negate": f.spec.Negate,
-			"gap_ms": f.spec.GapMs, "clamp_else_raw": f.spec.ClampElseRaw,
-			"sse": sseName(f.spec.SSE), "required": f.required,
+			"field": f.name, "as": f.label, "required": f.required,
 		}
+		if tabular {
+			fields = append(fields, out)
+			continue
+		}
+		out["delta"] = f.spec.Delta
+		out["per_second"] = f.spec.PerSecond
+		out["negate"] = f.spec.Negate
+		out["gap_ms"] = f.spec.GapMs
+		out["clamp_else_raw"] = f.spec.ClampElseRaw
+		out["sse"] = sseName(f.spec.SSE)
 		// The bounds themselves, not only the escape hatch flag.
 		//
 		// resolveField's contract is that "the resolved result is what

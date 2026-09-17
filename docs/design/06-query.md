@@ -292,6 +292,17 @@ read plus an optional filter scan. The filter scan is bounded by the same two
 size gates as a graph (§9): it walks every set carrying the label across the
 whole range, and a dashboard refreshes its variables on every load.
 
+Each form reads a fixed handful of the AST's fields and nothing else:
+`FIELDS` and `LABEL KEYS` read `FROM`, `LABELS` reads the label key and
+`WHERE`, and `SETS` reads neither. The text grammar cannot express any
+other clause on them, and a hand-authored AST that carries one is refused
+(`E008`) rather than having it dropped — an ignored clause would both do
+nothing and stop the AST round-tripping through its own canonical text
+(§2). `LABELS` in particular is store-wide, because there is one
+label-value dictionary per key for the whole store
+([05](05-storage.md) §8, ADR-004): a `FROM` on it has no meaning, and
+`WHERE` is the clause that scopes it.
+
 ## 6. Histograms and heatmaps
 
 A bucket set declared at ingest ([03-extraction.md §8](03-extraction.md)) is

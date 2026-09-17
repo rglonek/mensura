@@ -1609,14 +1609,24 @@ func (s *Store) Catalogue() wire.Catalogue {
 	// race the runtime tolerates -- it is a fatal error that takes the
 	// process down, and in plugin mode that process owns the data
 	// directory.
+	// Lists, never null. Neither `sets` nor `labels` carries omitempty,
+	// so a store with no sets answered `"sets": null` and a set that
+	// carries no label key answered `"labels": null` -- and the plugin's
+	// own GET /labels resource hands that straight to the query builder,
+	// which then has to tell "no such set" apart from "no labels" by
+	// distinguishing null from []. Every other list in this API was
+	// changed for exactly that reason: QueryResponse.Series, and
+	// LabelValues.Values on the endpoint beside this one.
 	out := wire.Catalogue{
 		Version:   s.catVer.Load(),
+		Sets:      []wire.SetInfo{},
 		Conflicts: append([]wire.CatalogueConflict(nil), s.conflicts...),
 	}
 	for name, e := range s.catalogue {
 		info := wire.SetInfo{
 			Name:      name,
 			Fields:    map[string]mql.FieldInfo{},
+			Labels:    []string{},
 			FirstTSMs: e.FirstTSMs,
 			LastTSMs:  e.LastTSMs,
 			Shards:    shards[name],

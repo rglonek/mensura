@@ -17,6 +17,7 @@ import (
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/rglonek/mensura/internal/engine"
 	"github.com/rglonek/mensura/internal/store"
 	"github.com/rglonek/mensura/pkg/mql"
 	"github.com/rglonek/mensura/pkg/wire"
@@ -30,6 +31,15 @@ type QueryService interface {
 	LabelValues(ctx context.Context, key string) ([]string, error)
 	Hello(ctx context.Context) (wire.Hello, error)
 	Parse(ctx context.Context, text string) (*mql.Query, []mql.Diag, error)
+	// Explain backs the builder's "explain" resource, which
+	// docs/design/08-plugin.md section 2.3 lists beside parse and print.
+	// It was the one resource in that table with no implementation, so
+	// the builder's Explain button answered "unknown resource explain".
+	Explain(ctx context.Context, req *wire.QueryRequest) (map[string]any, error)
+	// EngineStats reports the embedded engine's own numbers, and false
+	// where there is no embedded engine to ask. Section 2.2 says
+	// CheckHealth includes them in embedded mode.
+	EngineStats() (engine.StatsSnapshot, bool)
 }
 
 // Datasource implements the Grafana backend handlers.
@@ -317,7 +327,32 @@ func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequ
 	default:
 		msg += ", no data yet"
 	}
+	// The embedded engine's own numbers, which 08-plugin.md section 2.2
+	// says this check reports and which it never did. Both answer a
+	// question the set list cannot: how much disk the store is actually
+	// holding, and whether iterators are accumulating -- a rising count
+	// is what stops the LSM reclaiming the space a retention sweep just
+	// freed. A proxy-mode datasource has no engine to ask and says
+	// nothing rather than reporting zeroes that look like an idle store.
+	if st, ok := d.svc.EngineStats(); ok {
+		msg += fmt.Sprintf("; %s on disk, %d open iterator(s)", humanBytes(st.DiskBytes), st.OpenIterators)
+	}
 	return &backend.CheckHealthResult{Status: backend.HealthStatusOk, Message: msg}, nil
+}
+
+// humanBytes renders a byte count for a health message, where an exact
+// figure is less useful than one an operator can read at a glance.
+func humanBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for m := n / unit; m >= unit && exp < 4; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTP"[exp])
 }
 
 // CallResource backs the query builder: sets, fields, labels, values, and
@@ -390,6 +425,31 @@ func (d *Datasource) CallResource(ctx context.Context, req *backend.CallResource
 			return send(http.StatusOK, map[string]any{"error": err.Error()})
 		}
 		return send(http.StatusOK, map[string]any{"ast": ast, "warnings": warns})
+	case "explain":
+		// The plan, from the same planner that runs the query. It is
+		// listed beside parse and print in 08-plugin.md section 2.3 and
+		// was the one entry in that table with nothing behind it, so the
+		// builder's Explain button answered 404 "unknown resource
+		// explain" -- which reads as a broken datasource rather than as
+		// a feature that was never built.
+		var explainReq wire.QueryRequest
+		if err := json.Unmarshal(req.Body, &explainReq); err != nil {
+			return send(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if explainReq.AST == nil {
+			return send(http.StatusBadRequest, map[string]string{"error": "no AST supplied"})
+		}
+		// Bounded exactly as print is: Explain walks the predicate
+		// through the planner's own lowering, which is recursive over
+		// the same shape.
+		if err := mql.CheckPredicateDepth(explainReq.AST); err != nil {
+			return send(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		plan, err := d.svc.Explain(ctx, &explainReq)
+		if err != nil {
+			return send(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return send(http.StatusOK, plan)
 	case "print":
 		var q mql.Query
 		if err := json.Unmarshal(req.Body, &q); err != nil {

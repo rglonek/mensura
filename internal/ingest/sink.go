@@ -718,18 +718,60 @@ func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
 
 // sampleBytes estimates what one sample costs in the request body. An
 // estimate on purpose: marshalling everything twice to find out exactly
-// would cost more than the bound saves.
+// would cost more than the bound saves -- but it has to be an *upper*
+// bound, because it is the only thing standing between a buffer and a
+// body the store answers 413 to.
+//
+// Every piece of text is measured as it will be encoded, not as it is
+// held. It used to be measured raw, and encoding/json escapes far more
+// than a reader expects: a quote, a backslash or a tab costs two bytes,
+// and a control byte -- or one of '<', '>', '&', which the default
+// encoder escapes for HTML safety -- costs six. A `kind: string` field is
+// a whole log line, so URLs, quoted paths and JSON-in-a-log are the
+// ordinary case rather than the pathological one: a 4 KiB message of
+// quotes was charged 4 KiB and encoded to 8 KiB, and one of control
+// bytes encodes to 24 KiB.
+//
+// The direction is what matters. Under-counting lets one take exceed
+// BatchBytes, and an operator following this flag's own advice --
+// "--batch-bytes ... must stay under the store's max_request_bytes" --
+// then presents a body past that limit. The store answers 413, which
+// wire.Client classifies as fatal, so the sink drops the whole batch,
+// reports it to the delivery observers as a hole, and every followed
+// file's checkpoint freezes behind it. That is the exact failure
+// BatchBytes was added to prevent.
 func sampleBytes(s *model.Sample) int {
-	n := 48 + len(s.KeyHint)
+	n := 48 + jsonStringBytes(s.KeyHint)
 	for k, v := range s.Labels {
-		n += len(k) + len(v) + 8
+		n += jsonStringBytes(k) + jsonStringBytes(v) + 8
 	}
 	for k, v := range s.Fields {
-		n += len(k) + 14
+		n += jsonStringBytes(k) + 14
 		if v.T == model.TypeString {
-			n += len(v.S) + 2
+			n += jsonStringBytes(v.S) + 2
 		} else {
 			n += 20
+		}
+	}
+	return n
+}
+
+// jsonStringBytes is how many bytes s occupies inside a JSON string
+// literal, excluding the surrounding quotes.
+//
+// It mirrors encoding/json's own escaping rules rather than restating a
+// guess: the five short escapes, the \u00XX form for every other control
+// byte, and the HTML-safety escapes for '<', '>' and '&' that
+// json.Marshal applies unless a decoder is told otherwise. A byte that is
+// none of those costs itself.
+func jsonStringBytes(s string) int {
+	n := len(s)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"', c == '\\', c == '\n', c == '\r', c == '\t':
+			n++ // one backslash
+		case c < 0x20, c == '<', c == '>', c == '&':
+			n += 5 // \u00XX
 		}
 	}
 	return n
