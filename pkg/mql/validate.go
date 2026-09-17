@@ -62,6 +62,22 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	default:
 		return nil, Diag{"E008", fmt.Sprintf("unknown query kind %q: expected query, sets, fields, labels or label_keys", q.Kind)}
 	}
+	// A clause the kind does not read is refused rather than dropped.
+	//
+	// The auxiliary forms each read a fixed handful of fields -- FIELDS
+	// and LABEL KEYS read FROM, LABELS reads the label key and WHERE,
+	// SETS reads nothing -- and the executor ignores everything else,
+	// while Print emits only what the grammar has a place for. So
+	// {"kind":"fields","from":"app","where":{...},"by":["host"]}
+	// validated clean, answered with every field of the set, and printed
+	// back as `FIELDS FROM app`: the clauses silently did nothing *and*
+	// the AST stopped round-tripping through its own canonical text,
+	// which is the property every other empty-node and empty-list
+	// refusal in this file exists to keep. The data-query form reads all
+	// of them, so nothing there changes.
+	if err := checkUnusedClauses(q); err != nil {
+		return nil, err
+	}
 	if q.Kind == KindSets {
 		return nil, nil
 	}
@@ -347,6 +363,66 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		}
 	}
 	return warns, nil
+}
+
+// checkUnusedClauses names a clause an auxiliary query kind carries and
+// does not read.
+//
+// The Kind and Format that Query.MarshalJSON fills in are not clauses:
+// every AST that has been through JSON carries `"format":"timeseries"`
+// whatever its kind, so only a format that is neither absent nor the
+// default counts as written.
+func checkUnusedClauses(q *Query) error {
+	if q.Kind == "" || q.Kind == KindQuery {
+		return nil
+	}
+	reads := map[Kind]string{
+		KindSets:      "SETS takes no other clause",
+		KindFields:    "FIELDS reads FROM and nothing else",
+		KindLabelKeys: "LABEL KEYS reads FROM and nothing else",
+		KindLabels:    "LABELS reads the label key and WHERE, and nothing else",
+	}
+	refuse := func(clause string) error {
+		return Diag{"E008", fmt.Sprintf(
+			"a %s query carries %s, which nothing reads and which Print does not emit, so the clause silently does nothing and the query does not survive a round trip through its own text; %s",
+			q.Kind, clause, reads[q.Kind])}
+	}
+	if q.From != "" && q.Kind != KindFields && q.Kind != KindLabelKeys {
+		if q.Kind == KindLabels {
+			// Worth its own sentence: scoping a variable query to a set
+			// is the plausible mistake, and the answer is a clause that
+			// really does scope it.
+			return Diag{"E008", fmt.Sprintf(
+				"a LABELS query carries FROM %q, which nothing reads: there is one label-value dictionary per key for the whole store, so LABELS is store-wide -- write `LABELS %s WHERE ...` to scope it to the rows a predicate matches",
+				q.From, q.Label)}
+		}
+		return refuse("FROM " + q.From)
+	}
+	if q.Label != "" && q.Kind != KindLabels {
+		return refuse("a label key")
+	}
+	if len(q.Select) > 0 {
+		return refuse("SELECT")
+	}
+	if !q.Where.Empty() && q.Kind != KindLabels {
+		return refuse("WHERE")
+	}
+	if len(q.By) > 0 {
+		return refuse("BY")
+	}
+	if q.EveryMs != nil {
+		return refuse("EVERY")
+	}
+	if q.Format != "" && q.Format != FormatTimeseries {
+		return refuse("FORMAT " + string(q.Format))
+	}
+	if q.Limits.Series != nil {
+		return refuse("LIMIT SERIES")
+	}
+	if q.Limits.Points != nil {
+		return refuse("LIMIT POINTS")
+	}
+	return nil
 }
 
 // modifierNames lists the per-field modifiers an expression carries, in

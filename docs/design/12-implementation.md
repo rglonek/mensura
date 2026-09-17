@@ -3677,6 +3677,135 @@ client that repeats its declarations pays it per request.
 the catalogue never held moved the version too. Both now compare first,
 and a set this call creates still counts as a change.
 
+### 6.174 The batch-size bound that under-counted its own body
+
+`SinkConfig.BatchBytes` exists because a buffer that filled during a
+store outage used to go out as one body, and a body past the store's
+`max_request_bytes` comes back 413 — a status `wire.Client` classifies as
+fatal, so the sink drops the whole batch, reports it to the delivery
+observers as a hole, and every followed file's checkpoint freezes behind
+it (§6.86). `takeLocked` charges each sample against the budget through
+`sampleBytes`, which is an estimate on purpose: marshalling twice to find
+out exactly would cost more than the bound saves.
+
+An estimate is fine. An estimate that can come out *under* the truth is
+not, because this is the only thing standing between a backlog and that
+413. `sampleBytes` measured every string raw, and `encoding/json` escapes
+far more than a reader expects: a quote, a backslash, a newline or a tab
+costs two bytes, and a control byte — or one of `<`, `>`, `&`, which the
+default encoder escapes for HTML safety — costs six.
+
+A `kind: string` field is a whole log line, so quoted paths, URLs and
+JSON-inside-a-log are the ordinary case rather than the pathological one.
+A 4 KiB message of quotes was charged 4 KiB and encoded to 8 KiB; one of
+control bytes encodes to 24 KiB. So an operator following the flag's own
+advice — `--batch-bytes` "must stay under the store's
+`max_request_bytes`" — could still present a body several times past it,
+and the failure the bound was added to prevent happened anyway, on
+exactly the field kind that makes it likely.
+
+Every piece of text is now measured as it will be encoded, through
+`jsonStringBytes`, which mirrors `encoding/json`'s own escaping rules
+rather than restating a guess.
+
+### 6.175 A bearer store nothing could authenticate to
+
+`auth.mode: bearer` with no `auth.clients` starts cleanly. `authorise`
+then walks an empty list and answers "not authorised" to every request,
+so the write API returns 401 to every batch — which `wire.Client`
+classifies as an auth failure, so the ingest sink requeues rather than
+drops, holds delivery for 30 seconds, and retries forever. The store
+looks healthy, the ingester makes no progress, and the only trace is one
+WARNING per attempt in the store's log.
+
+A credential whose `hash:` is not 32 bytes of hex has the same shape and
+the same outcome: it is compared byte for byte against the SHA-256 of the
+presented token, so a truncated paste, a doubled `sha256:` prefix, or the
+*secret* pasted where the hash belongs can never match. Both are
+decidable at startup, which is where the inline-secret refusal and the
+loopback posture check already live, so `loadConfig` now decides them
+there and names the client.
+
+### 6.176 Explain reported render stages a tabular query does not run
+
+`runTabular` does no downsampling and no render walk at all, which is why
+`Explain` already reports `downsample_window: 0` for `FORMAT table` and
+`FORMAT logs` — "Explain may not report a plan that is not the plan"
+(§6.117). The resolved fields beside that number were still reporting the
+whole render spec.
+
+`Validate` refuses an *explicit* `DELTA`, `NEGATE`, `CLAMP`, `GAP` or
+`SSE` under those formats (E008), so this was not about what the query
+asked for. `resolveField` installs the *catalogue's* defaults whatever
+the format is: a declared `max_interval` becomes `gap_ms`, and a declared
+`limits:` pair becomes `clamp_min`/`clamp_max` with the counter-reset
+escape hatch (§6.168, §6.169). So a table query over a field with
+ordinary metadata explained as a clamped, gap-detected series and drew
+neither. `REQUIRED` is the one modifier that really is part of a tabular
+plan — it becomes an existence predicate on the scan — so it is still
+reported, with the field and its display name.
+
+### 6.177 Clauses an auxiliary query kind does not read
+
+`SETS`, `FIELDS`, `LABEL KEYS` and `LABELS` each read a fixed handful of
+fields: `FIELDS` and `LABEL KEYS` read `FROM`, `LABELS` reads the label
+key and `WHERE`, `SETS` reads nothing. The executor ignores everything
+else and `Print` emits only what the grammar has a place for, so
+`{"kind":"fields","from":"app","where":{…},"by":["host"]}` validated
+clean, answered with every field of the set, and printed back as
+`FIELDS FROM app`.
+
+That is two failures at once, and this package has fixed both before:
+a clause that is accepted and silently does nothing (the `LABELS … WHERE`
+predicate, §6.39), and an AST that does not survive a round trip through
+its own canonical text (the empty `IN` list, the empty predicate node,
+the empty label). `Validate` now refuses such a clause as E008 and names
+it. A `FROM` on a `LABELS` query gets its own sentence, because scoping a
+variable query to a set is the plausible mistake and there is one
+dictionary per label key for the whole store (ADR-004): the clause that
+really does scope it is `WHERE`.
+
+The `Kind` and `Format` that `Query.MarshalJSON` fills in are not
+clauses. Every AST that has been through JSON carries
+`"format":"timeseries"` whatever its kind, so only a format that is
+neither absent nor the default counts as written.
+
+### 6.178 `sets` and `labels` travelled as null
+
+Neither `Catalogue.Sets` nor `SetInfo.Labels` carries `omitempty`, and
+`Catalogue()` left both slices nil when there was nothing to put in them.
+So a fresh store answered `"sets": null` and a set carrying no label key
+answered `"labels": null` — and the plugin's own `GET /labels` resource
+hands that straight to the query builder, which then has to tell "no such
+set" apart from "no labels" by distinguishing null from `[]`.
+
+Every other list in this API was changed for the same reason:
+`QueryResponse.Series` (§6.71) and `LabelValues.Values` (§6.100), the
+latter on the endpoint beside this one. A list is a list.
+
+### 6.179 The plugin resources the documentation promised
+
+[08](08-plugin.md) §2.3 lists `POST /explain` beside `parse` and `print`.
+`CallResource` had no case for it, so the builder's Explain button
+answered 404 "unknown resource explain", which reads as a broken
+datasource rather than as a feature that was never built. It now takes
+the same body a query does — a `wire.QueryRequest` carrying the AST and
+the panel's range — bounds the predicate exactly as `print` does, and
+answers with what `Store.Explain` produces.
+
+A proxy-mode datasource cannot serve it: the store's own plan endpoint
+lives on its loopback-only debug listener, which by construction no proxy
+can reach, and building a plan on this side would describe a planner that
+is not the one running the query. It answers `ErrNoLocalEngine`, which
+says exactly that.
+
+§2.2 says `CheckHealth` reports the engine's disk usage and open iterator
+count in embedded mode. It never did. Both answer a question the set list
+cannot — how much disk the store is actually holding, and whether
+iterators are accumulating, which is what stops the LSM reclaiming the
+space a retention sweep just freed. A proxy says nothing rather than
+reporting zeroes that read like an idle store.
+
 
 ## 7. Known gaps worth naming
 
@@ -3700,6 +3829,15 @@ and a set this call creates still counts as a change.
   console line and the `_mensura_ingest` set are the whole of its
   telemetry — which is also the one telemetry path that stops working
   when the store is unreachable.
+- **`GET /label-values?filter=` is not built.** [08](08-plugin.md) §2.3
+  described the builder's value list as "optionally filtered". The
+  resource reads `key` and nothing else, so a filter would have been
+  accepted and dropped — the failure `LABELS … WHERE` was itself fixed
+  for. Filtering needs a predicate *and* a time range, because the
+  filtered form is a scan of the matching rows rather than a dictionary
+  read, and a resource call carries neither; `LABELS <key> WHERE …` on
+  the query API is the built form. The parameter has been removed from
+  the table rather than left reading as a feature.
 - **No frontend.** The plugin backend answers Grafana correctly, but until the
   React editor exists a panel must carry the AST in its query model. The
   backend's `parse`/`print` resources exist precisely so the frontend never

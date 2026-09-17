@@ -77,10 +77,22 @@ in the backend with `ETag`/`catalogue_version` revalidation:
 | `GET /sets` | Set names, row counts, time coverage |
 | `GET /fields?set=` | Fields with kind, unit, description, `max_interval`, limits, bucket-set membership, staleness |
 | `GET /labels?set=` | Label keys present on the set |
-| `GET /label-values?key=&filter=` | Dictionary values, optionally filtered |
+| `GET /label-values?key=` | Dictionary values |
 | `POST /parse` | MQL text → AST, or parse errors with positions |
 | `POST /print` | AST → canonical MQL text |
-| `POST /explain` | Plan summary: shards, index range, pushdown expression, projection |
+| `POST /explain` | Plan summary: shards, pushdown projection, resolved fields, downsample window (embedded mode only) |
+
+`/explain` takes the same body as a query — a `wire.QueryRequest` carrying
+the AST and the panel's range — and answers with what `Store.Explain`
+produces. A proxy-mode datasource has no local engine to ask and the
+store's own plan endpoint lives on its loopback-only debug listener
+(`--listen-debug`), which by construction no proxy can reach, so it
+answers with that rather than inventing a plan on this side.
+
+The `filter=` parameter `/label-values` used to be described with is not
+built; it is named in [12](12-implementation.md) §7. `LABELS <key> WHERE …` on
+the query API is the filtered form, and it needs a time range that a
+resource call does not carry.
 
 `/parse` and `/print` living in the backend is what keeps the two
 representations honest: there is one parser, in Go, and the frontend never
