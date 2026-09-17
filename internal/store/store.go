@@ -75,6 +75,29 @@ type Config struct {
 	// refused, by name, the way an over-cardinality value already is.
 	MaxLabelKeys int
 
+	// MaxSets and MaxFieldsPerSet bound the catalogue, which is the last
+	// dimension of client-chosen cardinality that nothing capped.
+	//
+	// MaxLabelKeys and MaxLabelCardinality exist because a label key and
+	// a label value are named by the sender and are never reclaimed. A
+	// *set* name and a *field* name are named by the sender too -- the
+	// line protocol, /ingest/v1/samples and /v1/write all let a client
+	// choose both -- and the catalogue that records them is held in
+	// memory and persisted as a single JSON record, exactly like the
+	// dictionaries. So one sender putting a request id in its set name,
+	// or a field name derived from a log line, grew the store's
+	// footprint and the size of every catalogue save without limit,
+	// while the two budgets beside it watched numbers that never moved.
+	//
+	// Both are refused by name and only for a *new* entry, which is the
+	// rule the label budgets already follow: a set or a field the
+	// catalogue already holds always works. The defaults are far past
+	// anything these documents describe -- the widest declared bucket set
+	// is 4096 columns and the worked examples have a handful of sets --
+	// and a negative value switches the gate off.
+	MaxSets         int
+	MaxFieldsPerSet int
+
 	// MaxConcurrentJobs bounds how many queries may execute at once. A
 	// query buffers its series in memory, so an unbounded number of them
 	// is an unbounded memory footprint.
@@ -95,6 +118,8 @@ func DefaultConfig() Config {
 		MaxDataPointsReceived: 34_560_000,
 		MaxLabelCardinality:   100_000,
 		MaxLabelKeys:          1000,
+		MaxSets:               10_000,
+		MaxFieldsPerSet:       10_000,
 		MaxConcurrentJobs:     8,
 		Logger:                log.New(os.Stderr, "mensura-store ", log.LstdFlags),
 	}
@@ -338,6 +363,12 @@ func Open(cfg Config) (*Store, error) {
 	}
 	if cfg.MaxLabelKeys == 0 {
 		cfg.MaxLabelKeys = DefaultConfig().MaxLabelKeys
+	}
+	if cfg.MaxSets == 0 {
+		cfg.MaxSets = DefaultConfig().MaxSets
+	}
+	if cfg.MaxFieldsPerSet == 0 {
+		cfg.MaxFieldsPerSet = DefaultConfig().MaxFieldsPerSet
 	}
 	opts := engine.DefaultOptions()
 	opts.Path = cfg.DataDir

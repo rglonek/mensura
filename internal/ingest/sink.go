@@ -686,6 +686,11 @@ func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
 			delete(s.buffers, set)
 			continue
 		}
+		// The envelope this set's samples travel inside is part of the
+		// body too, and nothing counted it: a flush spanning many sets
+		// paid for every {"set":"…","samples":[]} out of the same budget
+		// that was supposed to bound the whole request.
+		size += batchFixedBytes + jsonStringBytes(set)
 		n := 0
 		for n < len(samples) {
 			sz := sampleBytes(&samples[n])
@@ -716,11 +721,51 @@ func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
 	return batches, taken, s.pending > 0
 }
 
-// sampleBytes estimates what one sample costs in the request body. An
-// estimate on purpose: marshalling everything twice to find out exactly
-// would cost more than the bound saves -- but it has to be an *upper*
-// bound, because it is the only thing standing between a buffer and a
-// body the store answers 413 to.
+// Per-sample and per-batch JSON overheads, each counted as the encoder
+// will actually emit them.
+//
+// They are spelled out rather than rolled into one constant because the
+// constant was wrong. The old figure was a flat 48 bytes per sample, and
+// the fixed part of a sample alone is
+//
+//	{"ts_ms":<20>,"labels":{},"fields":{},"key_hint":""},
+//
+// which is 69 -- so the estimate was 21 bytes short before a single
+// label or field was counted, and a numeric field could take it one
+// further (see numericValueBytes). An under-count is the one direction
+// this may not err in: it lets a take exceed BatchBytes, and an operator
+// following the flag's own advice ("--batch-bytes ... must stay under
+// the store's max_request_bytes") then presents a body past that limit.
+// The store answers 413, which wire.Client classifies as fatal, so the
+// sink drops the whole batch, reports it to the delivery observers as a
+// hole, and every followed file's checkpoint freezes behind it. That is
+// the exact failure BatchBytes was added to prevent.
+const (
+	// {"ts_ms":<up to 20 characters of int64>} plus the comma that
+	// separates this sample from the next one in the array.
+	sampleFixedBytes = 9 + 20 + 1 + 1
+	// ,"labels":{} and ,"fields":{}, each counted only when present.
+	sampleMapBytes = 12
+	// ,"key_hint":"" around the hint itself.
+	sampleKeyHintBytes = 14
+	// "k":"v", around one label pair.
+	labelPairBytes = 6
+	// "k":{"i":…}, around one field.
+	fieldPairBytes = 10
+	// The longest literal encoding/json emits for a float64. It formats
+	// with 'f' between 1e-6 and 1e21 and with 'e' outside that, and the
+	// widest of the two is a negative value just above 1e-6:
+	// -0.0000012345678901234567 is 25 characters, against 24 for
+	// -1.2345678901234567e+308. int64 needs 20 and a bool 5.
+	numericValueBytes = 25
+	// {"set":"…","samples":[]}, around one set's samples.
+	batchFixedBytes = 24
+)
+
+// sampleBytes is an upper bound on what one sample costs in the request
+// body. A bound rather than a measurement on purpose: marshalling
+// everything twice to find out exactly would cost more than the bound
+// saves.
 //
 // Every piece of text is measured as it will be encoded, not as it is
 // held. It used to be measured raw, and encoding/json escapes far more
@@ -731,26 +776,26 @@ func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
 // ordinary case rather than the pathological one: a 4 KiB message of
 // quotes was charged 4 KiB and encoded to 8 KiB, and one of control
 // bytes encodes to 24 KiB.
-//
-// The direction is what matters. Under-counting lets one take exceed
-// BatchBytes, and an operator following this flag's own advice --
-// "--batch-bytes ... must stay under the store's max_request_bytes" --
-// then presents a body past that limit. The store answers 413, which
-// wire.Client classifies as fatal, so the sink drops the whole batch,
-// reports it to the delivery observers as a hole, and every followed
-// file's checkpoint freezes behind it. That is the exact failure
-// BatchBytes was added to prevent.
 func sampleBytes(s *model.Sample) int {
-	n := 48 + jsonStringBytes(s.KeyHint)
+	n := sampleFixedBytes
+	if len(s.Labels) > 0 {
+		n += sampleMapBytes
+	}
+	// A sample with no fields never reaches a buffer -- the store refuses
+	// one -- but the object is emitted whatever it holds.
+	n += sampleMapBytes
+	if s.KeyHint != "" {
+		n += sampleKeyHintBytes + jsonStringBytes(s.KeyHint)
+	}
 	for k, v := range s.Labels {
-		n += jsonStringBytes(k) + jsonStringBytes(v) + 8
+		n += jsonStringBytes(k) + jsonStringBytes(v) + labelPairBytes
 	}
 	for k, v := range s.Fields {
-		n += jsonStringBytes(k) + 14
+		n += jsonStringBytes(k) + fieldPairBytes
 		if v.T == model.TypeString {
 			n += jsonStringBytes(v.S) + 2
 		} else {
-			n += 20
+			n += numericValueBytes
 		}
 	}
 	return n

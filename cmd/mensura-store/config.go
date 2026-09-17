@@ -54,6 +54,11 @@ type fileConfig struct {
 		// MaxLabelKeys bounds the distinct label *names* the store will
 		// intern; max_label_cardinality bounds the values under each one.
 		MaxLabelKeys int `yaml:"max_label_keys"`
+		// MaxSets and MaxFieldsPerSet bound the catalogue itself, which
+		// is the other thing a sender names and the store never
+		// reclaims. Negative disables, as it does above.
+		MaxSets         int `yaml:"max_sets"`
+		MaxFieldsPerSet int `yaml:"max_fields_per_set"`
 
 		// Accepted by the decoder only so they can be refused by name.
 		// Neither is implemented, and KnownFields(true) reported them as
@@ -218,6 +223,12 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 		// other gate here is switched off, and Open reads zero as
 		// "unset, use the default".
 		sc.MaxLabelKeys = c.Limits.MaxLabelKeys
+	}
+	if c.Limits.MaxSets != 0 {
+		sc.MaxSets = c.Limits.MaxSets
+	}
+	if c.Limits.MaxFieldsPerSet != 0 {
+		sc.MaxFieldsPerSet = c.Limits.MaxFieldsPerSet
 	}
 	if c.Limits.MaxConcurrentJobs > 0 {
 		sc.MaxConcurrentJobs = c.Limits.MaxConcurrentJobs

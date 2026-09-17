@@ -450,6 +450,17 @@ wall-clock timeout in follow mode), and emit one sample carrying the accumulated
 field plus the labels of the accumulator. `mode: increment` adds one per record
 (the `(repeated: N)` case uses `mode: sum` with the parsed count).
 
+The accumulated field is the *only* column the sample carries. A window has
+one value for it and no single value for anything else the records held, so
+another field the same pattern captures is discarded rather than taken from
+whichever record opened the window — which is what used to happen, and drew
+a plausible per-window series of numbers nothing had aggregated
+([12-implementation.md §6.180](12-implementation.md)). The labels are
+different: they are the sample's identity, so they have to be *some* value,
+and the only one available is the opening record's. `check` reports both
+halves as `L007`: the fields an aggregating pattern captures and loses, and
+the labels it captures that are not among its `on:` keys.
+
 An accumulator is identified by the destination set, the `field` it writes,
 the `mode` it writes it with, and the `on` tuple. Two patterns therefore share
 a window only when they declare the same column with the same semantics —
@@ -465,7 +476,7 @@ Aggregation is a *lossy* choice, deliberately: individual occurrences are gone.
 and the rows those became, so the trade is visible.
 
 The open-window set is bounded. A window is an accumulator plus a copy of the
-opening record's labels and fields, and `on:` opens one per distinct tuple per
+opening record's labels, and `on:` opens one per distinct tuple per
 window period, so a key whose cardinality was misjudged is an unbounded
 footprint for as long as `every` lasts. Past 100 000 open windows the
 oldest-ending ones are emitted early — a shorter window, not a lost one — and

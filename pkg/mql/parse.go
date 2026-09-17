@@ -85,8 +85,7 @@ func ParseDiags(src string) (*Query, []Diag, error) {
 	return q, p.diags, nil
 }
 
-func (p *parser) cur() token  { return p.toks[p.i] }
-func (p *parser) next() token { t := p.toks[p.i]; p.i++; return t }
+func (p *parser) cur() token { return p.toks[p.i] }
 
 func (p *parser) errf(format string, args ...any) error {
 	return &ParseError{Pos: p.cur().pos, Msg: fmt.Sprintf(format, args...)}
@@ -443,10 +442,17 @@ func (p *parser) parseFieldExpr() (FieldExpr, error) {
 			}
 			fe.Modifiers.Clamp = c
 		case p.acceptKeyword("AS"):
-			if p.cur().kind != tokString && p.cur().kind != tokIdent {
-				return fe, p.errf("expected a display name after AS")
+			// p.name, not a bare token read: it refuses an empty name,
+			// and `AS ""` is a display name the grammar cannot express
+			// again. Print omits an empty As, so such an AST stopped
+			// round-tripping through its own canonical text -- which is
+			// what every other empty-name refusal in this parser and in
+			// Validate exists to keep.
+			name, err := p.name("a display name")
+			if err != nil {
+				return fe, err
 			}
-			fe.As = p.next().text
+			fe.As = name
 			return fe, nil
 		default:
 			return fe, nil
