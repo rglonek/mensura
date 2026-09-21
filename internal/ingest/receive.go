@@ -1057,6 +1057,21 @@ func ParseLineProtocol(line string, now time.Time) (string, model.Sample, error)
 		}
 		sample.Fields[name] = model.Coerce(raw)
 	}
+	// Anything past the timestamp is refused rather than dropped. The
+	// line is positional and has exactly four positions, so a fifth is
+	// either a field section the sender meant to separate with a comma
+	// and separated with a space, or a label section that lost its
+	// framing -- and both were silently discarded while the rest of the
+	// line was stored, so the sample looked accepted and carried less
+	// than it was sent with. An empty trailing position is only trailing
+	// whitespace and is ignored.
+	for i := 4; i < len(fields); i++ {
+		if strings.TrimSpace(fields[i]) == "" {
+			continue
+		}
+		extra := fields[i]
+		return "", model.Sample{}, fmt.Errorf("line protocol has four positions (<set> <labels> <fields> [ts]); %q comes after the timestamp -- separate fields with commas rather than spaces", extra)
+	}
 	if len(fields) >= 4 && fields[3] != "" {
 		ts, err := strconv.ParseInt(unescape(fields[3]), 10, 64)
 		if err != nil {

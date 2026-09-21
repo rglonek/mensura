@@ -209,27 +209,23 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 	if c.StorageProfile != "" {
 		sc.StorageProfile = c.StorageProfile
 	}
-	if c.Limits.MaxSeriesPerGraph > 0 {
-		sc.MaxSeriesPerGraph = c.Limits.MaxSeriesPerGraph
-	}
-	if c.Limits.MaxDatapointsReceived > 0 {
-		sc.MaxDataPointsReceived = c.Limits.MaxDatapointsReceived
-	}
-	if c.Limits.MaxLabelCardinality > 0 {
-		sc.MaxLabelCardinality = c.Limits.MaxLabelCardinality
-	}
-	if c.Limits.MaxLabelKeys != 0 {
-		// Non-zero rather than positive: a negative value is how every
-		// other gate here is switched off, and Open reads zero as
-		// "unset, use the default".
-		sc.MaxLabelKeys = c.Limits.MaxLabelKeys
-	}
-	if c.Limits.MaxSets != 0 {
-		sc.MaxSets = c.Limits.MaxSets
-	}
-	if c.Limits.MaxFieldsPerSet != 0 {
-		sc.MaxFieldsPerSet = c.Limits.MaxFieldsPerSet
-	}
+	// Non-zero rather than positive, on every one of the six: a negative
+	// value is how a gate here is switched off, and Open reads zero as
+	// "unset, use the default".
+	//
+	// Three of them read `> 0` and so kept their *default* when an
+	// operator wrote a negative -- the gate they were trying to remove
+	// stayed in force, and nothing said so, while the three keys beside
+	// them documented and implemented exactly the opposite. The comment
+	// on max_label_keys claimed "a negative value is how every other gate
+	// here is switched off", which was true of two of the five it was
+	// speaking for.
+	sc.MaxSeriesPerGraph = orDefault(c.Limits.MaxSeriesPerGraph, sc.MaxSeriesPerGraph)
+	sc.MaxDataPointsReceived = orDefault(c.Limits.MaxDatapointsReceived, sc.MaxDataPointsReceived)
+	sc.MaxLabelCardinality = orDefault(c.Limits.MaxLabelCardinality, sc.MaxLabelCardinality)
+	sc.MaxLabelKeys = orDefault(c.Limits.MaxLabelKeys, sc.MaxLabelKeys)
+	sc.MaxSets = orDefault(c.Limits.MaxSets, sc.MaxSets)
+	sc.MaxFieldsPerSet = orDefault(c.Limits.MaxFieldsPerSet, sc.MaxFieldsPerSet)
 	if c.Limits.MaxConcurrentJobs > 0 {
 		sc.MaxConcurrentJobs = c.Limits.MaxConcurrentJobs
 	}
@@ -271,6 +267,16 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 		}
 	}
 	return sc, nil
+}
+
+// orDefault applies a configured gate: zero leaves the built-in default
+// and anything else -- including a negative, which every one of these
+// gates reads as "no gate" -- is taken as written.
+func orDefault(configured, fallback int) int {
+	if configured == 0 {
+		return fallback
+	}
+	return configured
 }
 
 func durationOr(s string, fallback time.Duration) (time.Duration, error) {
