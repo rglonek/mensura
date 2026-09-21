@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -43,5 +44,31 @@ func TestExplainBoundsQueryWidth(t *testing.T) {
 	ok := &mql.Query{Kind: mql.KindQuery, From: "app", Select: []mql.FieldExpr{{Field: "v"}}, By: []string{"host"}}
 	if _, err := s.Explain(ok, &wire.QueryRequest{AST: ok, MaxPoints: 100}); err != nil {
 		t.Fatalf("an ordinary query failed to explain: %v", err)
+	}
+}
+
+// The plan's lists travel as lists, for the reason QueryResponse.Series,
+// LabelValues.Values and the catalogue's own `sets` and `labels` do: the
+// builder's Explain button should not have to tell "none" apart from "no
+// array".
+func TestExplainListsAreNeverNull(t *testing.T) {
+	s := openTestStore(t)
+	q := &mql.Query{Kind: mql.KindQuery, From: "nosuchset", Select: []mql.FieldExpr{{Field: "v"}}}
+	plan, err := s.Explain(q, &wire.QueryRequest{AST: q, MaxPoints: 100})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	body, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back map[string]json.RawMessage
+	if err := json.Unmarshal(body, &back); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"warnings", "shards", "projection", "resolved_fields"} {
+		if string(back[key]) == "null" {
+			t.Errorf("%s travelled as null rather than as a list: %s", key, body)
+		}
 	}
 }

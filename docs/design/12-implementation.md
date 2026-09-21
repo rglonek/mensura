@@ -4161,3 +4161,9 @@ after the captures are collected.
   §6.184 gave it the depth one. `plan()` resolves every selected field
   against the catalogue under a read lock and length-prefixes every `BY`
   slot, so `MaxSelectFields` and `MaxByLabels` are checked here too.
+- **The plan's lists are lists.** `warnings` and `shards` carried a nil
+  slice, so a plan with no warnings travelled as `"warnings": null` and a
+  set with no shards as `"shards": null` — the same null-versus-`[]`
+  distinction `QueryResponse.Series`, `LabelValues.Values` and the
+  catalogue's own `sets` and `labels` were each changed to stop making a
+  client tell apart.

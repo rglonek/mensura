@@ -1516,6 +1516,17 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 		// not report a plan that is not the plan.
 		window = 0
 	}
+	// Lists, never null, for the reason QueryResponse.Series,
+	// LabelValues.Values and the catalogue's own `sets` and `labels`
+	// are: a plan with no warnings travelled as `"warnings": null` and a
+	// set with no shards as `"shards": null`, so the builder's Explain
+	// button had to tell "none" apart from "no array" to render either.
+	if warns == nil {
+		warns = []mql.Diag{}
+	}
+	if p.shards == nil {
+		p.shards = []string{}
+	}
 	return map[string]any{
 		"shards":            p.shards,
 		"projection":        p.projection,
