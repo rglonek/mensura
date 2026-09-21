@@ -4174,6 +4174,16 @@ after the captures are collected.
   lexes as a string. (The prose in several places also wrote the crossed
   pair `E007` refuses as `CLAMP MIN 5 MAX 1`, which is a spelling the
   grammar does not have; it is `CLAMP MIN 5, MAX 1`.)
+- **The documented configuration is valid YAML.** `metrics:{addr: …}` in
+  §1.1 of [09](09-operations.md) has no space after its colon, so it is
+  not a mapping at all: an operator copying the example got
+  `yaml: line 6: did not find expected key`, which points at `listen:`
+  and says nothing about the entry three lines below it. That is the same
+  copy-the-example failure `max_concurrent_requests` and
+  `write_rate_per_client` were given named refusals for, arriving through
+  the syntax rather than through the schema. A guard in the loader's own
+  tests now decodes the documented block into `fileConfig` with
+  `KnownFields(true)`, so both the syntax and the key set stay in step.
 - **The plan's lists are lists.** `warnings` and `shards` carried a nil
   slice, so a plan with no warnings travelled as `"warnings": null` and a
   set with no shards as `"shards": null` — the same null-versus-`[]`
