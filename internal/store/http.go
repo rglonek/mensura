@@ -516,6 +516,21 @@ func (a *API) handleExplain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "no AST supplied")
 		return
 	}
+	// Bounded exactly as /v1/print is, and for the same reason: Explain
+	// runs the planner's own lowering, which is recursive over the
+	// predicate, and unlike /v1/query it does not go through
+	// mql.Validate, which is where that bound is otherwise applied. The
+	// plugin's "explain" resource already checks it; this endpoint was
+	// the one door left open.
+	if err := mql.CheckPredicateDepth(req.AST); err != nil {
+		var d mql.Diag
+		if asDiag(err, &d) {
+			writeJSONErr(w, http.StatusBadRequest, d.Msg, d.Code)
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	plan, err := a.store.Explain(req.AST, &req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

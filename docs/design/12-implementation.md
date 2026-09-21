@@ -922,9 +922,9 @@ dead: its destination set is never written, and nothing at run time says
 so, because the record did match something. An empty `search` is the
 extreme case and shadows every pattern after it.
 
-`Spec.Lint` reports six codes, split by `Lint.Fatal()` into the two that
-describe a broken spec and the four that describe a working one that
-declares more than it uses. `check` prints both, under separate headings,
+`Spec.Lint` reports seven codes, split by `Lint.Fatal()` into the two that
+describe a broken spec and the five that describe a working one that
+declares more than it uses, or more than a window can carry. `check` prints both, under separate headings,
 and exits non-zero only on the fatal ones — so a spec with a dead pattern
 fails the pipeline that runs it instead of shipping, while a spec that
 merely names its operator labels does not:
@@ -937,6 +937,7 @@ merely names its operator labels does not:
 | `L004` | no | a declared label no pattern captures and that is not a stream label |
 | `L005` | no | a capture that is *not* declared as a label but whose name is one an `identity:` rule can attach as a stream label; where that rule applies, the sample carries the name as a label and as a field, which the store refuses outright |
 | `L006` | yes | the same collision on `host` or `source`, which no rule has to supply because every acquisition path defaults them — so it happens on *every* record and the pattern can never store a row |
+| `L007` | no | an aggregating pattern captures something its windows cannot represent: a field other than `aggregate.field`, which is discarded because a window has no value for it, or a label outside `on:`, which is carried from whichever record opened the window ([§6.180](#6180-a-window-carried-the-opening-records-other-measurements)) |
 
 `L005` is advisory because an `identity:` rule scoped by `match_path` does
 not apply to every stream, so a pattern in another profile may legitimately
@@ -3818,7 +3819,7 @@ reporting zeroes that read like an idle store.
   handle loses whatever was left in it — the replacement is still read
   from offset 0, because the stored fingerprint no longer matches. §6.3
   says `mensura-ingest check` warns about an occurrence-counting pattern
-  under `key: content`; the lint set is `L001`–`L006` and holds no such
+  under `key: content`; the lint set is `L001`–`L007` and holds no such
   check, and deciding "no numeric capture" from a spec alone is guesswork,
   because extraction coerces per value. §7.1 offers TLS on the receive
   listeners and a client-certificate subject mapped to stream labels, plus
@@ -3906,3 +3907,120 @@ reporting zeroes that read like an idle store.
   logged with the reason, because an unbounded buffer turns a store outage
   into an out-of-memory kill that loses everything rather than the tail.
   Losing nothing at all still needs a spill-to-disk queue.
+
+### 6.180 A window carried the opening record's other measurements
+
+An aggregation window was built with a copy of the opening record's whole
+field map, and `aggregator.emit` wrote that copy out beside the
+accumulated column. So a pattern like
+
+```yaml
+extract: ['REQ status=(?P<status>\w+) bytes=(?P<bytes>\d+)']
+aggregate: {every: 10s, on: [status], field: hits, mode: increment}
+```
+
+emitted one row per ten seconds carrying `hits` — a real count — and
+`bytes`, whose value was whichever the *first* record of that window
+happened to have. Every later record's `bytes` was discarded silently: the
+row is well formed, the panel draws, and what it draws is a plausible
+ten-second series of numbers no aggregation ever computed. It is the same
+"a plausible-looking graph of numbers no single source ever reported"
+failure `W301` exists to warn about, arriving through the accumulator
+instead of through a missing `BY`.
+
+A window has one value per `aggregate.field` and no single value for
+anything else, so `emit` now writes the accumulated column and nothing
+else. [03](03-extraction.md) §9 has always described the emitted sample as
+"the accumulated field plus the labels of the accumulator"; the field copy
+was never part of that, and dropping it also takes a map out of every open
+window, which is what `maxOpenWindows` is counting.
+
+Silently dropping a column would be its own kind of invisible, so what is
+dropped is named at compile time. `Spec.Lint` gains `L007`, advisory,
+reporting both halves of what an aggregating pattern captures that its
+windows cannot represent:
+
+- a **field** other than `aggregate.field` — discarded, because the window
+  has no value for it;
+- a **label** that is not one of the `on:` keys — carried, but from
+  whichever record opened the window, so every row is attributed to that
+  one value.
+
+It is advisory rather than fatal because the label half cannot be decided
+from the spec alone: a label outside `on:` whose value is functionally
+determined by the keys that *are* in `on:` reads identically to one that
+varies within a window.
+
+### 6.181 The catalogue was the one cardinality nothing bounded
+
+§6.136 bounded the number of label *keys* because a key is named by the
+sender, costs a dictionary and a catalogue entry, and is never reclaimed.
+Every word of that applies to a **set name** and a **field name**, which
+the line protocol, `/ingest/v1/samples` and `/v1/write` all let a client
+choose — and neither had any bound at all. One sender putting a request id
+in its set name, or deriving a field name from a log line, grew the
+store's memory and the size of every catalogue save without limit, while
+`max_label_keys` and `max_label_cardinality` watched two numbers that
+never moved. The catalogue is a single JSON record: at ten thousand sets
+of a hundred fields it is hundreds of megabytes, rewritten on every
+save.
+
+`limits.max_sets` (10 000) and `limits.max_fields_per_set` (10 000) close
+it, with the rules `max_label_keys` already follows. Only a *new* entry is
+refused, so a set or a field the catalogue already holds always works; the
+refusal names what would not fit; a negative value switches the gate off;
+and the declaration path is held to the same budget as the sample path,
+weighed whole before any of it is applied, so the cheapest way past the
+cap is not the one that carries no data.
+
+### 6.182 The batch-size estimate was not the upper bound it claimed
+
+`sampleBytes` is the only thing standing between a buffer and a body the
+store answers 413 to — a status `wire.Client` classifies as fatal, so the
+sink drops the whole batch, reports it to the delivery observers as a hole
+and freezes every followed file's checkpoint behind it. §6.174 made it
+count escaped text correctly; the *fixed* part of a sample was still a
+flat 48 bytes against an encoding of
+
+```json
+{"ts_ms":<up to 20>,"labels":{},"fields":{},"key_hint":""},
+```
+
+which is 69 — so the estimate was 21 bytes short before a single label or
+field was counted, and a float field could take it one further (the widest
+literal `encoding/json` emits for a float64 is 25 characters, e.g.
+`-0.0000012345678901234567`, against an allowance of 20). The per-batch
+`{"set":"…","samples":[]}` envelope was not counted at all, so a flush
+spanning many sets overshot by one per set.
+
+Every one of those is now spelled out as a named constant and checked by a
+randomised round trip against `encoding/json` itself. The estimate is
+deliberately a little loose, which is the only direction it may err in.
+
+### 6.183 Two walks of the dictionary for one predicate
+
+`buildExpr` lowers a `WHERE` clause and folds the arms no dictionary value
+can satisfy to `engine.Const(false)`; `isAlwaysFalse` then walked the same
+AST a second time to decide whether the whole predicate was impossible.
+The second walk answered a question the first one had already answered, by
+redoing the expensive half of it: recompiling every regex and sweeping the
+whole label-value dictionary again, up to `max_label_cardinality` entries
+per clause, on the path a dashboard hits on every panel refresh — the
+same duplicate sweep §6.104 removed from the `LABELS` filter scan, one
+level in. The lowering now reports the verdict alongside the expression
+and `isAlwaysFalse` is gone. The propagation is unchanged: a conjunction
+is impossible as soon as one arm is, a disjunction only when every arm is,
+and a negation never is.
+
+### 6.184 Smaller corrections
+
+- **`/v1/debug/plan` bounded its predicate.** `/v1/query` bounds depth
+  through `mql.Validate`, `/v1/print` and the plugin's `explain` resource
+  bound it explicitly, and the store's own plan endpoint — which runs the
+  planner's recursive lowering on an AST nothing has validated — did not.
+  It now calls `mql.CheckPredicateDepth` like the rest.
+- **`AS ""` is refused.** The parser read the display name as a bare
+  token rather than through `p.name`, so an empty quoted one parsed into
+  an alias `Print` does not emit: the AST stopped round-tripping through
+  its own canonical text, which is what every other empty-name refusal
+  here exists to keep.

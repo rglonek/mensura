@@ -57,6 +57,12 @@ func (l Lint) String() string {
 // record -- which store.rowFor refuses by name, for the life of the
 // process, with nothing pointing back at the spec. A spec that can never
 // store a row is a broken spec, which is what L001 is fatal for.
+// L007 is advisory for a different reason again: it names what an
+// aggregating pattern captures and the window cannot carry. That is
+// almost always a spec the author should narrow, but it is not
+// necessarily wrong -- a label outside `on:` whose value is functionally
+// determined by the keys that *are* in `on:` is reported identically to
+// one that varies, and this cannot tell them apart from the spec alone.
 func (l Lint) Fatal() bool { return l.Code == "L001" || l.Code == "L006" }
 
 // Fatal reports whether any finding in a set is fatal.
@@ -90,6 +96,101 @@ func (s *Spec) Lint() []Lint {
 	for _, p := range s.Profiles {
 		out = append(out, p.lintUnreachablePatterns()...)
 		out = append(out, p.lintCaptures(stream)...)
+		out = append(out, p.lintAggregateCaptures()...)
+	}
+	return out
+}
+
+// lintAggregateCaptures reports what an aggregating pattern captures that
+// its windows cannot represent.
+//
+// A window is keyed on `on:` and carries one accumulated column. Two
+// kinds of capture do not survive that:
+//
+//   - A *field* other than `aggregate.field`. The window has no single
+//     value for it -- every record in the window may carry a different
+//     one -- so emit() writes only the accumulated column and the capture
+//     is discarded. It used to be carried forward from whichever record
+//     opened the window, which drew a plausible per-window series of
+//     numbers nothing had aggregated.
+//   - A *label* that is not one of the `on:` keys. The window has to
+//     carry some value for it, because the labels are the emitted
+//     sample's identity, and the only one available is the opening
+//     record's. Where the label really varies within a window, every row
+//     is attributed to whichever value happened to arrive first.
+//
+// Both are decidable from the spec and invisible at run time: the row is
+// well formed and the panel draws.
+func (p *Profile) lintAggregateCaptures() []Lint {
+	var out []Lint
+	for _, pat := range p.Patterns {
+		if pat.Aggregate == nil {
+			continue
+		}
+		on := make(map[string]struct{}, len(pat.Aggregate.On))
+		for _, k := range pat.Aggregate.On {
+			on[k] = struct{}{}
+		}
+		var dropped, carried []string
+		seen := map[string]struct{}{}
+		names := patternExtractedNames(pat)
+		// The columns a bucket set expands into are written straight
+		// into the same field map, so they are discarded with the rest.
+		if bs, ok := p.buckets[pat.BucketSet]; ok && pat.BucketSet != "" {
+			for _, b := range bs.Buckets {
+				names = append(names, b)
+				if bs.Cumulative {
+					names = append(names, b+"plus")
+				}
+			}
+			if bs.Tail {
+				names = append(names, tailField)
+			}
+		}
+		for _, name := range names {
+			if name == "" || name == "buckets" || name == "histogram" {
+				continue
+			}
+			if name == pat.Aggregate.Field {
+				continue // the accumulated column itself
+			}
+			if _, dup := seen[name]; dup {
+				continue
+			}
+			seen[name] = struct{}{}
+			if isDeclaredLabel(p, pat, name) {
+				if _, keyed := on[name]; !keyed {
+					carried = append(carried, name)
+				}
+				continue
+			}
+			dropped = append(dropped, name)
+		}
+		sort.Strings(dropped)
+		sort.Strings(carried)
+		if len(dropped) > 0 {
+			out = append(out, Lint{
+				Profile: p.Name, Code: "L007",
+				Msg: fmt.Sprintf("pattern for set %q aggregates into %q, so the field(s) %s it also captures are discarded: a window has one value per `aggregate.field` and no single value for anything else -- write a second, non-aggregating pattern for them, or aggregate them too",
+					pat.Set, pat.Aggregate.Field, strings.Join(quoteAll(dropped), ", ")),
+			})
+		}
+		if len(carried) > 0 {
+			out = append(out, Lint{
+				Profile: p.Name, Code: "L007",
+				Msg: fmt.Sprintf("pattern for set %q aggregates on %s, but also captures the label(s) %s; a window carries whichever value the record that opened it had, so every row is attributed to that one -- add them to `on:` if they vary within a window",
+					pat.Set, strings.Join(quoteAll(pat.Aggregate.On), ", "), strings.Join(quoteAll(carried), ", ")),
+			})
+		}
+	}
+	return out
+}
+
+// quoteAll renders a list of names for a diagnostic.
+func quoteAll(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, fmt.Sprintf("%q", n))
 	}
 	return out
 }

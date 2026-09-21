@@ -50,6 +50,8 @@ limits:
   max_datapoints_received: 34560000
   max_label_cardinality: 100000   # distinct values under one label key
   max_label_keys: 1000            # distinct label keys in all; <0 disables
+  max_sets: 10000                 # distinct sets in the catalogue; <0 disables
+  max_fields_per_set: 10000       # distinct fields under one set; <0 disables
 
 # Per-client rate limiting is not implemented (12-implementation.md §5), so
 # there is no write_rate_per_client key and no max_concurrent_requests:

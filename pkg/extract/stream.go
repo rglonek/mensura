@@ -120,8 +120,8 @@ type Stream struct {
 // maxOpenWindows bounds how many aggregation windows one stream may hold
 // open at once.
 //
-// A window is one accumulator plus a copy of the opening record's labels
-// and fields, and there is one per distinct `on` tuple per window period.
+// A window is one accumulator plus a copy of the opening record's labels,
+// and there is one per distinct `on` tuple per window period.
 // Nothing bounded that: `on: [request_id]` -- or any key whose
 // cardinality the spec author misjudged -- grew the ingester's memory for
 // as long as `every` lasted, with no cap, no counter and no diagnostic,
@@ -191,7 +191,6 @@ type aggregator struct {
 	value      float64
 	start, end time.Time
 	labels     map[string]string
-	fields     map[string]model.Value
 	set        string
 	line       string
 	field      string
@@ -519,8 +518,8 @@ func (st *Stream) pruneHolds() {
 		// clears the slot it pops: compacting in place shortens the
 		// slice but leaves the dropped entries in the backing array,
 		// and each one holds an aggregation key and a pointer to the
-		// window it named -- which holds copies of the opening record's
-		// maps. Pruning that frees nothing is not pruning.
+		// window it named -- which holds a copy of the opening record's
+		// labels. Pruning that frees nothing is not pruning.
 		for i := len(kept); i < len(st.holds); i++ {
 			st.holds[i] = holdEntry{}
 		}
@@ -1065,12 +1064,16 @@ func (st *Stream) aggregate(pat *Pattern, patIdx int, set string, ts time.Time, 
 	}
 	a, ok := st.aggs[key]
 	if !ok {
-		// The maps are copied: the caller hands the same ones to the sink,
-		// which labels them further, and the window must not see that.
+		// The labels are copied, because the caller hands the same map
+		// to the sink, which labels it further, and the window must not
+		// see that. The fields are not carried at all: a window has one
+		// value per `aggregate.field` and no single value for anything
+		// else the record held, so keeping the rest would attribute the
+		// opening record's numbers to the whole window -- see emit.
 		a = &aggregator{
 			start: ts, end: ts.Add(ag.every),
-			labels: copyLabels(labels), fields: copyFields(fields),
-			set: set, line: line, field: ag.Field, mode: ag.Mode,
+			labels: copyLabels(labels),
+			set:    set, line: line, field: ag.Field, mode: ag.Mode,
 			mark: st.mark, lastMark: st.mark, slot: slot,
 		}
 		st.aggs[key] = a
@@ -1254,7 +1257,7 @@ func (q *aggQueue) Pop() any {
 	// in the backing array, and the garbage collector traces the array
 	// rather than the length -- so every window this queue ever emitted
 	// stayed reachable through its *aggregator, which holds a copy of the
-	// opening record's label and field maps and the whole record line.
+	// opening record's label map and the whole record line.
 	// The queue's high-water mark is maxOpenWindows, and one stream can
 	// live for the life of the process (a followed file, a peer, an SSH
 	// connection), so the retention was the peak footprint rather than
@@ -1271,45 +1274,53 @@ func (q *aggQueue) Pop() any {
 // below is range-checked before it is made rather than relying on either.
 const maxExactInt = 1 << 53
 
-// emit renders one window. ok is false when the window has nothing left
-// to report, which is the only honest answer for a window that measured
-// nothing at all.
+// emit renders one window: the accumulated column and nothing else.
 //
-// The synthesised column is written only where the accumulator really
-// holds a reading, or where zero is the identity of the fold. `sum` of
-// nothing is zero and `increment` counts the opening record, so both
-// always have one. `max` and `last` do not: a window whose records never
-// carried the field left the accumulator at its zero value and emitted
-// it, so a latency maximum nobody measured was drawn as 0 -- the same
-// invention hasValue was added to stop one case earlier, and the same one
+// ok is false when the window has nothing left to report, which is the
+// only honest answer for a window that measured nothing at all. The
+// synthesised column is written only where the accumulator really holds a
+// reading, or where zero is the identity of the fold. `sum` of nothing is
+// zero and `increment` counts the opening record, so both always have
+// one. `max` and `last` do not: a window whose records never carried the
+// field left the accumulator at its zero value and emitted it, so a
+// latency maximum nobody measured was drawn as 0 -- the same invention
+// hasValue was added to stop one case earlier, and the same one
 // BucketSet.expand refuses when it writes an absent bucket as absent
 // rather than as a measured zero. An absent column reads as a gap, which
 // is what the render walk already draws for a row that does not carry a
 // field.
+//
+// Nothing else the *opening record* carried is written, and that is the
+// same rule one step wider. The window used to be built with a copy of
+// that record's whole field map, so a pattern like
+//
+//	extract: ['REQ status=(?P<status>\w+) bytes=(?P<bytes>\d+)']
+//	aggregate: {every: 10s, on: [status], field: hits, mode: increment}
+//
+// emitted one row per ten seconds carrying `hits` -- a real count -- and
+// `bytes`, whose value was whichever the first record of that window
+// happened to have. Every later record's bytes were discarded, silently:
+// the row is well formed, the series draws, and it is a plausible-looking
+// ten-second series of numbers no aggregation ever computed. A window has
+// one value per `aggregate.field` and no single value for anything else,
+// so anything else is not a number this function may invent.
+// 03-extraction.md section 9 has always described the emitted sample as
+// "the accumulated field plus the labels of the accumulator"; the field
+// copy was never part of it. Lint reports L007 for the captures this
+// discards, so the loss is visible in `check` rather than only here.
 func (a *aggregator) emit() (Result, bool) {
-	fields := map[string]model.Value{}
-	for k, v := range a.fields {
-		fields[k] = v
-	}
-	if a.hasValue || a.mode == "sum" || a.mode == "increment" {
-		if a.value >= -maxExactInt && a.value <= maxExactInt && a.value == float64(int64(a.value)) {
-			fields[a.field] = model.Int(int64(a.value))
-		} else {
-			fields[a.field] = model.Float(a.value)
-		}
-	} else {
-		// The opening record cannot have carried a value under this name
-		// -- aggregate() refuses a non-numeric one for these modes -- so
-		// there is nothing here to leave behind.
-		delete(fields, a.field)
-	}
-	if len(fields) == 0 {
-		// A pattern that aggregates and extracts nothing else has one
-		// column, and it is the one there is no reading for. A row with
-		// no fields is a row the store refuses by name, so the window is
-		// dropped here instead, where it can be counted.
+	if !a.hasValue && a.mode != "sum" && a.mode != "increment" {
+		// A pattern that aggregates has one column, and it is the one
+		// there is no reading for. A row with no fields is a row the
+		// store refuses by name, so the window is dropped here instead,
+		// where it can be counted.
 		return Result{}, false
 	}
+	v := model.Float(a.value)
+	if a.value >= -maxExactInt && a.value <= maxExactInt && a.value == float64(int64(a.value)) {
+		v = model.Int(int64(a.value))
+	}
+	fields := map[string]model.Value{a.field: v}
 	return Result{Set: a.set, TSMs: a.start.UnixMilli(), Labels: a.labels, Fields: fields, Line: a.line}, true
 }
 
@@ -1330,14 +1341,6 @@ func trimToRune(s string) string {
 
 func copyLabels(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func copyFields(in map[string]model.Value) map[string]model.Value {
-	out := make(map[string]model.Value, len(in))
 	for k, v := range in {
 		out[k] = v
 	}

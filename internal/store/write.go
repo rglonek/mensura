@@ -282,6 +282,13 @@ func (s *Store) applySetMeta(metas []wire.SetMeta) error {
 			return err
 		}
 	}
+	// A `sets:` declaration creates a catalogue entry through
+	// entryLocked exactly as a field declaration does, so it is held to
+	// the same budget and, like the rest of this function, weighed before
+	// any of it is applied.
+	if err := s.setDeclarationRoom(metas); err != nil {
+		return err
+	}
 	for _, m := range metas {
 		if m.Set == "" {
 			continue
@@ -298,6 +305,35 @@ func (s *Store) applySetMeta(metas []wire.SetMeta) error {
 		}
 		if m.KeyScheme != "" {
 			s.SetKeyScheme(m.Set, m.KeyScheme)
+		}
+	}
+	return nil
+}
+
+// setDeclarationRoom refuses a `sets:` declaration that would take the
+// catalogue past Config.MaxSets.
+func (s *Store) setDeclarationRoom(metas []wire.SetMeta) error {
+	if s.cfg.MaxSets <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sets := len(s.catalogue)
+	seen := map[string]struct{}{}
+	for _, m := range metas {
+		if m.Set == "" {
+			continue
+		}
+		if _, known := s.catalogue[m.Set]; known {
+			continue
+		}
+		if _, dup := seen[m.Set]; dup {
+			continue
+		}
+		seen[m.Set] = struct{}{}
+		sets++
+		if sets > s.cfg.MaxSets {
+			return badRequestf("set %q would be a new set past the limit of %d; a set name is a catalogue entry that is held in memory and persisted with every save, and nothing ever reclaims one", m.Set, s.cfg.MaxSets)
 		}
 	}
 	return nil
@@ -409,6 +445,15 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 			return nil, fmt.Errorf("%q is both a label and a field", k)
 		}
 	}
+	// The catalogue budgets, checked here for the reason the label
+	// budgets are checked in intern(): before anything is interned or
+	// written, and against the sample rather than after the fact. A set
+	// name and a field name are chosen by the sender on every write
+	// path, and the catalogue that records them is one in-memory map and
+	// one JSON record on disk.
+	if err := s.catalogueRoom(set, sm); err != nil {
+		return nil, err
+	}
 
 	row := make(engine.Row, len(sm.Labels)+len(sm.Fields)+1)
 	row[model.TimestampField] = model.Int(sm.TSMs)
@@ -423,6 +468,47 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 		row[k] = v
 	}
 	return row, nil
+}
+
+// catalogueRoom refuses a sample that would grow the catalogue past its
+// budget, naming the set or the field that would not fit.
+//
+// It is the write-path half of Config.MaxSets and Config.MaxFieldsPerSet,
+// and it mirrors intern(): only a *new* entry is refused, so a set or a
+// field the catalogue already holds is always accepted, and a
+// non-positive budget switches the gate off. One read lock per sample,
+// which is the same order of cost the label loop beside it already pays.
+func (s *Store) catalogueRoom(set string, sm *model.Sample) error {
+	maxSets, maxFields := s.cfg.MaxSets, s.cfg.MaxFieldsPerSet
+	if maxSets <= 0 && maxFields <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, known := s.catalogue[set]
+	if !known {
+		if maxSets > 0 && len(s.catalogue) >= maxSets {
+			return fmt.Errorf("set %q would be a new set past the limit of %d; a set name is a catalogue entry that is held in memory and persisted with every save, and nothing ever reclaims one", set, maxSets)
+		}
+		if maxFields > 0 && len(sm.Fields) > maxFields {
+			return fmt.Errorf("set %q: this sample carries %d fields, which is beyond the limit of %d distinct fields per set", set, len(sm.Fields), maxFields)
+		}
+		return nil
+	}
+	if maxFields <= 0 {
+		return nil
+	}
+	room := maxFields - len(e.Fields)
+	for k := range sm.Fields {
+		if _, have := e.Fields[k]; have {
+			continue
+		}
+		room--
+		if room < 0 {
+			return fmt.Errorf("field %q would be a new field on set %q past the limit of %d distinct fields; unbounded field *names* cost what unbounded label names do", k, set, maxFields)
+		}
+	}
+	return nil
 }
 
 // observeSet keeps the catalogue current: which labels and fields a set
@@ -594,6 +680,14 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The catalogue budgets, decided before anything is applied, which is
+	// the shape the validating pass above already has. A declaration
+	// creates a set and a field exactly as a sample does, so leaving this
+	// path out would have made the cheapest way past the cap the one that
+	// costs no data at all.
+	if err := s.declarationRoomLocked(metas); err != nil {
+		return err
+	}
 	// Only a real change bumps the version. Bumping unconditionally made
 	// the /v1/catalogue ETag miss on every write that carried metadata,
 	// which is the churn CatalogueVersion's own contract rules out.
@@ -720,6 +814,61 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 	}
 	if changed {
 		s.catVer.Add(1)
+	}
+	return nil
+}
+
+// declarationRoomLocked refuses a field-metadata request that would grow
+// the catalogue past Config.MaxSets or Config.MaxFieldsPerSet. It must be
+// called with the catalogue write lock held.
+//
+// The whole request is weighed before any of it is applied, so two
+// declarations in one body cannot leave half the growth behind after the
+// second one is refused.
+func (s *Store) declarationRoomLocked(metas []wire.FieldMeta) error {
+	maxSets, maxFields := s.cfg.MaxSets, s.cfg.MaxFieldsPerSet
+	if maxSets <= 0 && maxFields <= 0 {
+		return nil
+	}
+	sets := len(s.catalogue)
+	newSets := map[string]struct{}{}
+	newFields := map[string]map[string]struct{}{}
+	for _, m := range metas {
+		if m.Set == "" || m.Field == "" {
+			continue
+		}
+		e, known := s.catalogue[m.Set]
+		if !known {
+			if _, seen := newSets[m.Set]; !seen {
+				newSets[m.Set] = struct{}{}
+				sets++
+				if maxSets > 0 && sets > maxSets {
+					return badRequestf("set %q would be a new set past the limit of %d; a set name is a catalogue entry that is held in memory and persisted with every save, and nothing ever reclaims one", m.Set, maxSets)
+				}
+			}
+		}
+		if maxFields <= 0 {
+			continue
+		}
+		if _, have := newFields[m.Set]; !have {
+			newFields[m.Set] = map[string]struct{}{}
+		}
+		if known {
+			if _, have := e.Fields[m.Field]; have {
+				continue
+			}
+		}
+		if _, seen := newFields[m.Set][m.Field]; seen {
+			continue
+		}
+		newFields[m.Set][m.Field] = struct{}{}
+		have := 0
+		if known {
+			have = len(e.Fields)
+		}
+		if have+len(newFields[m.Set]) > maxFields {
+			return badRequestf("field %q would be a new field on set %q past the limit of %d distinct fields; unbounded field *names* cost what unbounded label names do", m.Field, m.Set, maxFields)
+		}
 	}
 	return nil
 }

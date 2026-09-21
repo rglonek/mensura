@@ -384,31 +384,56 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 		return nil, nil, false
 	}
 	var warns []mql.Diag
-	var impossible bool
 
-	var lower func(e mql.Expr) engine.Expr
-	lower = func(e mql.Expr) engine.Expr {
+	// lower reports, alongside the engine expression, whether the node it
+	// lowered can never match: exactly the arms below that fold to
+	// engine.Const(false). It used to be a second walk over the same AST
+	// (isAlwaysFalse), which answered the same question by redoing the
+	// work -- recompiling every regex and sweeping the whole
+	// label-value dictionary again, up to max_label_cardinality entries
+	// per clause, on the path a dashboard hits on every panel refresh.
+	// The lowering already knows; asking it is free.
+	//
+	// NOT is deliberately not propagated: the negation of a predicate
+	// that can never match is one that always does, so a false child
+	// makes the parent true rather than false. Nor are Ne and NoMatch,
+	// which lower to an existence test rather than to a constant. That
+	// is the same set of arms the second walk recognised, which is what
+	// keeps this a refactoring rather than a change of plan.
+	var lower func(e mql.Expr) (engine.Expr, bool)
+	lower = func(e mql.Expr) (engine.Expr, bool) {
 		switch {
 		case len(e.And) > 0:
 			subs := make([]engine.Expr, 0, len(e.And))
+			never := false
 			for _, sub := range e.And {
-				subs = append(subs, lower(sub))
+				lowered, subNever := lower(sub)
+				subs = append(subs, lowered)
+				// A conjunction is impossible as soon as one arm is.
+				// Every arm is still lowered, because each one may carry
+				// a warning the operator needs.
+				never = never || subNever
 			}
-			return engine.And(subs...)
+			return engine.And(subs...), never
 		case len(e.Or) > 0:
 			subs := make([]engine.Expr, 0, len(e.Or))
+			never := true
 			for _, sub := range e.Or {
-				subs = append(subs, lower(sub))
+				lowered, subNever := lower(sub)
+				subs = append(subs, lowered)
+				// A disjunction is impossible only when every arm is.
+				never = never && subNever
 			}
-			return engine.Or(subs...)
+			return engine.Or(subs...), never
 		case e.Not != nil:
-			return engine.Not(lower(*e.Not))
+			inner, _ := lower(*e.Not)
+			return engine.Not(inner), false
 		case e.Has != "":
 			proj[e.Has] = struct{}{}
-			return engine.Exists(e.Has)
+			return engine.Exists(e.Has), false
 		case e.Missing != "":
 			proj[e.Missing] = struct{}{}
-			return engine.Not(engine.Exists(e.Missing))
+			return engine.Not(engine.Exists(e.Missing)), false
 		case e.Eq != nil:
 			proj[e.Eq.Label] = struct{}{}
 			// Every position the value occupies, not only the one the
@@ -419,21 +444,21 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 			idxs, ok := s.lookupPositions(e.Eq.Label, e.Eq.Value)
 			if !ok {
 				warns = append(warns, mql.Diag{Code: "W201", Msg: fmt.Sprintf("no values match %s = %q", e.Eq.Label, e.Eq.Value)})
-				return engine.Const(false)
+				return engine.Const(false), true
 			}
 			if len(idxs) == 1 {
-				return engine.Eq(e.Eq.Label, idxs[0])
+				return engine.Eq(e.Eq.Label, idxs[0]), false
 			}
-			return engine.In(e.Eq.Label, idxs...)
+			return engine.In(e.Eq.Label, idxs...), false
 		case e.Ne != nil:
 			proj[e.Ne.Label] = struct{}{}
 			idxs, ok := s.lookupPositions(e.Ne.Label, e.Ne.Value)
 			if !ok {
 				// Nothing carries that value, so the inequality holds for
 				// every row that carries the label at all.
-				return engine.Exists(e.Ne.Label)
+				return engine.Exists(e.Ne.Label), false
 			}
-			return engine.And(engine.Exists(e.Ne.Label), engine.Not(engine.In(e.Ne.Label, idxs...)))
+			return engine.And(engine.Exists(e.Ne.Label), engine.Not(engine.In(e.Ne.Label, idxs...))), false
 		case e.In != nil:
 			proj[e.In.Label] = struct{}{}
 			var vals []model.Value
@@ -449,9 +474,9 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 				warns = append(warns, mql.Diag{Code: "W201", Msg: fmt.Sprintf("no values match %s in (%s)", e.In.Label, strings.Join(missing, ", "))})
 			}
 			if len(vals) == 0 {
-				return engine.Const(false)
+				return engine.Const(false), true
 			}
-			return engine.In(e.In.Label, vals...)
+			return engine.In(e.In.Label, vals...), false
 		case e.Match != nil, e.NoMatch != nil:
 			m := e.Match
 			negate := false
@@ -462,89 +487,41 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 			re, err := regexp.Compile(m.Regex)
 			if err != nil {
 				warns = append(warns, mql.Diag{Code: "E001", Msg: fmt.Sprintf("invalid regex /%s/: %v", m.Regex, err)})
-				return engine.Const(false)
+				// The clause matches nothing either way: a query is
+				// narrowed by a predicate it cannot read, never widened
+				// by it, which is the one failure mode a filter must not
+				// have. Only the positive form makes the whole query
+				// impossible, because a negated clause elsewhere in a
+				// disjunction may still match.
+				return engine.Const(false), !negate
 			}
 			// The regex is evaluated once against the dictionary, not once
 			// per row: the scan only ever sees an integer set.
 			vals, all := s.labelIndicesMatching(m.Label, re.MatchString)
 			if len(vals) == all && all > 0 && !negate {
 				warns = append(warns, mql.Diag{Code: "W202", Msg: fmt.Sprintf("regex /%s/ matches every value of %s; the clause was folded away", m.Regex, m.Label)})
-				return engine.Exists(m.Label)
+				return engine.Exists(m.Label), false
 			}
 			if len(vals) == 0 {
 				if negate {
-					return engine.Exists(m.Label)
+					return engine.Exists(m.Label), false
 				}
 				warns = append(warns, mql.Diag{Code: "W201", Msg: fmt.Sprintf("regex /%s/ matches no value of %s", m.Regex, m.Label)})
-				return engine.Const(false)
+				return engine.Const(false), true
 			}
 			in := engine.In(m.Label, vals...)
 			if negate {
-				return engine.And(engine.Exists(m.Label), engine.Not(in))
+				return engine.And(engine.Exists(m.Label), engine.Not(in)), false
 			}
-			return in
+			return in, false
 		}
-		return engine.Const(true)
+		return engine.Const(true), false
 	}
 
-	expr := lower(e)
 	// A predicate that no dictionary value can satisfy means the query
 	// cannot match anything; say so up front instead of scanning.
-	if isAlwaysFalse(e, s) {
-		impossible = true
-	}
+	expr, impossible := lower(e)
 	return expr, warns, impossible
-}
-
-// isAlwaysFalse reports whether a predicate is one no dictionary value can
-// satisfy, so the scan can skip every shard instead of opening each one and
-// walking it with a constant-false filter.
-//
-// It mirrors the arms of the lowering above that fold to engine.Const(false),
-// and a regex is one of them: `pool =~ /nosuch/` produced the same empty
-// answer as `pool = "nosuch"` while reading the whole time range off disk to
-// get there, because only the equality arms were recognised here. The
-// regex arm is also the one a dashboard variable lands on, where the range
-// is the panel's and the sets are every set carrying the label.
-//
-// A negated match is deliberately absent: it lowers to an existence test,
-// not to a constant, so a key with no matching value still matches rows.
-func isAlwaysFalse(e mql.Expr, s *Store) bool {
-	switch {
-	case e.Eq != nil:
-		_, ok := s.lookup(e.Eq.Label, e.Eq.Value)
-		return !ok
-	case e.In != nil:
-		for _, v := range e.In.Values {
-			if _, ok := s.lookup(e.In.Label, v); ok {
-				return false
-			}
-		}
-		return true
-	case e.Match != nil:
-		re, err := regexp.Compile(e.Match.Regex)
-		if err != nil {
-			// The lowering folds an uncompilable regex to false too.
-			return true
-		}
-		vals, _ := s.labelIndicesMatching(e.Match.Label, re.MatchString)
-		return len(vals) == 0
-	case len(e.And) > 0:
-		for _, sub := range e.And {
-			if isAlwaysFalse(sub, s) {
-				return true
-			}
-		}
-	case len(e.Or) > 0:
-		// A disjunction can only be impossible when every arm is.
-		for _, sub := range e.Or {
-			if !isAlwaysFalse(sub, s) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
 }
 
 // ---------- execution ----------

@@ -259,7 +259,7 @@ answer with the oldest rows under a message saying the newest were kept.
 The shard planner now reports whether its selection overlaps, and the
 tabular executor keeps the early stop only where it does not.
 
-### 7.2 The dictionary is bounded in both dimensions
+### 7.2 The dictionary and the catalogue are bounded
 
 `max_label_cardinality` bounds the distinct values under one label key.
 `max_label_keys` bounds how many keys there are, because §8's one
@@ -272,6 +272,17 @@ Both refuse by name, per sample, on the write path, and both refuse only
 *new* entries: a key or a value the store already holds always works. The
 key budget defaults to 1000, which is far more than any spec in these
 documents declares; a negative value switches it off.
+
+`max_sets` (10 000) and `max_fields_per_set` (10 000) bound the catalogue
+on exactly the same grounds. A set name and a field name are chosen by the
+sender too — the line protocol, `/ingest/v1/samples` and `/v1/write` all
+let a client pick both — and the catalogue that records them is one
+in-memory map persisted as a single JSON record, so an unbounded number of
+either is the same cost in the same place. They follow the same rules:
+only a new entry is refused, the refusal names it, and a negative value
+switches the gate off. Declarations (`field_meta`, `set_meta`) are held to
+the budget as well, weighed whole before any of the request is applied, so
+the cheapest way past the cap is not the one that carries no data.
 
 Internal sets, all under the reserved prefix and all writable only by the store
 itself:
