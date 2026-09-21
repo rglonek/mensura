@@ -77,7 +77,7 @@ profiles:
 // `.nan` and `.inf` as real float64s -- makes the whole write request
 // carrying the declaration unencodable, which the sink reports as a lost
 // batch and every followed file's checkpoint freezes behind. An inverted
-// pair is quieter: MQL refuses `CLAMP MIN 5 MAX 1` as E007, while the
+// pair is quieter: MQL refuses `CLAMP MIN 5, MAX 1` as E007, while the
 // same pair arriving from the catalogue installed a clamp that bounds
 // nothing.
 func TestFieldLimitsAreValidated(t *testing.T) {

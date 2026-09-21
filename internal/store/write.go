@@ -671,7 +671,7 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		// to bound anything, it replaces every rendered value with the
 		// raw sample. Under RATE that means the panel draws the raw
 		// counter instead of the rate, and nothing anywhere says so.
-		// MQL refuses `CLAMP MIN 5 MAX 1` as E007 and extract.Compile
+		// MQL refuses `CLAMP MIN 5, MAX 1` as E007 and extract.Compile
 		// refuses the same pair in a spec; the write API was the one
 		// door it could still come through.
 		if m.LimitMin != nil && m.LimitMax != nil && *m.LimitMin > *m.LimitMax {

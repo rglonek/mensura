@@ -738,7 +738,7 @@ func (p *Profile) compile(s *Spec) error {
 		// unencodable, which the sink reports as a lost batch and every
 		// followed file's checkpoint freezes behind it until the next
 		// flush thaws them. An inverted pair is quieter and lasts
-		// longer: MQL refuses `CLAMP MIN 5 MAX 1` as E007, but the same
+		// longer: MQL refuses `CLAMP MIN 5, MAX 1` as E007, but the same
 		// pair arriving from the catalogue installs a clamp whose two
 		// halves cancel, so the field declares a range and is not
 		// bounded by it.

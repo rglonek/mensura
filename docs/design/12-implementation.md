@@ -3198,7 +3198,7 @@ a counter declaring `min: 100, max: 1` therefore drew the raw counter —
 1007, 1014, 1021 where the rate is 7 — with no error, no warning and a
 perfectly plausible-looking line. Both the other surfaces that can express
 the same pair already refuse it: MQL answers `E007` for
-`CLAMP MIN 5 MAX 1` ([06](06-query.md) §12) and `extract.Compile` refuses
+`CLAMP MIN 5, MAX 1` ([06](06-query.md) §12) and `extract.Compile` refuses
 `limits: {min: 5, max: 1}` in a spec (§6.146's neighbour). The write API
 was the one door left open, and it is the door a third-party writer or an
 ingester built before that check comes through.
@@ -3304,7 +3304,7 @@ populated.
   refuses both, so the whole write request carrying the declaration is
   undeliverable and every followed file's checkpoint freezes behind the
   lost batch until the next flush thaws it. An inverted pair is quieter
-  and lasts longer: MQL refuses `CLAMP MIN 5 MAX 1` as `E007`, while the
+  and lasts longer: MQL refuses `CLAMP MIN 5, MAX 1` as `E007`, while the
   same pair arriving from the catalogue installed a clamp whose two
   halves cancel, so a field declared a range and was not bounded by it.
 - **`store_stream_label:` is gone from the worked example.**
@@ -4161,6 +4161,19 @@ after the captures are collected.
   §6.184 gave it the depth one. `plan()` resolves every selected field
   against the catalogue under a read lock and length-prefixes every `BY`
   slot, so `MaxSelectFields` and `MaxByLabels` are checked here too.
+- **A comma-less `CLAMP` names its own clause.** The bound list is
+  comma-separated (§4.2 of [06](06-query.md)) and the comma is what tells
+  a second bound apart from the next `SELECT` field — `SELECT cpu CLAMP
+  MIN 0, mem` is two fields and `SELECT cpu CLAMP MIN 0, MAX 100` is one
+  (§6.76). Writing the bounds without it is the ordinary typo, and it
+  left the `CLAMP` holding one bound while the query ended on a keyword,
+  so the parser answered `unexpected "MAX" after end of query` at a
+  position past the whole `SELECT` list — naming neither the clause nor
+  the fix. The keyword can only ever be this, because a field called
+  `MIN` or `MAX` has to be quoted to be a name at all and a quoted name
+  lexes as a string. (The prose in several places also wrote the crossed
+  pair `E007` refuses as `CLAMP MIN 5 MAX 1`, which is a spelling the
+  grammar does not have; it is `CLAMP MIN 5, MAX 1`.)
 - **The plan's lists are lists.** `warnings` and `shards` carried a nil
   slice, so a plan with no warnings travelled as `"warnings": null` and a
   set with no shards as `"shards": null` — the same null-versus-`[]`

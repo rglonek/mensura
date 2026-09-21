@@ -484,6 +484,19 @@ func (p *parser) clamp() (*Clamp, error) {
 			break
 		}
 	}
+	// A bound list is comma-separated (06-query.md section 4.2), and the
+	// comma is what tells a second bound apart from the next SELECT
+	// field: `SELECT cpu CLAMP MIN 0, mem` is two fields and
+	// `SELECT cpu CLAMP MIN 0, MAX 100` is one. Writing the bounds
+	// without it is the ordinary typo, and it left the CLAMP holding one
+	// bound while the query ended on a keyword -- which came back as
+	// `unexpected "MAX" after end of query`, at a position past the
+	// whole SELECT list, naming neither the clause nor the fix. The
+	// keyword can only be this, because a field called MIN or MAX has to
+	// be quoted to be a name at all and a quoted name lexes as a string.
+	if t := p.cur(); t.kind == tokKeyword && (t.text == "MIN" || t.text == "MAX") {
+		return nil, p.errf("CLAMP bounds are separated by a comma: write `CLAMP MIN <a>, %s <b>`", t.text)
+	}
 	if p.acceptKeyword("ELSE") {
 		switch {
 		case p.acceptKeyword("RAW"):
