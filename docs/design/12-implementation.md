@@ -3865,13 +3865,28 @@ reporting zeroes that read like an idle store.
   matches every row that does not. Both readings are defensible and the
   grammar offers both; the asymmetry is recorded here rather than resolved,
   because changing either one silently changes what a stored panel draws.
+- **There is no spec reload.** [03](03-extraction.md) §11 describes
+  reloading a spec on `SIGHUP` or on a `--spec-reload-interval`, keeping
+  the running spec loudly when the new one will not compile and applying
+  new patterns to subsequent records only. `mensura-ingest` loads its
+  spec once, in `setup()`, and installs no signal handler: changing a
+  spec means restarting the process, which resumes each followed file
+  from its checkpoint. One bullet of that section *is* true, by a
+  different route: a field the catalogue stops seeing is marked
+  `stale: true` with a last-seen timestamp (§6.50), which is driven by
+  the field going unwritten rather than by the declaration going away.
 - **Documented CLI surface that does not exist.** `mensura-store
   convert-dashboard`, `mensura-store config check`, `mensura-ingest
   --label-from-path`, `--read-only-input`, and the whole ingest config
   file of [09](09-operations.md) §1.2 — `store:`, `state_dir:`, `spec:`,
   `labels:`, several `inputs:` entries, `progress:` — are described in
   [02](02-ingest.md), [06](06-query.md) and [09](09-operations.md) and
-  are not built. `mensura-ingest` is configured by flags only, and the
+  are not built. [02](02-ingest.md) §2's own synopsis spelled two
+  subcommands with flags that do not exist either (`--ssh user@h:/path`
+  for the remote tail, `--listen …` for the receiver); the real spellings
+  are `--ssh-host` with `--path`, and `--listen-tcp`/`--listen-udp`/
+  `--listen-http`, and the synopsis has been corrected rather than
+  recorded, because those flags are there. `mensura-ingest` is configured by flags only, and the
   subcommands that exist cover the single-input case each of the missing
   ones is sugar for. What `config check` describes does happen: the store
   refuses an inline secret at startup and names the key

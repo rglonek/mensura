@@ -539,6 +539,15 @@ BY host, pool
 
 ## 11. Spec changes over time
 
+> **Not built.** A running `mensura-ingest` loads its spec once, at start,
+> and has no `SIGHUP` handler and no `--spec-reload-interval`: changing a
+> spec means restarting the process, which re-reads each followed file
+> from its checkpoint. The rest of this section describes the intended
+> reload semantics; only the last bullet — the catalogue's `stale: true`
+> marking — is implemented today, and it is driven by a field going
+> unwritten rather than by a spec that stopped declaring it. See
+> [12](12-implementation.md) §7.
+
 Specs are versioned by content hash. On reload (`SIGHUP` or
 `--spec-reload-interval`):
 
