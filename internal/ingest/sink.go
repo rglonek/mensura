@@ -6,6 +6,7 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -512,15 +513,39 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 		s.enforceBufferCap(obs)
 		return false, nil
 	}
+	// The declarations are taken before the samples, because they travel
+	// in the same body and so have to be charged against the same budget.
+	//
+	// BatchBytes bounded the batches alone. A spec declaring a wide
+	// bucket set produces one FieldMeta per bucket column -- up to the
+	// 4096 a bucket set may hold -- and they all go out with the first
+	// write, on top of a full batch. An operator following the flag's own
+	// advice ("--batch-bytes ... must stay under the store's
+	// max_request_bytes") could still present a body past that limit, and
+	// the store answers 413, which wire.Client classifies as fatal: the
+	// sink drops the whole batch, reports it to the delivery observers as
+	// a hole, and every followed file's checkpoint freezes behind it.
+	// That is the exact failure BatchBytes exists to prevent, arriving
+	// through the half of the body nothing measured.
+	s.metaMu.Lock()
+	meta, sets := s.metaQ, s.setQ
+	s.metaQ, s.setQ = nil, nil
+	s.metaMu.Unlock()
+	// Measured before the buffer lock is taken: the queue is empty on all
+	// but the first flush of a process, but when it is not this walks
+	// every declaration, and nothing that long-running belongs under the
+	// lock every Add contends for.
+	budget := s.sampleBudget(meta, sets)
+
 	s.mu.Lock()
 	if s.pending == 0 {
 		s.mu.Unlock()
 		// Metadata still has to reach the store even when no samples are
 		// waiting, or a spec's declarations would sit in the queue until
 		// the first sample happens to arrive.
-		return false, s.flushMetaOnly(ctx)
+		return false, s.sendMeta(ctx, meta, sets)
 	}
-	batches, count, partial := s.takeLocked()
+	batches, count, partial := s.takeLocked(budget)
 	if !partial {
 		// Under the buffer lock: the batch is now fixed, and any Add
 		// racing this flush is either already in it or blocked until it
@@ -535,11 +560,6 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 		s.beginFlush(obs)
 	}
 	s.mu.Unlock()
-
-	s.metaMu.Lock()
-	meta, sets := s.metaQ, s.setQ
-	s.metaQ, s.setQ = nil, nil
-	s.metaMu.Unlock()
 
 	req := &wire.WriteRequest{FieldMeta: meta, SetMeta: sets, Batches: batches}
 	resp, err := s.client.Write(ctx, req)
@@ -661,9 +681,10 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 	return partial, nil
 }
 
-// takeLocked moves buffered samples into batches, bounded by BatchBytes,
-// and reports how many it took and whether it left anything behind. It
-// must be called with the buffer lock held.
+// takeLocked moves buffered samples into batches, bounded by the body
+// budget the caller has left after the declarations, and reports how many
+// it took and whether it left anything behind. It must be called with the
+// buffer lock held.
 //
 // The size bound is what BatchBytes was always documented to be and never
 // was: nothing read it, so a request was bounded only by a sample count.
@@ -671,7 +692,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 // body past the store's max_request_bytes comes back 413 -- a status the
 // client classifies as fatal, so the whole buffer was dropped rather than
 // delivered in pieces.
-func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
+func (s *Sink) takeLocked(budget int) ([]model.Batch, int, bool) {
 	sets := make([]string, 0, len(s.buffers))
 	for set := range s.buffers {
 		sets = append(sets, set)
@@ -696,7 +717,7 @@ func (s *Sink) takeLocked() ([]model.Batch, int, bool) {
 			sz := sampleBytes(&samples[n])
 			// Always take at least one sample: a single sample bigger
 			// than the budget would otherwise never leave the buffer.
-			if taken+n > 0 && s.cfg.BatchBytes > 0 && size+sz > s.cfg.BatchBytes {
+			if taken+n > 0 && budget > 0 && size+sz > budget {
 				break
 			}
 			size += sz
@@ -1029,12 +1050,57 @@ func (s *Sink) requeueMeta(meta []wire.FieldMeta, sets []wire.SetMeta) {
 	s.metaMu.Unlock()
 }
 
-// flushMetaOnly delivers queued metadata with no samples attached.
-func (s *Sink) flushMetaOnly(ctx context.Context) error {
-	s.metaMu.Lock()
-	meta, sets := s.metaQ, s.setQ
-	s.metaQ, s.setQ = nil, nil
-	s.metaMu.Unlock()
+// sampleBudget is how many body bytes are left for samples once the
+// declarations travelling with them have been paid for.
+//
+// The declarations are measured rather than estimated: the queue is empty
+// on all but the first flush of a process, so marshalling it costs
+// nothing in the steady state and the number is exact where it matters.
+// Never below one byte: a budget of zero would read as "no bound" in
+// takeLocked, and the honest degenerate answer when the declarations
+// alone fill the body is one sample per request until they have gone.
+func (s *Sink) sampleBudget(meta []wire.FieldMeta, sets []wire.SetMeta) int {
+	if s.cfg.BatchBytes <= 0 {
+		return 0
+	}
+	budget := s.cfg.BatchBytes - metaBytes(meta, sets)
+	if budget < 1 {
+		budget = 1
+	}
+	return budget
+}
+
+// metaBytes is what the declarations occupy in the request body,
+// including the two keys that carry them.
+func metaBytes(meta []wire.FieldMeta, sets []wire.SetMeta) int {
+	if len(meta) == 0 && len(sets) == 0 {
+		return 0
+	}
+	n := 0
+	if len(meta) > 0 {
+		n += metaKeyBytes
+		if b, err := json.Marshal(meta); err == nil {
+			n += len(b)
+		}
+	}
+	if len(sets) > 0 {
+		n += setMetaKeyBytes
+		if b, err := json.Marshal(sets); err == nil {
+			n += len(b)
+		}
+	}
+	return n
+}
+
+const (
+	// `"field_meta":` plus the comma that separates it from the next key.
+	metaKeyBytes = 14
+	// `"set_meta":` plus the same separator.
+	setMetaKeyBytes = 12
+)
+
+// sendMeta delivers queued metadata with no samples attached.
+func (s *Sink) sendMeta(ctx context.Context, meta []wire.FieldMeta, sets []wire.SetMeta) error {
 	if len(meta) == 0 && len(sets) == 0 {
 		return nil
 	}

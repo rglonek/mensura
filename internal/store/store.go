@@ -350,10 +350,65 @@ func (d *dictionary) takeHole() (int32, bool) {
 	return 0, false
 }
 
+// checkDurations refuses a negative retention, shard width or sweep
+// interval rather than letting it become the opposite of what was asked
+// for.
+//
+// Every one of them is read with a `> 0` or `<= 0` test further down, so a
+// negative is not a tighter setting, it is the gate switched off -- and
+// switched off in the one direction that is invisible. A negative
+// `retention` makes retentionFor answer "keep everything", which makes
+// shardWidth answer 0, which routes every row of that set to the
+// unsharded "@all" shard that the sweep skips by name: the data is kept
+// for ever, in a shape retention can never reach, from a spelling that
+// reads like "keep it for less time". A negative sweep interval is
+// quieter still -- the sweep goroutine is simply never started, so
+// nothing ages out at all and the store looks healthy.
+//
+// Both are already refused everywhere else a duration of theirs can be
+// declared: checkSetMeta on the write API, and extract.Compile in a spec.
+// The store's own configuration was the door left open.
+func checkDurations(cfg Config) error {
+	if cfg.Retention < 0 {
+		return fmt.Errorf("store: retention %s must not be negative; 0 is how \"keep everything\" is written", cfg.Retention)
+	}
+	if cfg.Shard < 0 {
+		return fmt.Errorf("store: shard width %s must not be negative; 0 leaves the default", cfg.Shard)
+	}
+	if cfg.RetentionSweep < 0 {
+		return fmt.Errorf("store: retention sweep interval %s must not be negative; 0 is how the sweep is switched off", cfg.RetentionSweep)
+	}
+	for _, name := range sortedKeys(cfg.SetRetention) {
+		if cfg.SetRetention[name] < 0 {
+			return fmt.Errorf("store: retention for set %s is %s, which must not be negative; 0 is how \"keep everything\" is written", name, cfg.SetRetention[name])
+		}
+	}
+	for _, name := range sortedKeys(cfg.SetShard) {
+		if cfg.SetShard[name] < 0 {
+			return fmt.Errorf("store: shard width for set %s is %s, which must not be negative; leave it unset to take the default", name, cfg.SetShard[name])
+		}
+	}
+	return nil
+}
+
+// sortedKeys lists a map's keys in a stable order, so a configuration
+// with several faults always names the same one first.
+func sortedKeys(m map[string]time.Duration) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Open starts a store on a data directory. Exactly one process may hold it.
 func Open(cfg Config) (*Store, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = DefaultConfig().Logger
+	}
+	if err := checkDurations(cfg); err != nil {
+		return nil, err
 	}
 	if cfg.Shard <= 0 {
 		cfg.Shard = 24 * time.Hour
@@ -397,6 +452,31 @@ func Open(cfg Config) (*Store, error) {
 		opts.L0StopWritesThreshold = 40
 		opts.EnableBloomFilter = true
 		opts.MaxConcurrentCompactions = 2
+	}
+	// The engine knobs are checked before they are applied, the way
+	// durability, storage_profile and compression are: they travel
+	// straight into Pebble, and two of them are numbers Pebble has no
+	// defence against.
+	//
+	// MaxConcurrentCompactions is the dangerous one. Pebble's own
+	// documentation says it "must be greater than 0", and Pebble does not
+	// enforce it: the compaction scheduler compares
+	// `compactingCount >= MaxConcurrentCompactions()`, which is true at
+	// zero for any negative value, so *no compaction ever starts*. L0
+	// then grows until L0StopWritesThreshold is reached and every write
+	// stalls for ever -- from a store that opened cleanly, logged
+	// nothing, and served queries until the writes stopped.
+	//
+	// CacheBytes has a sentinel (engine.NoBlockCache, -1) and no other
+	// negative means anything: pebbleOptions matches neither arm, so the
+	// setting is dropped and Pebble allocates its own 8 MiB default --
+	// the opposite of what an operator writing a negative number is
+	// asking for, and silently.
+	if cfg.MaxConcurrentCompactions < 0 {
+		return nil, fmt.Errorf("store: db.max_concurrent_compactions %d must be positive; the engine compares its compaction count against this number, so a negative one stops every compaction and the LSM grows until writes stall", cfg.MaxConcurrentCompactions)
+	}
+	if cfg.CacheBytes < 0 && cfg.CacheBytes != engine.NoBlockCache {
+		return nil, fmt.Errorf("store: db.cache_bytes %d must be positive, 0 for the default, or %d for no block cache at all", cfg.CacheBytes, engine.NoBlockCache)
 	}
 	// Explicit tuning is applied last, so it wins over the profile's
 	// choices rather than being quietly overridden by them.

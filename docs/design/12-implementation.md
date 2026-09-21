@@ -3198,7 +3198,7 @@ a counter declaring `min: 100, max: 1` therefore drew the raw counter —
 1007, 1014, 1021 where the rate is 7 — with no error, no warning and a
 perfectly plausible-looking line. Both the other surfaces that can express
 the same pair already refuse it: MQL answers `E007` for
-`CLAMP MIN 5 MAX 1` ([06](06-query.md) §12) and `extract.Compile` refuses
+`CLAMP MIN 5, MAX 1` ([06](06-query.md) §12) and `extract.Compile` refuses
 `limits: {min: 5, max: 1}` in a spec (§6.146's neighbour). The write API
 was the one door left open, and it is the door a third-party writer or an
 ingester built before that check comes through.
@@ -3304,7 +3304,7 @@ populated.
   refuses both, so the whole write request carrying the declaration is
   undeliverable and every followed file's checkpoint freezes behind the
   lost batch until the next flush thaws it. An inverted pair is quieter
-  and lasts longer: MQL refuses `CLAMP MIN 5 MAX 1` as `E007`, while the
+  and lasts longer: MQL refuses `CLAMP MIN 5, MAX 1` as `E007`, while the
   same pair arriving from the catalogue installed a clamp whose two
   halves cancel, so a field declared a range and was not bounded by it.
 - **`store_stream_label:` is gone from the worked example.**
@@ -3865,13 +3865,28 @@ reporting zeroes that read like an idle store.
   matches every row that does not. Both readings are defensible and the
   grammar offers both; the asymmetry is recorded here rather than resolved,
   because changing either one silently changes what a stored panel draws.
+- **There is no spec reload.** [03](03-extraction.md) §11 describes
+  reloading a spec on `SIGHUP` or on a `--spec-reload-interval`, keeping
+  the running spec loudly when the new one will not compile and applying
+  new patterns to subsequent records only. `mensura-ingest` loads its
+  spec once, in `setup()`, and installs no signal handler: changing a
+  spec means restarting the process, which resumes each followed file
+  from its checkpoint. One bullet of that section *is* true, by a
+  different route: a field the catalogue stops seeing is marked
+  `stale: true` with a last-seen timestamp (§6.50), which is driven by
+  the field going unwritten rather than by the declaration going away.
 - **Documented CLI surface that does not exist.** `mensura-store
   convert-dashboard`, `mensura-store config check`, `mensura-ingest
   --label-from-path`, `--read-only-input`, and the whole ingest config
   file of [09](09-operations.md) §1.2 — `store:`, `state_dir:`, `spec:`,
   `labels:`, several `inputs:` entries, `progress:` — are described in
   [02](02-ingest.md), [06](06-query.md) and [09](09-operations.md) and
-  are not built. `mensura-ingest` is configured by flags only, and the
+  are not built. [02](02-ingest.md) §2's own synopsis spelled two
+  subcommands with flags that do not exist either (`--ssh user@h:/path`
+  for the remote tail, `--listen …` for the receiver); the real spellings
+  are `--ssh-host` with `--path`, and `--listen-tcp`/`--listen-udp`/
+  `--listen-http`, and the synopsis has been corrected rather than
+  recorded, because those flags are there. `mensura-ingest` is configured by flags only, and the
   subcommands that exist cover the single-input case each of the missing
   ones is sugar for. What `config check` describes does happen: the store
   refuses an inline secret at startup and names the key
@@ -4024,3 +4039,169 @@ and a negation never is.
   an alias `Print` does not emit: the AST stopped round-tripping through
   its own canonical text, which is what every other empty-name refusal
   here exists to keep.
+
+### 6.185 The compaction setting that stopped every compaction
+
+`db.max_concurrent_compactions` travelled from the config file into
+Pebble's `Options.MaxConcurrentCompactions` unchecked. Pebble's own
+documentation for that field says it "must be greater than 0", and Pebble
+does not enforce it — `Options.Validate` checks the memtable size, the L0
+thresholds and the format version, and not this. The compaction scheduler
+compares
+
+```go
+if d.mu.compact.compactingCount >= d.opts.MaxConcurrentCompactions() {
+    return
+}
+```
+
+which is true at a compacting count of zero for any negative value, so
+**no compaction ever starts**. The store opens cleanly, logs nothing,
+serves queries, and L0 grows until `L0StopWritesThreshold` is reached and
+every write stalls — permanently, from a single minus sign.
+
+`db.cache_bytes` had the quieter half of the same shape. `engine.NoBlockCache`
+is `-1` and is translated into the smallest cache Pebble will build; every
+*other* negative matched neither arm of `pebbleOptions`, so the setting was
+dropped and Pebble allocated its own 8 MiB default — the opposite of what
+an operator writing a negative number is asking for.
+
+Both are now refused by name in `store.Open`, where `durability`,
+`storage_profile` and `compression` were already validated.
+
+### 6.186 A negative retention kept the data for ever
+
+`retention.default`, `retention.shard`, `retention.sweep` and the per-set
+overrides are each read with a `> 0` or `<= 0` test, so a negative is not
+a tighter setting — it is the gate switched off, in the one direction that
+is invisible:
+
+- a negative `retention` makes `retentionFor` answer "keep everything",
+  which makes `shardWidth` answer 0, which routes every row of that set to
+  the unsharded `@all` shard that the sweep skips **by name**. The data is
+  kept for ever, in a shape retention can never reach, from a spelling
+  that reads like "keep it for less time";
+- a negative `sweep` is quieter still: `Open` starts the sweep goroutine
+  only when the interval is positive, so nothing ages out at all and the
+  store looks healthy.
+
+The same values are already refused everywhere else a duration of theirs
+can be declared — `checkSetMeta` on the write API, `extract.Compile` in a
+spec — so the store's own configuration was the door left open.
+`store.Open` now refuses them, naming the set where one is per-set. Zero
+keeps meaning "keep everything", which is how the documented
+`--retention 0` posture is written.
+
+### 6.187 Three gates a negative value did not switch off
+
+`limits.max_label_keys`, `max_sets` and `max_fields_per_set` document
+"<0 disables" and implement it (`toStoreConfig` applies them when the
+configured value is non-zero). `max_series_per_graph`,
+`max_datapoints_received` and `max_label_cardinality` — read by the same
+`> 0` tests in the store — were applied only when the configured value was
+*positive*, so a negative was silently ignored and the built-in default
+gate stayed in force. An operator removing a ceiling kept it, and the
+comment on `max_label_keys` claimed "a negative value is how every other
+gate here is switched off", which was true of two of the five it spoke
+for. All six now go through one helper.
+
+`narrower` had the matching fault on the read side. It applies a per-query
+`LIMIT` on top of a datasource ceiling and treated only *zero* as "no
+ceiling", so against a negative one `*limit < ceiling` is false for every
+positive limit: the ceiling was returned and the query's own
+`LIMIT POINTS 500` bounded nothing at all. A limit may only ever narrow,
+so a non-positive ceiling now always yields to it.
+
+### 6.188 `--batch-bytes` did not count the declarations
+
+`BatchBytes` is the only thing between a buffer and a 413, which
+`wire.Client` classifies as fatal — the sink drops the batch, reports it
+to the delivery observers as a hole, and every followed file's checkpoint
+freezes behind it (§6.174, §6.182). It bounded the *batches* and not the
+request they travel in: `field_meta` and `set_meta` go out in the same
+body, and a spec declaring a wide bucket set produces one `FieldMeta` per
+bucket column — up to the 4096 a bucket set may hold — all of them on the
+first write, on top of a full batch. An operator following the flag's own
+advice ("must stay under the store's `max_request_bytes`") could still
+present a body past that limit.
+
+`flushRound` now takes the declarations first, measures them, and hands
+`takeLocked` what is left. They are measured rather than estimated: the
+queue is empty on all but the first flush of a process, so marshalling it
+costs nothing in the steady state and the number is exact where it
+matters. Declarations bigger than the whole budget still leave — they are
+applied before any batch, so they are the smallest unit there is — with
+one sample beside them rather than an unbounded take.
+
+### 6.189 Field metadata followed the pattern, not the branch
+
+`route:` lets one pattern fan out to several sets, and `process()` treats
+the branches as alternatives: an `extract:` regex that matches writes
+`pat.Set` with its own captures, and only when none of them matches is a
+`route:` regex tried, writing *that* route's set with *that* route's
+captures. `Declarations()` merged them — every capture of every regex was
+attributed to every set the pattern names — with two consequences, both
+silent:
+
+- a pattern that declares no `extract:` at all never writes its own
+  `set:`, and that is the shape §4 of [03](03-extraction.md) shows for
+  fan-out and the shape its worked example uses. The set was declared
+  anyway, so the catalogue gained an entry nothing can ever write: the
+  query builder offers it in the set list, `mql.Validate` resolves a field
+  against it, and `FROM hist SELECT total` comes back empty with no W203
+  to say the field is not there — which is the one diagnostic that exists
+  to explain an empty panel;
+- each branch's columns were declared on the other branch's set, so the
+  declared kind, unit, cadence and limits of a millisecond histogram
+  landed on the microsecond set beside it, where `resolveField` installs
+  them as that field's defaults.
+
+Both also count against `max_sets` and `max_fields_per_set` (§6.181).
+Declarations now follow the branch. `default_values` and the column an
+`aggregate:` synthesises are the exception in the other direction: they
+are applied after a branch has matched, whichever one it was, so they
+belong to every destination — as does a `bucket_set:`, which is expanded
+after the captures are collected.
+
+### 6.190 Smaller corrections
+
+- **The line protocol has four positions.** `<set> <labels> <fields>
+  [ts]` — and anything past the timestamp was silently discarded while the
+  rest of the line was stored. A sender that separated its fields with a
+  space instead of a comma was told its sample had landed and lost every
+  field but the first. It is refused now, naming what it refused and why.
+- **`Explain` bounds the width of a query.** It deliberately does not run
+  `mql.Validate` — a half-built query from the builder still has to
+  explain — so the only bounds it has are the ones it takes itself, and
+  §6.184 gave it the depth one. `plan()` resolves every selected field
+  against the catalogue under a read lock and length-prefixes every `BY`
+  slot, so `MaxSelectFields` and `MaxByLabels` are checked here too.
+- **A comma-less `CLAMP` names its own clause.** The bound list is
+  comma-separated (§4.2 of [06](06-query.md)) and the comma is what tells
+  a second bound apart from the next `SELECT` field — `SELECT cpu CLAMP
+  MIN 0, mem` is two fields and `SELECT cpu CLAMP MIN 0, MAX 100` is one
+  (§6.76). Writing the bounds without it is the ordinary typo, and it
+  left the `CLAMP` holding one bound while the query ended on a keyword,
+  so the parser answered `unexpected "MAX" after end of query` at a
+  position past the whole `SELECT` list — naming neither the clause nor
+  the fix. The keyword can only ever be this, because a field called
+  `MIN` or `MAX` has to be quoted to be a name at all and a quoted name
+  lexes as a string. (The prose in several places also wrote the crossed
+  pair `E007` refuses as `CLAMP MIN 5 MAX 1`, which is a spelling the
+  grammar does not have; it is `CLAMP MIN 5, MAX 1`.)
+- **The documented configuration is valid YAML.** `metrics:{addr: …}` in
+  §1.1 of [09](09-operations.md) has no space after its colon, so it is
+  not a mapping at all: an operator copying the example got
+  `yaml: line 6: did not find expected key`, which points at `listen:`
+  and says nothing about the entry three lines below it. That is the same
+  copy-the-example failure `max_concurrent_requests` and
+  `write_rate_per_client` were given named refusals for, arriving through
+  the syntax rather than through the schema. A guard in the loader's own
+  tests now decodes the documented block into `fileConfig` with
+  `KnownFields(true)`, so both the syntax and the key set stay in step.
+- **The plan's lists are lists.** `warnings` and `shards` carried a nil
+  slice, so a plan with no warnings travelled as `"warnings": null` and a
+  set with no shards as `"shards": null` — the same null-versus-`[]`
+  distinction `QueryResponse.Series`, `LabelValues.Values` and the
+  catalogue's own `sets` and `labels` were each changed to stop making a
+  client tell apart.

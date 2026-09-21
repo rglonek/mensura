@@ -26,7 +26,7 @@ listen:
   write:  {addr: "0.0.0.0:9631", tls: {cert: …, key: …, client_ca: …}}
   query:  {addr: "127.0.0.1:9632"}   # read surface only: no /v1/write, no /v1/admin/*
   debug:  {addr: "127.0.0.1:9633"}   # /v1/debug/*, loopback only
-  metrics:{addr: "127.0.0.1:9634"}
+  metrics: {addr: "127.0.0.1:9634"}
 
 # Every listener honours its own tls: block. A separate `query` address is a
 # separate *surface*, not only a separate port: it mounts the read endpoints
@@ -46,9 +46,9 @@ limits:
   max_buffered_request_bytes: 0   # 0 = 4x max_request_bytes; total body bytes held at once
   max_concurrent_writes: 8        # write slots; past them the store sheds with 503
   max_concurrent_jobs: 8          # concurrent queries
-  max_series_per_graph: 1000
-  max_datapoints_received: 34560000
-  max_label_cardinality: 100000   # distinct values under one label key
+  max_series_per_graph: 1000      # <0 disables
+  max_datapoints_received: 34560000 # <0 disables
+  max_label_cardinality: 100000   # distinct values under one label key; <0 disables
   max_label_keys: 1000            # distinct label keys in all; <0 disables
   max_sets: 10000                 # distinct sets in the catalogue; <0 disables
   max_fields_per_set: 10000       # distinct fields under one set; <0 disables
@@ -65,9 +65,9 @@ retention:
     http: {retention: 7d, shard: 1h}
 
 db:                              # see 05-storage.md §9; 0 = engine default
-  cache_bytes: 0
+  cache_bytes: 0                 # -1 asks for no block cache; no other negative is accepted
   memtable_size_bytes: 0
-  max_concurrent_compactions: 0
+  max_concurrent_compactions: 0  # must be positive; the engine never compacts on a negative
   compression: ""
 ```
 

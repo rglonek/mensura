@@ -89,7 +89,7 @@ func TestTakeLockedBoundsTheWholeBody(t *testing.T) {
 		if round > 200 {
 			t.Fatal("takeLocked made no progress")
 		}
-		batches, count, _ := s.takeLocked()
+		batches, count, _ := s.takeLocked(s.cfg.BatchBytes)
 		if count == 0 {
 			t.Fatal("takeLocked took nothing while samples remain")
 		}

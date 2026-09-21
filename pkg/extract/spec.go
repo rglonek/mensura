@@ -738,7 +738,7 @@ func (p *Profile) compile(s *Spec) error {
 		// unencodable, which the sink reports as a lost batch and every
 		// followed file's checkpoint freezes behind it until the next
 		// flush thaws them. An inverted pair is quieter and lasts
-		// longer: MQL refuses `CLAMP MIN 5 MAX 1` as E007, but the same
+		// longer: MQL refuses `CLAMP MIN 5, MAX 1` as E007, but the same
 		// pair arriving from the catalogue installs a clamp whose two
 		// halves cancel, so the field declares a range and is not
 		// bounded by it.
@@ -1295,8 +1295,34 @@ type SetDeclaration struct {
 }
 
 // Declarations resolves the profile's field metadata onto the sets its
-// patterns write. A field is attributed to a set when a pattern writing
+// patterns write. A field is attributed to a set when a *branch* writing
 // that set captures it.
+//
+// The branch is what matters, and it used to be ignored: every capture of
+// every regex was attributed to every set the pattern names. process()
+// does not work that way. An `extract:` regex that matches writes
+// `pat.Set` with its own captures, and only when none of them matches is
+// a `route:` regex tried -- writing that route's set with that route's
+// captures. The two are alternatives, so merging them declared each
+// branch's columns on the other branch's set, and a pattern that declares
+// no `extract:` at all -- which is the shape 03-extraction.md section 4
+// shows for fan-out, and the shape its worked example uses -- declared
+// every one of them on a `set:` that nothing can ever write.
+//
+// Neither is visible at run time, and both cost the same thing. The
+// catalogue is what the query builder offers and what mql.Validate
+// resolves a field against, so a phantom set appears in the set list and
+// `FROM hist SELECT total` validates clean and draws nothing, with no
+// W203 to say the field is not there -- which is the one diagnostic that
+// exists to explain an empty panel. The entries count against
+// `max_sets` and `max_fields_per_set` as well, and the declared unit,
+// kind, cadence and limits of one branch's column land on the other
+// branch's set, where the query layer installs them as that field's
+// defaults.
+//
+// `default_values` and the column an `aggregate:` synthesises are the
+// exception in the other direction: they are applied after a branch has
+// matched, whichever one it was, so they belong to every destination.
 func (p *Profile) Declarations() []SetDeclaration {
 	bySet := map[string]*SetDeclaration{}
 	get := func(set string) *SetDeclaration {
@@ -1308,33 +1334,50 @@ func (p *Profile) Declarations() []SetDeclaration {
 		return d
 	}
 	for _, pat := range p.Patterns {
-		sets := []string{pat.Set}
-		for _, r := range pat.Route {
-			sets = append(sets, r.Set)
-		}
-		var captures []string
-		for _, re := range pat.extract {
-			captures = append(captures, re.SubexpNames()...)
-		}
-		for i := range pat.Route {
-			captures = append(captures, pat.Route[i].re.SubexpNames()...)
-		}
+		// Names that reach the row whichever branch matched.
+		var shared []string
 		for k := range pat.DefaultValues {
-			captures = append(captures, k)
+			shared = append(shared, k)
 		}
 		if pat.Aggregate != nil {
-			captures = append(captures, pat.Aggregate.Field)
+			shared = append(shared, pat.Aggregate.Field)
 		}
-		for _, set := range sets {
-			d := get(set)
-			for _, name := range captures {
-				if name == "" {
-					continue
-				}
-				if fs, ok := p.Fields[name]; ok {
+		// One destination per branch, each with the captures that branch
+		// can actually produce. A pattern with no `extract:` never
+		// writes pat.Set, so it is not a destination at all.
+		type branch struct {
+			set      string
+			captures []string
+		}
+		var branches []branch
+		if len(pat.extract) > 0 {
+			var caps []string
+			for _, re := range pat.extract {
+				caps = append(caps, re.SubexpNames()...)
+			}
+			branches = append(branches, branch{pat.Set, caps})
+		}
+		for i := range pat.Route {
+			branches = append(branches, branch{pat.Route[i].Set, pat.Route[i].re.SubexpNames()})
+		}
+		for _, b := range branches {
+			if b.set == "" {
+				continue
+			}
+			d := get(b.set)
+			for _, name := range b.captures {
+				if fs, ok := p.Fields[name]; ok && name != "" {
 					d.Fields[name] = fs
 				}
 			}
+			for _, name := range shared {
+				if fs, ok := p.Fields[name]; ok && name != "" {
+					d.Fields[name] = fs
+				}
+			}
+			// A bucket set is expanded after the captures are collected,
+			// whichever branch produced them, so every destination
+			// carries its columns.
 			if pat.BucketSet != "" {
 				if bs, ok := p.buckets[pat.BucketSet]; ok {
 					d.BucketSets = append(d.BucketSets, bs)

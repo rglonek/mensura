@@ -66,7 +66,7 @@ func TestTakeStaysUnderBatchBytes(t *testing.T) {
 		s.pending++
 	}
 	s.mu.Lock()
-	batches, taken, _ := s.takeLocked()
+	batches, taken, _ := s.takeLocked(s.cfg.BatchBytes)
 	s.mu.Unlock()
 	if taken == 0 {
 		t.Fatal("took nothing")

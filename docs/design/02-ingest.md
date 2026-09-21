@@ -21,17 +21,20 @@ and does not intern label strings into dictionary indices.
 ## 2. Subcommands
 
 ```
-mensura-ingest batch    --spec F --source S…   [--store URL]   one-shot import, exits when done
-mensura-ingest follow   --spec F --path P…     [--store URL]   long-running tail
-mensura-ingest follow   --spec F --ssh user@h:/path/*.log      long-running remote tail
-mensura-ingest receive  --spec F --listen …    [--store URL]   long-running network receiver
-mensura-ingest check    --spec F [--sample FILE] [--label k=v]   offline spec linting / dry run
-mensura-ingest query    --store URL 'MQL…'                      debugging client
+mensura-ingest batch    --spec F --source S,…              [--store URL]   one-shot import, exits when done
+mensura-ingest follow   --spec F --path P,…                [--store URL]   long-running tail
+mensura-ingest follow   --spec F --ssh-host H --path P,…   [--store URL]   long-running remote tail
+mensura-ingest receive  --spec F --listen-tcp|-udp|-http A [--store URL]   long-running network receiver
+mensura-ingest check    --spec F [--sample FILE] [--label k=v]             offline spec linting / dry run
+mensura-ingest query    --store URL 'MQL…'                                 debugging client
 ```
 
-`batch`, `follow` and `receive` may be combined in one process via a config
-file with multiple `inputs:` entries; the subcommands are sugar for the common
-single-input case. One process, many inputs, one write client.
+`batch`, `follow` and `receive` are one input each. The design also describes
+combining them in one process via a config file with multiple `inputs:`
+entries — one process, many inputs, one write client — and that file is not
+built: `mensura-ingest` is configured by flags only, and each subcommand
+covers the single-input case its `inputs:` entry would be sugar for. See
+[12](12-implementation.md) §7.
 
 ## 3. Pipeline
 

@@ -143,13 +143,23 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	return resp, nil
 }
 
-// narrower applies a per-query LIMIT on top of a datasource ceiling. Zero
-// means "no gate", so a limit always wins over an absent ceiling.
+// narrower applies a per-query LIMIT on top of a datasource ceiling. A
+// non-positive ceiling means "no gate", so a limit always wins over an
+// absent one.
+//
+// Non-positive, not just zero. Every gate that reads these numbers tests
+// `> 0`, so a *negative* ceiling switches the gate off exactly as a zero
+// does -- and that is how the configuration writes "disabled" for the
+// budgets beside these two. Comparing against zero alone therefore had an
+// operator who disabled the datasource ceiling lose the per-query LIMIT
+// with it: `*limit < ceiling` is false for every positive limit against a
+// negative ceiling, so the ceiling was returned and `LIMIT POINTS 500`
+// bounded nothing at all. A limit may only ever narrow.
 func narrower(ceiling int, limit *int) int {
 	if limit == nil || *limit <= 0 {
 		return ceiling
 	}
-	if ceiling == 0 || *limit < ceiling {
+	if ceiling <= 0 || *limit < ceiling {
 		return *limit
 	}
 	return ceiling
@@ -1415,6 +1425,23 @@ func (s *Store) setsWithLabel(key string) []string {
 // Explain reports the plan a query would run, which is what the builder's
 // Explain button and the debug endpoint show.
 func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, error) {
+	// The width of the query is bounded here, as its depth already is at
+	// both entry points.
+	//
+	// Explain deliberately does not run mql.Validate -- a half-built
+	// query from the builder still has to explain -- so the only bounds
+	// it has are the ones it takes itself. plan() resolves every selected
+	// field against the catalogue under a read lock and length-prefixes
+	// every BY slot, so an AST carrying a million of either is minutes of
+	// locked work per request on an endpoint the query editor calls
+	// freely. That is the same unbounded-work hazard CheckPredicateDepth
+	// was added here to close, on the other axis.
+	if n := len(q.Select); n > mql.MaxSelectFields {
+		return nil, mql.Diag{Code: "E007", Msg: fmt.Sprintf("query selects %d fields, which is beyond the limit of %d", n, mql.MaxSelectFields)}
+	}
+	if n := len(q.By); n > mql.MaxByLabels {
+		return nil, mql.Diag{Code: "E007", Msg: fmt.Sprintf("query groups by %d labels, which is beyond the limit of %d", n, mql.MaxByLabels)}
+	}
 	p, warns, err := s.plan(q, req)
 	if err != nil {
 		return nil, err
@@ -1488,6 +1515,17 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 		// describes a stage of the plan that does not run. Explain may
 		// not report a plan that is not the plan.
 		window = 0
+	}
+	// Lists, never null, for the reason QueryResponse.Series,
+	// LabelValues.Values and the catalogue's own `sets` and `labels`
+	// are: a plan with no warnings travelled as `"warnings": null` and a
+	// set with no shards as `"shards": null`, so the builder's Explain
+	// button had to tell "none" apart from "no array" to render either.
+	if warns == nil {
+		warns = []mql.Diag{}
+	}
+	if p.shards == nil {
+		p.shards = []string{}
 	}
 	return map[string]any{
 		"shards":            p.shards,
