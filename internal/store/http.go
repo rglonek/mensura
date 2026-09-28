@@ -326,6 +326,20 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 			writeErr(w, http.StatusBadRequest, bad.Msg)
 			return
 		}
+		// A store that is shutting down is not a broken one, and it is
+		// the one condition a write client can be told how long to wait
+		// for. handleQuery and writeAdminErr both answer it with the
+		// status that means "come back"; the write API answered 500,
+		// which wire.Client retries on its own exponential backoff --
+		// so the batch that arrives during a rolling restart spends its
+		// retries against a process that has already gone, and is then
+		// held on the client's own timer rather than the one the store
+		// named.
+		if errors.Is(err, ErrClosed) {
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

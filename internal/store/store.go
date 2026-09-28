@@ -257,6 +257,28 @@ func (f fieldEntry) stale() bool {
 	return f.LastSeenMs > 0 && time.Since(time.UnixMilli(f.LastSeenMs)) > staleAfter
 }
 
+// kind is the field kind to report, with the default applied.
+//
+// The stored Kind is empty for a field the catalogue only ever *observed*
+// -- one that arrived on a sample with no `fields:` entry behind it --
+// and that is deliberately not the same thing as a field declared
+// `kind: gauge`. observeSet used to write the default into the record,
+// which made the two indistinguishable, and applyFieldMeta's conflict
+// test reads that field: a set written before its metadata arrived (a
+// second ingester, a second profile, or simply the first batch of a spec
+// with no `fields:` block for that column) recorded a
+// CatalogueConflict "was gauge, now counter" for a declaration nothing
+// had disagreed with, and /v1/catalogue reported it to every client. The
+// default belongs where the record is *rendered*, not where it is
+// stored: every consumer of this value treats an unrecognised kind and a
+// gauge alike, so the reported shape does not change.
+func (f fieldEntry) kind() model.Kind {
+	if f.Kind == "" {
+		return model.KindGauge
+	}
+	return f.Kind
+}
+
 // dictionary is the string-to-index map for one label key. The store owns
 // it because with many independent ingesters a single writer is the only
 // way to keep indices consistent without a coordination protocol.
@@ -1649,7 +1671,7 @@ func (sc Schema) Field(set, field string) (mql.FieldInfo, bool) {
 		return mql.FieldInfo{}, false
 	}
 	return mql.FieldInfo{
-		Kind: f.Kind, Unit: f.Unit, UnitHint: f.UnitHint, Description: f.Description,
+		Kind: f.kind(), Unit: f.Unit, UnitHint: f.UnitHint, Description: f.Description,
 		MaxInterval: f.MaxInterval, LimitMin: f.LimitMin, LimitMax: f.LimitMax,
 		BucketSet: f.BucketSet, BucketIndex: f.BucketIndex, BucketEdge: f.BucketEdge,
 		Stale: f.stale(),
@@ -1744,7 +1766,7 @@ func (s *Store) Catalogue() wire.Catalogue {
 		}
 		for f, fe := range e.Fields {
 			info.Fields[f] = mql.FieldInfo{
-				Kind: fe.Kind, Unit: fe.Unit, UnitHint: fe.UnitHint, Description: fe.Description,
+				Kind: fe.kind(), Unit: fe.Unit, UnitHint: fe.UnitHint, Description: fe.Description,
 				MaxInterval: fe.MaxInterval, LimitMin: fe.LimitMin, LimitMax: fe.LimitMax,
 				BucketSet: fe.BucketSet, BucketIndex: fe.BucketIndex, BucketEdge: fe.BucketEdge,
 				// Computed here as well as in Schema.Field, because this

@@ -138,6 +138,17 @@ Notes:
 retryable and slows down. Everything in the `4xx` range other than `429` is
 fatal for that batch (§9 of [02-ingest.md](02-ingest.md)).
 
+`Retry-After` is honoured in both forms RFC 9110 allows — a delta-seconds
+count and an HTTP date — and is **capped at `wire.MaxRetryAfter`** (two
+minutes). The store never asks for more than a second, but the header is
+whatever answered the request: a reverse proxy or a load balancer in front of
+the store commonly answers a `503` with minutes or hours, and the client
+sleeps the interval out inside one request while the ingest sink holds
+delivery for the same span. Past the cap that stops being backpressure and
+becomes an outage the ingester inflicted on itself — its readers block, its
+buffer fills to `max_buffered_samples`, and the excess is dropped
+([12-implementation.md §6.195](12-implementation.md)).
+
 ### 3.3 Ordering
 
 The protocol makes **no ordering guarantee across batches**, and the store

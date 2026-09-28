@@ -563,6 +563,11 @@ var errRecordCutShort = errors.New("the connection ended mid-record; the fragmen
 // the record the sender meant.
 var errDatagramTooLarge = errors.New("the datagram was larger than --max-datagram-bytes and was discarded rather than extracted from a truncated record")
 
+// errSenderNotAllowed names a record refused because its sender is not in
+// --allow-source. It is a constant so warnRecord's collapsing map keys on
+// one entry per peer rather than one per datagram.
+var errSenderNotAllowed = errors.New("the sender is not in allowed_sources, so the record was discarded")
+
 // errDelivery wraps a failure to hand a record's samples to the sink, so
 // a request/response listener can tell it apart from a record the spec
 // could not read.
@@ -642,6 +647,15 @@ func (r *receiver) serveUDP(ctx context.Context, conn *net.UDPConn) error {
 		}
 		peer := src.IP.String()
 		if !r.permitted(peer) {
+			// Said out loud, collapsed on the powers of ten, like every
+			// other per-record failure on this listener. A datagram
+			// dropped here used to leave no trace anywhere: no counter,
+			// no log line, and no response for the sender to read --
+			// while the TCP listener logs a refused connection and the
+			// HTTP one answers 403. An `--allow-source` written with a
+			// hostname rather than an address refuses every sender, and
+			// that is exactly the mistake this listener could not show.
+			r.warnRecord("udp "+peer, errSenderNotAllowed)
 			continue
 		}
 		if n > r.opts.MaxDatagramBytes {
@@ -883,20 +897,54 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
 	}
+	// stopped tells the shutdown goroutine that Serve failed on its own,
+	// so it does not sit on a cancellation that may never come.
+	stopped := make(chan struct{})
+	var drained sync.WaitGroup
+	drained.Add(1)
 	go func() {
-		<-ctx.Done()
+		defer drained.Done()
+		select {
+		case <-ctx.Done():
+		case <-stopped:
+			return
+		}
 		// Shutdown, not Close: an in-flight batch should reach the sink
 		// rather than be cut off mid-request.
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), httpDrainGrace)
 		defer cancel()
-		_ = srv.Shutdown(sctx)
+		if err := srv.Shutdown(sctx); err != nil {
+			r.ing.cfg.Log.Printf("WARNING http listener still had requests in flight after %s: %v", httpDrainGrace, err)
+		}
 	}()
 	r.ing.cfg.Log.Printf("receiving on http %s", r.opts.HTTPAddr)
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	err := srv.Serve(ln)
+	if err != nil && err != http.ErrServerClosed {
+		close(stopped)
+	}
+	// Waited for before serveHTTP returns, exactly as serveTCP waits for
+	// its connections and serveUDP for its drain goroutine.
+	//
+	// http.Server.Shutdown closes the listener *first* and only then
+	// waits for the requests it has already accepted, so Serve returns
+	// straight away while handlers are still running -- and Receive goes
+	// on to flushAll and the final Sink.Flush behind them. Whatever those
+	// handlers buffered in that window went into a sink that had already
+	// flushed for the last time, so a sender that was answered
+	// `"accepted": n` lost every one of those records, with no checkpoint
+	// to re-read them from.
+	drained.Wait()
+	if err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
 }
+
+// httpDrainGrace bounds how long the HTTP listener waits for the requests
+// it has already accepted. A request that will not finish must not stop
+// the process from shutting down; one that will has to reach the sink
+// before the final flush.
+const httpDrainGrace = 10 * time.Second
 
 func writeJSONOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

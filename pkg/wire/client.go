@@ -332,6 +332,22 @@ func apiMessage(body []byte) string {
 	return string(body)
 }
 
+// MaxRetryAfter caps the delay this client will honour from a
+// Retry-After header.
+//
+// The header is not under this client's control. Mensura's own store
+// always answers `Retry-After: 1`, but a reverse proxy, a load balancer
+// or a service mesh in front of it commonly answers a 503 with minutes or
+// hours -- and the value used to be taken as written, in two places at
+// once: the client slept it out inside one Write, holding the sink's
+// delivery lock, and the sink then held delivery for the same interval.
+// An hour of that is an hour of readers blocked and buffers filling to
+// MaxBufferedSamples, after which the excess is dropped. A cap makes the
+// worst case a few wasted requests instead of an outage the ingester
+// inflicted on itself; the header still shortens the wait, which is what
+// it is for.
+const MaxRetryAfter = 2 * time.Minute
+
 // retryAfter reads both forms RFC 9110 allows for the header: a
 // delta-seconds count and an HTTP date. Only the first used to be
 // understood, so a store that answered with a date was retried on the
@@ -345,12 +361,19 @@ func retryAfter(resp *http.Response) time.Duration {
 		if secs < 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
+		return capRetryAfter(time.Duration(secs) * time.Second)
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := time.Until(t); d > 0 {
-			return d
+			return capRetryAfter(d)
 		}
 	}
 	return 0
+}
+
+func capRetryAfter(d time.Duration) time.Duration {
+	if d > MaxRetryAfter {
+		return MaxRetryAfter
+	}
+	return d
 }

@@ -1239,7 +1239,7 @@ func (s *Store) queryFields(set string) (*wire.QueryResponse, error) {
 	if ok {
 		rows = make([]fieldRow, 0, len(e.Fields))
 		for n, f := range e.Fields {
-			rows = append(rows, fieldRow{n, string(f.Kind), f.Unit, f.MaxInterval})
+			rows = append(rows, fieldRow{n, string(f.kind()), f.Unit, f.MaxInterval})
 		}
 	}
 	s.mu.RUnlock()
