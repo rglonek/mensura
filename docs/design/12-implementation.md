@@ -4299,6 +4299,25 @@ took for the same reason: it deliberately does not run `Validate`.
   after the "Known gaps worth naming" heading, so the section a reader
   scrolls to for the gaps ran straight into more divergences. §7 is at
   the end of the document again.
+- **The "no such set" diagnostic is bounded.** `E002` listed every set
+  the catalogue holds so an operator could spot the typo, and `max_sets`
+  allows ten thousand of up to 128 characters each: a mistyped `FROM`
+  answered `400` with over a megabyte of names, which the plugin then
+  renders as a panel-level error string. Fifty names and a count is the
+  same bound `wire.MaxReportedRejections` puts on the other diagnostic a
+  client can make arbitrarily large.
+- **Two heatmap refusals are diagnostics, not faults.** `runHeatmap`
+  answered a missing `HISTOGRAM(...)` and an empty bucket set with a bare
+  error, which `handleQuery` turns into `500` — a fault in the store for
+  something the request got wrong. `mql.Validate` refuses both first, so
+  they are only reachable from a caller that builds a `wire.QueryRequest`
+  directly, but that is the caller least able to tell `500` from `400`.
+- **The wire protocol's endpoint table was missing three endpoints and
+  named the wrong method for a fourth.** `POST /v1/parse`,
+  `POST /v1/print` and `POST /v1/admin/quiesce` are part of the store's
+  HTTP surface and appeared nowhere in [04](04-wire-protocol.md); the
+  plan endpoint was listed as `GET /v1/debug/plan` while it takes a whole
+  `QueryRequest` as its body and the shipped client `POST`s it.
 
 
 ## 7. Known gaps worth naming

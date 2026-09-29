@@ -113,7 +113,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		return nil, Diag{"E002", "query has no FROM set"}
 	}
 	if s != nil && !s.HasSet(q.From) {
-		return nil, Diag{"E002", fmt.Sprintf("unknown set %q; known sets: %s", q.From, strings.Join(s.Sets(), ", "))}
+		return nil, Diag{"E002", fmt.Sprintf("unknown set %q; known sets: %s", q.From, namedSets(s.Sets()))}
 	}
 	if q.Kind == KindFields || q.Kind == KindLabelKeys {
 		return nil, nil
@@ -374,6 +374,28 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		}
 	}
 	return warns, nil
+}
+
+// maxNamedSets bounds how many set names a "no such set" diagnostic
+// lists.
+//
+// The list is there so an operator can spot the typo, which takes a
+// handful of names; the store's own `max_sets` allows ten thousand of up
+// to 128 characters each. A mistyped FROM therefore answered `400` with
+// well over a megabyte of set names, and the plugin renders that string
+// as a panel-level error. It is the same bound wire.MaxReportedRejections
+// puts on the other diagnostic a client can make arbitrarily large.
+const maxNamedSets = 50
+
+// namedSets renders the known-set list for a diagnostic, bounded.
+func namedSets(sets []string) string {
+	if len(sets) == 0 {
+		return "(none)"
+	}
+	if len(sets) <= maxNamedSets {
+		return strings.Join(sets, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(sets[:maxNamedSets], ", "), len(sets)-maxNamedSets)
 }
 
 // checkUnusedClauses names a clause an auxiliary query kind carries and

@@ -1,6 +1,7 @@
 package mql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -94,4 +95,30 @@ func itoaField(n int) string {
 		n /= 10
 	}
 	return "f" + string(b)
+}
+
+// The "no such set" diagnostic is bounded.
+//
+// The store allows ten thousand sets of up to 128 characters, so a
+// mistyped FROM answered 400 with over a megabyte of set names -- which
+// the plugin then renders as a panel-level error string. The list exists
+// so an operator can spot the typo, and that takes a handful of names.
+func TestUnknownSetDiagnosticIsBounded(t *testing.T) {
+	sets := make([]string, 0, 3000)
+	for i := 0; i < 3000; i++ {
+		sets = append(sets, strings.Repeat("s", 120)+fmt.Sprint(i))
+	}
+	got := namedSets(sets)
+	if len(got) > maxNamedSets*160 {
+		t.Fatalf("the known-set list is %d bytes for %d sets", len(got), len(sets))
+	}
+	if !strings.Contains(got, "and 2950 more") {
+		t.Fatalf("the remainder is not reported: %q", got[len(got)-40:])
+	}
+	if namedSets(nil) != "(none)" {
+		t.Fatalf("an empty store should say so, got %q", namedSets(nil))
+	}
+	if got := namedSets([]string{"a", "b"}); got != "a, b" {
+		t.Fatalf("a short list must be listed in full, got %q", got)
+	}
 }

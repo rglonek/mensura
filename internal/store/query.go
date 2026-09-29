@@ -712,7 +712,12 @@ func (s *Store) interleaveWarning(q *mql.Query, collapsed int) mql.Diag {
 // running the min/max walk.
 func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryRequest, p *queryPlan, resp *wire.QueryResponse, maxSeries, maxPoints int) error {
 	if len(q.Select) == 0 {
-		return fmt.Errorf("query: FORMAT heatmap requires HISTOGRAM(<bucket set>)")
+		// A Diag, not a bare error: handleQuery turns anything else into
+		// a 500, and a query that asked for a heatmap without naming a
+		// bucket set is the client's mistake, not the store's. Validate
+		// refuses this first, so it is only reachable from a caller that
+		// builds a wire.QueryRequest directly.
+		return mql.Diag{Code: "E008", Msg: "FORMAT heatmap requires HISTOGRAM(<bucket set>)"}
 	}
 	s.mu.RLock()
 	entry, ok := s.catalogue[q.From]
@@ -732,7 +737,7 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 	}
 	s.mu.RUnlock()
 	if len(bs.Buckets) == 0 {
-		return fmt.Errorf("query: bucket set %q has no buckets on set %q", name, q.From)
+		return mql.Diag{Code: "E009", Msg: fmt.Sprintf("bucket set %q has no buckets on set %q", name, q.From)}
 	}
 
 	window := heatmapWindow(q, req)
