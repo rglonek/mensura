@@ -131,6 +131,16 @@ datapoint and opens no series, so `max_datapoints_received` and
 scanned row pays for every name
 ([12](12-implementation.md) §6.147).
 
+A `WHERE` predicate is bounded in *size* as well as in depth: at most
+1024 clauses (`E007`). It is the one axis whose cost is worse than
+linear, because the store resolves a regex clause by walking every value
+of its label key — up to `max_label_cardinality` — before it reads a
+single row, and it does that before the query takes an execution slot.
+The deepest and widest predicate in this document has three clauses; a
+multi-valued dashboard variable travels as one `IN` list or one
+alternation regex rather than as one clause per value
+([12](12-implementation.md) §6.199).
+
 ## 4. Semantics
 
 ### 4.1 `FROM`

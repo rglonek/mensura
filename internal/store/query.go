@@ -1442,6 +1442,15 @@ func (s *Store) Explain(q *mql.Query, req *wire.QueryRequest) (map[string]any, e
 	if n := len(q.By); n > mql.MaxByLabels {
 		return nil, mql.Diag{Code: "E007", Msg: fmt.Sprintf("query groups by %d labels, which is beyond the limit of %d", n, mql.MaxByLabels)}
 	}
+	// And the predicate, on both of its axes. buildExpr below resolves
+	// every regex clause against the whole label-value dictionary, so an
+	// unbounded clause count is unbounded work per request -- the same
+	// hazard the two width checks above close, on the axis that is the
+	// planner's own. Both entry points already call this, but Explain is
+	// the function that promises to bound itself.
+	if err := mql.CheckPredicateDepth(q); err != nil {
+		return nil, err
+	}
 	p, warns, err := s.plan(q, req)
 	if err != nil {
 		return nil, err

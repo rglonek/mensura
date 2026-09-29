@@ -203,7 +203,7 @@ func Series(points []Point, spec Spec, window int64) []Output {
 		// 8) Window boundary. Strict >, so the crossing sample opens the
 		//    new window and w == 0 degenerates to one sample per window.
 		if ts-windowStart > window {
-			out = append(out, emitWindow(wMin, wMax, haveExtrema, nulls, spec.SSE)...)
+			out = append(out, emitWindow(wMin, wMax, haveExtrema, nulls)...)
 			windowStart = ts
 			nulls = nulls[:0]
 			haveExtrema = false
@@ -228,15 +228,7 @@ func Series(points []Point, spec Spec, window int64) []Output {
 
 	// Tail flush.
 	if haveExtrema {
-		out = append(out, emitWindow(wMin, wMax, haveExtrema, nulls, spec.SSE)...)
-	}
-
-	// Post-downsample singular-series extension: a lone point is invisible
-	// on a line chart, so it is wrapped unless the field opted out.
-	if len(out) == 1 && !out[0].Null {
-		if lo, hi, ok := ssePair(spec.SSE, out[0]); ok {
-			out = []Output{lo, out[0], hi}
-		}
+		out = append(out, emitWindow(wMin, wMax, haveExtrema, nulls)...)
 	}
 
 	// Trailing connect-break: the declared cadence was missed between the
@@ -252,20 +244,27 @@ func Series(points []Point, spec Spec, window int64) []Output {
 	// break drawn just after a moment when data did arrive, whose real
 	// cause is that a rate needs two samples. Saying nothing is the
 	// honest answer.
+	//
+	// It is appended before the padding pass below rather than after it,
+	// so a final real point that this break isolates is padded against
+	// the break instead of over it.
 	if len(out) > 0 && spec.GapMs != 0 && spec.EndMs > 0 && lastPointTime != -1 && spec.EndMs-lastPointTime > spec.GapMs {
 		at := lastPointTime + spec.GapMs
 		if at > out[len(out)-1].TSMs {
 			out = append(out, Output{TSMs: at, Null: true})
 		}
 	}
-	return out
+
+	// Singular-series extension, applied once over the finished series.
+	return padIsolated(out, spec.SSE)
 }
 
-// emitWindow flushes one window: at most one null per classification slot,
-// the extrema in chronological order, and singular-series padding wherever
-// a real point would otherwise render as a zero-length mark between
-// connect-breaks.
-func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
+// emitWindow flushes one window: at most one null per classification slot
+// and the extrema in chronological order. Singular-series padding is not
+// applied here -- see padIsolated, which runs once over the finished
+// series, because whether a point is stranded depends on the neighbouring
+// windows' output as well as this one's.
+func emitWindow(wMin, wMax Point, have bool, nulls []int64) []Output {
 	if !have {
 		return nil
 	}
@@ -316,12 +315,39 @@ func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
 	if after > -1 {
 		dps = append(dps, Output{TSMs: after, Null: true})
 	}
-	return padAgainstNulls(dps, sse)
+	return dps
 }
 
-// padAgainstNulls splices singular-series padding beside any real point
-// whose neighbour on that side is a connect-break, so the point draws as a
-// segment rather than a zero-length mark.
+// padIsolated splices singular-series padding beside every real point the
+// finished series leaves stranded between connect-breaks, so it draws as a
+// segment rather than as a zero-length mark.
+//
+// The test is "stranded", not "next to a null", and the difference is the
+// whole point of running this once over the finished series rather than
+// once per window.
+//
+// Padding used to be spliced inside emitWindow, beside any real point
+// whose neighbour *within that window* was a null. A window sees only its
+// own points, and at any realistic zoom a window holds one sample -- the
+// render budget divides the range into roughly as many windows as there
+// are points to draw -- so the last sample before an outage was routinely
+// the only real point in its window, sitting next to the break the outage
+// injected. It was therefore padded, and the default padding is
+// `SSE const 0`: a synthetic zero 500 ms after the last real reading.
+// The point was never stranded -- it connects to the previous window's
+// sample -- so what the panel drew was a healthy series diving vertically
+// to zero immediately before every outage, on any field with a declared
+// `max_interval`, which is the configuration W103 exists to ask for. A
+// value no source reported, drawn as if it were measured, is the exact
+// falsification the rest of this walk is built to avoid.
+//
+// A point is stranded when the finished output offers it no neighbour to
+// draw a line to on *either* side: a null, or the end of the series. That
+// is decidable only here, because the neighbour may come from the
+// previous or the next window -- which is also why this subsumes the old
+// "the whole series reduced to one point" special case, and why it now
+// pads a point the old per-window test missed (a break before it in one
+// window and a break after it in the next).
 //
 // Padding timestamps are clamped into the gap between the point and its
 // neighbours. The whitepaper writes the offsets as a flat +/-500 ms; a flat
@@ -329,57 +355,53 @@ func emitWindow(wMin, wMax Point, have bool, nulls []int64, sse SSE) []Output {
 // strictly-increasing-time guarantee (C1) that the same paper asserts.
 // Clamping keeps both properties: the padding is as wide as it can be
 // without reordering anything.
-func padAgainstNulls(dps []Output, sse SSE) []Output {
-	if sse.Mode == SSEOff || len(dps) == 0 {
-		return dps
+func padIsolated(out []Output, sse SSE) []Output {
+	if sse.Mode == SSEOff || len(out) == 0 {
+		return out
 	}
-	out := make([]Output, 0, len(dps)+4)
-	for i, p := range dps {
+	// Decided against the original slice, so the indices below always name
+	// the neighbours the finished series really has rather than the
+	// padding this pass is adding as it goes.
+	padded := make([]Output, 0, len(out))
+	for i, p := range out {
 		if p.Null {
-			out = append(out, p)
+			padded = append(padded, p)
+			continue
+		}
+		leftBreak := i == 0 || out[i-1].Null
+		rightBreak := i == len(out)-1 || out[i+1].Null
+		if !leftBreak || !rightBreak {
+			// It has a real neighbour on at least one side, so a line is
+			// already drawn through it and there is nothing to rescue.
+			padded = append(padded, p)
 			continue
 		}
 		// SSE REPEAT repeats the value of the point being padded, not one
-		// fixed value for the window: padding the maximum with the
-		// minimum's value would draw a step that never happened.
+		// fixed value for the series: padding one point with another's
+		// value would draw a step that never happened.
 		value := sse.Value
 		if sse.Mode == SSERepeat {
 			value = p.Value
 		}
-		leftIsNull := i > 0 && dps[i-1].Null
-		rightIsNull := i+1 < len(dps) && dps[i+1].Null
-		if leftIsNull {
-			ts := p.TSMs - ssePadMs
-			if lower := dps[i-1].TSMs + 1; ts < lower {
-				ts = lower
-			}
-			if ts < p.TSMs {
-				out = append(out, Output{TSMs: ts, Value: value})
+		before := p.TSMs - ssePadMs
+		if i > 0 {
+			if lower := out[i-1].TSMs + 1; before < lower {
+				before = lower
 			}
 		}
-		out = append(out, p)
-		if rightIsNull {
-			ts := p.TSMs + ssePadMs
-			if upper := dps[i+1].TSMs - 1; ts > upper {
-				ts = upper
-			}
-			if ts > p.TSMs {
-				out = append(out, Output{TSMs: ts, Value: value})
+		if before < p.TSMs {
+			padded = append(padded, Output{TSMs: before, Value: value})
+		}
+		padded = append(padded, p)
+		after := p.TSMs + ssePadMs
+		if i+1 < len(out) {
+			if upper := out[i+1].TSMs - 1; after > upper {
+				after = upper
 			}
 		}
+		if after > p.TSMs {
+			padded = append(padded, Output{TSMs: after, Value: value})
+		}
 	}
-	return out
-}
-
-// ssePair builds the two padding points around a lone real point.
-func ssePair(sse SSE, p Output) (Output, Output, bool) {
-	if sse.Mode == SSEOff {
-		return Output{}, Output{}, false
-	}
-	v := sse.Value
-	if sse.Mode == SSERepeat {
-		v = p.Value
-	}
-	return Output{TSMs: p.TSMs - ssePadMs, Value: v},
-		Output{TSMs: p.TSMs + ssePadMs, Value: v}, true
+	return padded
 }

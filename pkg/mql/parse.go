@@ -13,6 +13,9 @@ type parser struct {
 	// depth is how many predicate groups the recursive descent is
 	// currently inside, so MaxPredicateDepth can be enforced.
 	depth int
+	// nodes is how many predicate clauses have been parsed in all, so
+	// MaxPredicateNodes can be enforced.
+	nodes int
 }
 
 // MaxPredicateDepth bounds how deeply a WHERE predicate may nest, in the
@@ -50,6 +53,27 @@ const (
 	MaxSelectFields = 1024
 	MaxByLabels     = 64
 )
+
+// MaxPredicateNodes bounds the *size* of a WHERE predicate, as
+// MaxPredicateDepth bounds its depth and MaxSelectFields its width.
+//
+// It is the third axis of the same hazard, and the only one whose cost is
+// worse than linear. The store lowers a predicate before it scans
+// anything, and a regex clause is lowered by walking every value of its
+// label key -- up to max_label_cardinality, 100 000 by default -- so the
+// work is (number of regex clauses) x (dictionary size). Nothing bounded
+// the first factor. An AST arrives as JSON at the store's
+// max_request_bytes, which holds on the order of a million clauses, and
+// mql.Validate compiles every one of them *before* the query takes an
+// execution slot, so the concurrency gate does not apply either. A
+// handful of such requests is the cheapest way to make a store stop
+// answering, on an endpoint whose whole audience is a query editor.
+//
+// A thousand is the same order as MaxSelectFields and far past anything a
+// dashboard emits: the deepest predicate in the documentation is three
+// clauses, and a multi-valued dashboard variable travels as one IN list
+// or one alternation regex rather than as one clause per value.
+const MaxPredicateNodes = 1024
 
 // Parse turns MQL text into the canonical AST.
 func Parse(src string) (*Query, error) {
@@ -469,11 +493,25 @@ func (p *parser) clamp() (*Clamp, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Refused rather than overwritten, which is the rule
+			// `LIMIT SERIES` and a repeated field modifier already
+			// follow. A Clamp holds one pointer per bound, so
+			// `CLAMP MIN 0, MIN 5` kept whichever was written last and
+			// said nothing -- and Print emits the survivor, so the query
+			// came back from the editor silently missing a bound the
+			// author had typed. 06-query.md section 12 lists a repeated
+			// clause under E006.
+			if c.Min != nil {
+				return nil, &ParseError{p.cur().pos, "E006: CLAMP MIN given twice"}
+			}
 			c.Min = &v
 		case p.acceptKeyword("MAX"):
 			v, err := p.number()
 			if err != nil {
 				return nil, err
+			}
+			if c.Max != nil {
+				return nil, &ParseError{p.cur().pos, "E006: CLAMP MAX given twice"}
 			}
 			c.Max = &v
 		default:
@@ -712,6 +750,15 @@ func (p *parser) parseUnary() (Expr, error) {
 	// which is a loop and not a nesting, at depth one.
 	if p.depth >= MaxPredicateDepth {
 		return Expr{}, p.errf("predicate nests deeper than the limit of %d", MaxPredicateDepth)
+	}
+	// And the size bound, on the same function and for the same reason it
+	// carries the depth bound: every clause and every parenthesised group
+	// passes through here exactly once, so counting entries counts the
+	// predicate. An AND/OR chain is a loop rather than a nesting, so the
+	// depth counter does not see it -- this one does.
+	p.nodes++
+	if p.nodes > MaxPredicateNodes {
+		return Expr{}, p.errf("predicate holds more than %d clauses", MaxPredicateNodes)
 	}
 	p.depth++
 	defer func() { p.depth-- }()
