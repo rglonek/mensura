@@ -1028,9 +1028,19 @@ func (s *Sink) bufferedRoom(count int) bool {
 
 // retryHoldFor honours a Retry-After the store sent, which is the interval
 // it asked for, and falls back to the fixed hold otherwise.
+//
+// Bounded by wire.MaxRetryAfter, which is where the header is already
+// capped: the number comes from whatever answered the request, and a
+// proxy in front of the store commonly answers a 503 with minutes or
+// hours. Holding delivery that long fills the buffer to
+// MaxBufferedSamples and then drops the excess, which is a worse outcome
+// than a few wasted requests.
 func (s *Sink) retryHoldFor(err error) time.Duration {
 	var retry *wire.ErrRetryable
 	if errors.As(err, &retry) && retry.After > 0 {
+		if retry.After > wire.MaxRetryAfter {
+			return wire.MaxRetryAfter
+		}
 		return retry.After
 	}
 	return retryHold

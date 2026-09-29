@@ -3843,8 +3843,15 @@ reporting zeroes that read like an idle store.
   React editor exists a panel must carry the AST in its query model. The
   backend's `parse`/`print` resources exist precisely so the frontend never
   implements a second parser.
-- **`route:` can create unbounded sets.** Open question 3 in
-  [11](11-roadmap.md) is unresolved; there is no `max_sets` guard yet.
+- **`route:` decides a destination set per record, and the *policy*
+  question is still open.** Open question 3 in [11](11-roadmap.md) asks
+  whether a route may name a set no spec declared; it may, and the store
+  creates it on first write. The *cardinality* half of that question is
+  closed: `limits.max_sets` and `limits.max_fields_per_set` (§6.181) bound
+  the catalogue on the declaration path and on the sample path alike, so a
+  route deriving its set name from a log line is refused by name past the
+  cap rather than growing the catalogue without limit. What is still
+  missing is a way to say *which* names a route may invent.
 - **`store_stream_label:` is refused, not ignored.** The key was accepted by
   the spec decoder and acted on nowhere. Compiling a spec that sets it now
   fails, on the same principle as `tls.client_ca`: a declaration that does
@@ -4205,3 +4212,133 @@ after the captures are collected.
   distinction `QueryResponse.Series`, `LabelValues.Values` and the
   catalogue's own `sets` and `labels` were each changed to stop making a
   client tell apart.
+
+### 6.191 The HTTP receive listener did not wait for the requests it had accepted
+
+`http.Server.Shutdown` closes the listeners *first* and only then waits
+for the requests already in flight, so `Serve` returns straight away while
+handlers are still running. `serveHTTP` returned on that, which released
+the listener's slot in `Receive`'s `WaitGroup` — and `Receive` then ran
+`flushAll` and its final `Sink.Flush` behind a handler that was still
+buffering samples. Whatever `/ingest/v1/lines` or `/ingest/v1/samples`
+added in that window went into a sink that had already flushed for the
+last time: it was counted as "still buffered at shutdown" and lost, while
+the sender had been answered `"accepted": n`. A socket, unlike a followed
+file, has no checkpoint to re-read it from.
+
+`serveTCP` joins its connection goroutines and `serveUDP` joins its drain
+goroutine for exactly this reason; the third listener was the one that did
+not. `serveHTTP` now waits for the shutdown goroutine, which is bounded by
+`httpDrainGrace` (ten seconds) and says so on the way out if a request
+outlasts it — an unfinished request must not stop the process from
+stopping, but one that will finish has to reach the sink before the last
+flush. A `stopped` channel keeps the wait from becoming a deadlock when
+`Serve` fails on its own rather than being shut down.
+
+### 6.192 One malformed `--path` stopped every followed path
+
+`filepath.Glob` reports a malformed pattern as an error, and
+`follower.poll` returned it — before it had read a single file, retired a
+single tailer, published a lag figure or written a single checkpoint. A
+pattern is a constant, so that error never cleared: `--path '/var/log/['`
+turned `follow` into a permanent no-op for *every* path it was given,
+printing one `ERROR follow:` line at the poll rate (four a second by
+default) and ingesting nothing, for the life of the process.
+
+A spec's own `select.path_glob` is compiled in `Profile.compile` with
+`filepath.Match(g, "probe")` precisely because `Match` reports
+`ErrBadPattern` alongside "did not match"; `--path` was the glob nothing
+checked. `Follow` now refuses a malformed pattern by name at startup, and
+`poll` skips a failing pattern rather than abandoning the sweep, so one
+bad entry can never take the others with it.
+
+### 6.193 A repeating failure was reported at the poll rate
+
+A file inside the glob that cannot be *opened* — a permission change, a
+network mount that went away, an exhausted descriptor table — was retried
+on every sweep, which is right: it comes back without a restart. It was
+also *reported* on every sweep, which at the default 250 ms poll interval
+is four `WARNING cannot follow` lines a second, per path, for as long as
+the fault lasts. A file that could be opened and not read did the same
+through the sweep's own `ERROR follow:` line. Either buries every other
+line the process produces, which is how an operator loses the one that
+mattered.
+
+The retry cadence is unchanged; only the report is collapsed, the way
+`receiver.warnRecord` already collapses a repeated per-record failure. The
+throttle is keyed by the fault (the path for an open failure, the message
+for a sweep error), so a fault that *changes* is reported at once rather
+than hidden behind the one before it, and it is bounded and pruned
+alongside the no-profile backoff for a path that has left the glob.
+
+### 6.194 An observed field is not a declared one
+
+`observeSet` creates a catalogue entry for a field the moment a sample
+carries it, and it stamped `Kind: gauge` onto that entry. That made a
+field the catalogue had merely *seen* indistinguishable from one an
+ingester had *declared* `kind: gauge` — and `applyFieldMeta`'s conflict
+test reads exactly that field. So a set written before its metadata
+arrived recorded a `CatalogueConflict` of "was gauge, now counter" for a
+declaration nothing had disagreed with, and `/v1/catalogue` reported that
+disagreement to every client for the life of the store.
+
+It is not an exotic ordering. A second ingester whose spec declares a
+field the first one's did not, a second profile writing the same set, or
+simply a spec with no `fields:` entry for that column on the first batch
+all produce it — and `Write` applies a request's `field_meta` before its
+batches precisely so the declaration usually wins the race, which is what
+made the failure look like a real conflict when it happened.
+
+The default belongs where the record is *rendered*, not where it is
+stored. `fieldEntry.kind()` answers `gauge` for an empty kind, and
+`Schema.Field`, `Catalogue()` and `queryFields` read it through that, so
+the reported shape does not change: every consumer already treats an
+unrecognised kind and a gauge alike. Two ingesters that really do declare
+different kinds are still recorded.
+
+### 6.195 `Retry-After` was honoured without a bound
+
+The header is not under the write client's control. Mensura's own store
+always answers `Retry-After: 1`, but a reverse proxy, a load balancer or a
+service mesh in front of it commonly answers a 503 with minutes or hours —
+and the value was taken as written in two places at once.
+`wire.Client.Write` slept it out *inside* one request, holding the sink's
+delivery lock for the whole of it, and `Sink.retryHoldFor` then held
+delivery for the same interval. A one-hour header therefore stopped the
+ingester for an hour: its readers blocked, its buffer filled to
+`MaxBufferedSamples`, and the excess past that was dropped and counted.
+Both are now capped at `wire.MaxRetryAfter` (two minutes). The header
+still shortens the wait, which is what it is for; it can no longer lengthen
+it into an outage the ingester inflicted on itself.
+
+### 6.196 `Spec.Compile` was not idempotent
+
+Every compiled artefact `Compile` builds is replaced rather than
+extended — `p.labelSet`, `p.buckets`, `pat.labelSet`, `bs.edges`, and the
+per-regex fields assigned in place — except `pat.extract`, which was
+appended to. A second `Compile` on the same `Spec` therefore left every
+`extract:` regex in the list twice: `patternExtractedNames` reported each
+capture twice, `Declarations()` and `Lint()` walked them twice, and
+`process()` tried each one again on every record that matched none of
+them. Nothing in this package calls `Compile` twice today, which is
+exactly why the next caller should not have to know that.
+
+### 6.197 Smaller corrections
+
+- **A write that arrives during shutdown is shed, not faulted.** §3.4 of
+  [04](04-wire-protocol.md) has always listed `503` with `Retry-After` for
+  "the store is shedding (write queue full, **or shutting down**)", and
+  `handleQuery` and `writeAdminErr` both answer `ErrClosed` that way.
+  `handleWrite` answered `500`. The client classifies both as retryable,
+  so nothing was lost — but only `503` carries the interval the store
+  chose, so a batch arriving in a rolling restart spent its retries on the
+  client's own exponential backoff against a process that had already
+  gone.
+- **A datagram from a sender outside `--allow-source` is said out loud.**
+  It was dropped with no counter, no log line and no response for the
+  sender to read, while the TCP listener logs a refused connection and the
+  HTTP one answers `403`. An `--allow-source` written with a hostname
+  rather than an address refuses every sender — `permitted` compares the
+  peer *address* — and UDP was the one listener that could not show it.
+  The refusal now goes through `warnRecord`, so it is collapsed on the
+  powers of ten like every other per-record failure there.

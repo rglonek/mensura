@@ -543,7 +543,12 @@ func (s *Store) observeSet(set string, samples []model.Sample) {
 		for k := range sm.Fields {
 			f, ok := e.Fields[k]
 			if !ok {
-				f = &fieldEntry{Kind: model.KindGauge}
+				// No kind: this field has been *observed*, not declared,
+				// and writing the default into the record makes the two
+				// indistinguishable to the conflict test below.
+				// fieldEntry.kind() applies the default where the record is
+				// rendered, so nothing downstream sees a change.
+				f = &fieldEntry{}
 				e.Fields[k] = f
 				schemaChanged = true
 			}

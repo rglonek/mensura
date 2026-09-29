@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -46,6 +47,22 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 	if opts.MaxRecordBytes <= 0 {
 		opts.MaxRecordBytes = defaultMaxRecordBytes
 	}
+	// The patterns are compiled once, here, rather than being handed to
+	// filepath.Glob on every sweep and having its verdict discarded.
+	//
+	// Glob reports a malformed pattern as an error, and poll returns on
+	// the first one -- before it has read a single file, retired a single
+	// tailer or written a single checkpoint. A pattern is a constant, so
+	// that error never clears: one bad `--path` stopped *every* followed
+	// path, for the life of the process, while printing an ERROR line at
+	// the poll rate (four a second by default). A spec's own
+	// `select.path_glob` is compiled in Profile.compile for exactly this
+	// reason; `--path` was the glob nothing checked.
+	for _, pattern := range opts.Paths {
+		if _, err := filepath.Match(pattern, "probe"); err != nil {
+			return fmt.Errorf("ingest: --path %q: %w", pattern, err)
+		}
+	}
 	cps, err := NewCheckpointStore(i.cfg.StateDir)
 	if err != nil {
 		return err
@@ -55,6 +72,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 		ing: i, opts: opts, cps: cps,
 		tailers:   map[string]*tailer{},
 		noProfile: map[string]time.Time{},
+		warnAt:    map[string]time.Time{},
 	}
 	// Checkpoints advance only for bytes the store has accepted.
 	i.cfg.Sink.Observe(f)
@@ -94,7 +112,16 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 			f.flushIdle(ctx)
 		case <-ticker.C:
 			if err := f.poll(ctx); err != nil {
-				i.cfg.Log.Printf("ERROR follow: %v", err)
+				// Collapsed for the reason an open failure is: a file
+				// that can be opened and not read -- a disk fault, a
+				// mount that went away -- fails on every sweep, and one
+				// line per sweep is four a second at the default poll
+				// interval. Keyed by the message, so a fault that
+				// changes is reported at once.
+				if f.shouldWarn("poll:" + err.Error()) {
+					i.cfg.Log.Printf("ERROR follow: %v (still retrying every %s; this line repeats at most every %s)",
+						err, opts.PollInterval, warnEvery)
+				}
 			}
 		}
 	}
@@ -139,6 +166,19 @@ type follower struct {
 	tailers map[string]*tailer
 	// noProfile maps a path to the time it may be reconsidered.
 	noProfile map[string]time.Time
+	// warnAt maps a repeating failure to the time it was last reported.
+	//
+	// The sweep retries a failing path on every tick, which is right --
+	// a permission, a mount or a disk comes back without a restart --
+	// but the report was repeated with it. A file inside the glob that
+	// cannot be opened printed a WARNING at the poll rate, four a second
+	// by default, for as long as it stayed unreadable; a file that could
+	// be opened and not read did the same through the sweep's own
+	// "ERROR follow:" line. Either buries every other line the process
+	// produces, which is how an operator loses the one that mattered.
+	// The retry cadence is unchanged; only the report is collapsed, the
+	// way the receive path collapses a repeated per-record failure.
+	warnAt map[string]time.Time
 
 	// flushSeq numbers the flushes of buffered extractor state across
 	// every followed path, because such a flush has no byte offset of its
@@ -450,10 +490,18 @@ func (t *tailer) reset(to int64) {
 
 func (f *follower) poll(ctx context.Context) error {
 	paths := map[string]struct{}{}
+	var firstErr error
 	for _, pattern := range f.opts.Paths {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
-			return err
+			// Follow refuses a malformed pattern at startup, so this is
+			// unreachable -- and it does not abandon the sweep either
+			// way. One pattern must not stop the others from being
+			// read, for the reason one failing file does not.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		for _, m := range matches {
 			paths[m] = struct{}{}
@@ -466,13 +514,18 @@ func (f *follower) poll(ctx context.Context) error {
 		ordered = append(ordered, p)
 	}
 	sort.Strings(ordered)
-	var firstErr error
 	for _, p := range ordered {
 		t, err := f.ensure(p)
 		if err != nil {
-			f.ing.cfg.Log.Printf("WARNING cannot follow %s: %v", p, err)
+			if f.shouldWarn(openWarnKey(p)) {
+				f.ing.cfg.Log.Printf("WARNING cannot follow %s: %v (still retrying every %s; this line repeats at most every %s)",
+					p, err, f.opts.PollInterval, warnEvery)
+			}
 			continue
 		}
+		// The path opened, so the next failure after this one is news
+		// again rather than a repeat.
+		f.clearWarn(openWarnKey(p))
 		if t == nil {
 			continue
 		}
@@ -505,6 +558,46 @@ func (f *follower) poll(ctx context.Context) error {
 	f.persistOwed(false)
 	return firstErr
 }
+
+// warnEvery bounds how often one repeating failure is reported. The
+// sweep still retries it every poll; only the line is collapsed.
+const warnEvery = time.Minute
+
+// maxWarnKeys bounds the throttle map, which is keyed partly by error
+// text and so by whatever a failing filesystem puts in it.
+const maxWarnKeys = 256
+
+// shouldWarn reports whether a repeating failure is worth another log
+// line, and records that it was taken. A key not seen within warnEvery
+// -- including a *different* error about the same path -- is always
+// reported, so a fault that changes is never hidden.
+func (f *follower) shouldWarn(key string) bool {
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if at, seen := f.warnAt[key]; seen && now.Sub(at) < warnEvery {
+		return false
+	}
+	// Allocated here as well as in Follow: this is reached from the sweep
+	// and from the poll loop, and a caller that built a follower without
+	// it would take a nil-map write rather than a missing log line.
+	if f.warnAt == nil || len(f.warnAt) > maxWarnKeys {
+		f.warnAt = map[string]time.Time{}
+	}
+	f.warnAt[key] = now
+	return true
+}
+
+// clearWarn forgets a failure that has cleared, so its next occurrence
+// is news again.
+func (f *follower) clearWarn(key string) {
+	f.mu.Lock()
+	delete(f.warnAt, key)
+	f.mu.Unlock()
+}
+
+// openWarnKey names one path's open failure in the throttle map.
+func openWarnKey(path string) string { return "open:" + path }
 
 // persistOwed writes the resume records that a coalesced commit deferred.
 // force ignores the interval, which is what a shutdown wants: this is the
@@ -553,6 +646,18 @@ func (f *follower) retireUnmatched(ctx context.Context, matched map[string]struc
 	for path := range f.noProfile {
 		if _, ok := matched[path]; !ok {
 			delete(f.noProfile, path)
+		}
+	}
+	// The open-failure throttle is pruned with it, and for the same
+	// reason: its entries are only ever removed when the path is looked
+	// at again, and a path that has left the glob never is.
+	for key := range f.warnAt {
+		path, isOpen := strings.CutPrefix(key, "open:")
+		if !isOpen {
+			continue
+		}
+		if _, ok := matched[path]; !ok {
+			delete(f.warnAt, key)
 		}
 	}
 	f.mu.Unlock()

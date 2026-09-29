@@ -788,6 +788,18 @@ func (p *Profile) compile(s *Spec) error {
 			}
 			pat.Replace[i].re = re
 		}
+		// Reset, not appended to. Compile is exported and every other
+		// compiled artefact it builds is replaced rather than extended --
+		// p.labelSet, p.buckets, pat.labelSet, bs.edges, and the
+		// per-regex fields assigned in place. This one accumulated, so a
+		// second Compile on the same Spec left every `extract:` regex in
+		// the list twice: patternExtractedNames then reported each
+		// capture twice, Declarations() and the lint pass walked them
+		// twice, and process() tried each one again on every record that
+		// matched none of them. Nothing in this package calls Compile
+		// twice today, which is exactly why the next caller should not
+		// have to know that.
+		pat.extract = nil
 		for _, ex := range pat.Extract {
 			re, err := regexp.Compile(ex)
 			if err != nil {

@@ -394,6 +394,14 @@ about the line in hand; reporting it as a refusal under a `200` left a sender
 unable to tell a spec that does not match its lines from a store that is down
 ([12-implementation.md §6.148](12-implementation.md)).
 
+On shutdown the listener stops accepting and then **waits for the requests it
+has already accepted**, up to ten seconds, before the process takes its final
+flush. Every acquisition path owes its workers that wait — the TCP listener
+joins its connections and the UDP one its drain goroutine — because a socket,
+unlike a followed file, has no checkpoint to re-read from: a sample buffered
+after the last flush is simply gone, and the sender had already been answered
+`"accepted": n` ([12-implementation.md §6.191](12-implementation.md)).
+
 ## 8. Extraction, aggregation and histograms
 
 The extraction engine is specified in [03-extraction.md](03-extraction.md).
