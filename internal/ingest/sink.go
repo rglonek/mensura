@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -113,6 +115,11 @@ type Sink struct {
 	// moment they should stop reading rather than the next tick.
 	gaveUp     chan struct{}
 	gaveUpOnce sync.Once
+
+	// batchBytes is the body budget actually in force, which starts at
+	// SinkConfig.BatchBytes and is halved whenever the store answers
+	// 413. See shrinkBatchBytes.
+	batchBytes atomic.Int64
 
 	// now is the clock, overridable through setClock.
 	//
@@ -219,6 +226,7 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 		gaveUp:   make(chan struct{}),
 		now:      time.Now,
 	}
+	s.batchBytes.Store(int64(cfg.BatchBytes))
 	s.wg.Add(1)
 	go s.flushLoop()
 	return s
@@ -567,6 +575,23 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 	if err != nil {
 		var fatal *wire.ErrFatal
 		if errors.As(err, &fatal) {
+			// A body the store found too large is not a verdict on the
+			// samples inside it: the same samples in a smaller request
+			// are a request the store would take. Halving the budget and
+			// putting the batch back converges on a body it accepts,
+			// instead of dropping the batch and freezing every followed
+			// file's checkpoint behind the hole that leaves. Nothing in
+			// the protocol lets an ingester discover the store's
+			// max_request_bytes, so this is how it is learned.
+			if fatal.Status == http.StatusRequestEntityTooLarge {
+				if to, again := s.shrinkBatchBytes(); again {
+					s.requeueBatches(batches, count)
+					s.requeueMeta(meta, sets)
+					s.log.Printf("WARNING the store refused a %d-sample request as too large (%v); halving the body budget to %d bytes and retrying", count, fatal, to)
+					return false, err
+				}
+				s.log.Printf("ERROR the store refused a %d-sample request as too large (%v) and the body budget is already at the %d-byte floor; a single sample is larger than the store will accept", count, fatal, minBatchBytes)
+			}
 			// Retrying a malformed batch forever is how a pipeline stalls
 			// silently, so it is dropped, counted and logged with enough
 			// detail to fix the spec.
@@ -1109,14 +1134,68 @@ func (s *Sink) requeueMeta(meta []wire.FieldMeta, sets []wire.SetMeta) {
 // takeLocked, and the honest degenerate answer when the declarations
 // alone fill the body is one sample per request until they have gone.
 func (s *Sink) sampleBudget(meta []wire.FieldMeta, sets []wire.SetMeta) int {
-	if s.cfg.BatchBytes <= 0 {
+	limit := int(s.batchBytes.Load())
+	if limit <= 0 {
+		// A caller that built a Sink directly rather than through
+		// NewSink has not stored the effective budget, so fall back to
+		// the configured one.
+		limit = s.cfg.BatchBytes
+	}
+	if limit <= 0 {
 		return 0
 	}
-	budget := s.cfg.BatchBytes - metaBytes(meta, sets)
+	budget := limit - metaBytes(meta, sets)
 	if budget < 1 {
 		budget = 1
 	}
 	return budget
+}
+
+// minBatchBytes is the floor shrinkBatchBytes will not go below.
+//
+// Past it the store's own limit is smaller than a single record can be --
+// the record cap is a megabyte, and a `kind: string` field holding one
+// costs several times that once JSON escaping is paid for -- so no amount
+// of halving will make that sample deliverable and it has to be dropped
+// like any other batch the store refuses outright.
+const minBatchBytes = 64 << 10
+
+// shrinkBatchBytes halves the body budget after the store has answered
+// 413, and reports whether the batch is worth another attempt.
+//
+// A 413 is fatal for the *body*, which is why wire.Client classifies it
+// that way, but it is not a verdict on the samples: the store said the
+// request was too big, and a smaller one carrying the same samples is a
+// request it would take. The sink used to treat it as a lost batch --
+// dropped, counted, reported to the delivery observers as a hole, which
+// freezes every followed file's checkpoint behind it -- so an operator
+// whose --batch-bytes sat above the store's max_request_bytes lost data
+// at full rate, and nothing in the protocol lets an ingester discover
+// that number to avoid it. Halving and retrying converges on a body the
+// store accepts within a handful of flushes, and says so once per step.
+//
+// The budget is never raised again. A store's body limit is a
+// configuration rather than a weather condition, so a shrink that stuck
+// is the honest description of what this ingester may send; growing it
+// back on a hunch would rediscover the same refusal, and each
+// rediscovery costs a request.
+func (s *Sink) shrinkBatchBytes() (int, bool) {
+	for {
+		cur := s.batchBytes.Load()
+		if cur <= 0 {
+			cur = int64(s.cfg.BatchBytes)
+		}
+		if cur <= minBatchBytes {
+			return int(cur), false
+		}
+		next := cur / 2
+		if next < minBatchBytes {
+			next = minBatchBytes
+		}
+		if s.batchBytes.CompareAndSwap(cur, next) {
+			return int(next), true
+		}
+	}
 }
 
 // metaBytes is what the declarations occupy in the request body,

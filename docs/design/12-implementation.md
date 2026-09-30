@@ -4414,6 +4414,21 @@ emits.
   record is read; a chunked body that overruns still answers `413` but
   now reports `accepted` and `refused` with it, so a partial application
   is visible rather than invisible.
+- **A `413` shrinks the body budget instead of costing the batch.** A
+  body the store found too large is not a verdict on the samples inside
+  it: the same samples in a smaller request are a request the store would
+  take. `wire.Client` classifies `413` as fatal, which is right for the
+  body and wrong for the batch — the sink dropped it, counted it and
+  reported it to the delivery observers as a hole, which freezes every
+  followed file's checkpoint — and nothing in the protocol lets an
+  ingester discover the store's `max_request_bytes`, so an operator whose
+  `--batch-bytes` sat above it lost data at full rate with no way to find
+  out except by reading both configurations side by side. The budget is
+  now halved and the batch requeued, which converges on a body the store
+  accepts within a handful of flushes and says so once per step. It stops
+  at a 64 KiB floor: past that the store's limit is smaller than a single
+  record can be, so no amount of halving makes that sample deliverable
+  and the batch is dropped as it always was.
 - **Both verdicts of one call now reach the counters.** A continuation
   line whose timestamp moved backwards is refused *and* flushes the record
   it was meant to join, so `extract.Stream` has two records to report on
