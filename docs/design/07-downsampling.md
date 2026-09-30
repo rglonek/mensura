@@ -125,10 +125,15 @@ peaks up, troughs down, inflections in their real temporal position.
 A window whose min and max share a timestamp (one accepted sample) emits one
 point.
 
-SSE padding is applied inside `emitWindow` when the window emits exactly one
-real point adjacent to nulls (before-only, after-only, between two nulls, or
-adjacent to a mid null), so the lone real value renders as a drawable segment
-between the connect-breaks rather than a zero-length mark.
+`emitWindow` applies no SSE padding. Whether a real point is a zero-length
+mark is not a property of its window: the neighbour that would draw a line
+through it usually comes from the *previous* or the *next* window's output.
+Deciding it per window padded the last reading before every outage — at any
+realistic zoom a window holds one sample, so that reading is the only real
+point in its window and the outage's null sits beside it — and the default
+padding is `SSE const 0`, so the panel drew a healthy series diving to zero
+500 ms before each break. Padding is therefore applied once, over the
+finished series, by `padIsolated` (§5).
 
 ## 5. Singular-series extension
 
@@ -142,12 +147,23 @@ declares how to synthesise its neighbours at ±500 ms:
 | `OFF` | no padding; the single mark stands alone |
 
 ±500 ms is a rendering choice: long enough to be visible at any realistic zoom,
-short enough not to mislead about when the event occurred. In-window padding
-clamps the offset into the space actually available, because gap detection
-injects its null at `ts − 1` and a flat −500 ms point would land on the far
-side of it and break C1 ([12-implementation.md §6.5](12-implementation.md)). The padding points
+short enough not to mislead about when the event occurred. The padding clamps
+the offset into the space actually available, because gap detection injects its
+null at `ts − 1` and a flat −500 ms point would land on the far side of it and
+break C1 ([12-implementation.md §6.5](12-implementation.md)). The padding points
 are synthetic by construction (a declared constant or a repeat), never mistaken
 for independent measurements.
+
+`padIsolated` runs once over the finished series, after the tail flush and
+after the trailing connect-break, and pads exactly the real points that
+series **strands**: the ones whose neighbour is a null, or the end of the
+series, on **both** sides. A point with a real neighbour on either side is
+already part of a drawn line and gains nothing from a synthetic one beside
+it; padding it anyway is how a constant-`0` default turned an ordinary
+outage into a vertical drop to zero. The whole-series singular case — one
+accepted sample, one emitted point — is the same rule rather than a special
+case beside it, and a point stranded by breaks that fall in two *different*
+windows is now padded, which the per-window test could not see.
 
 Invariant P4, all the way from raw record to rendered pixel: *if a series
 produced any value in the rendered range, the operator sees it.*

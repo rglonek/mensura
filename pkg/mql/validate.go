@@ -78,6 +78,17 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	if err := checkUnusedClauses(q); err != nil {
 		return nil, err
 	}
+	// Both structural bounds, before anything walks the predicate. The
+	// depth one keeps this package's own recursion (and the store's, and
+	// the engine's) off the stack limit; the size one keeps a query from
+	// buying an unbounded number of label-dictionary sweeps in the
+	// lowering, which happens after this returns and, on the /v1/query
+	// path, before the concurrency gate. Applying them here rather than
+	// inside validateExpr means the LABELS form -- whose predicate is
+	// validated against a nil schema -- is held to them too.
+	if err := checkPredicateShape(q.Where); err != nil {
+		return nil, err
+	}
 	if q.Kind == KindSets {
 		return nil, nil
 	}
@@ -102,7 +113,7 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		return nil, Diag{"E002", "query has no FROM set"}
 	}
 	if s != nil && !s.HasSet(q.From) {
-		return nil, Diag{"E002", fmt.Sprintf("unknown set %q; known sets: %s", q.From, strings.Join(s.Sets(), ", "))}
+		return nil, Diag{"E002", fmt.Sprintf("unknown set %q; known sets: %s", q.From, namedSets(s.Sets()))}
 	}
 	if q.Kind == KindFields || q.Kind == KindLabelKeys {
 		return nil, nil
@@ -365,6 +376,28 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 	return warns, nil
 }
 
+// maxNamedSets bounds how many set names a "no such set" diagnostic
+// lists.
+//
+// The list is there so an operator can spot the typo, which takes a
+// handful of names; the store's own `max_sets` allows ten thousand of up
+// to 128 characters each. A mistyped FROM therefore answered `400` with
+// well over a megabyte of set names, and the plugin renders that string
+// as a panel-level error. It is the same bound wire.MaxReportedRejections
+// puts on the other diagnostic a client can make arbitrarily large.
+const maxNamedSets = 50
+
+// namedSets renders the known-set list for a diagnostic, bounded.
+func namedSets(sets []string) string {
+	if len(sets) == 0 {
+		return "(none)"
+	}
+	if len(sets) <= maxNamedSets {
+		return strings.Join(sets, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(sets[:maxNamedSets], ", "), len(sets)-maxNamedSets)
+}
+
 // checkUnusedClauses names a clause an auxiliary query kind carries and
 // does not read.
 //
@@ -457,7 +490,11 @@ func modifierNames(m Modifiers) []string {
 }
 
 // CheckPredicateDepth refuses a predicate that nests deeper than
-// MaxPredicateDepth.
+// MaxPredicateDepth or holds more clauses than MaxPredicateNodes.
+//
+// The name is kept because it is what the store's /v1/print and
+// /v1/debug/plan handlers and the plugin's own resources call; both
+// bounds are structural and every one of those callers needs both.
 //
 // Every other surface of this package already enforces that bound: the
 // parser counts it in parseUnary, and Validate counts it again on the AST
@@ -476,34 +513,58 @@ func modifierNames(m Modifiers) []string {
 // it produced was a predicate this package's own parser refuses, which
 // the AST-and-text round trip is documented not to do.
 //
+// The size half closes the same hazard on the other axis: Explain runs
+// the store's own lowering, which resolves every regex clause against the
+// whole label-value dictionary, so an unbounded clause count is unbounded
+// work on a request nothing else gates.
+//
 // It checks the predicate and nothing else, so a half-built query from a
 // builder -- one with no SELECT yet -- still prints.
 func CheckPredicateDepth(q *Query) error {
 	if q == nil {
 		return nil
 	}
-	return predicateDepthOK(q.Where, 0)
+	return checkPredicateShape(q.Where)
 }
 
-func predicateDepthOK(e Expr, depth int) error {
+// checkPredicateShape holds a predicate to both structural bounds: how
+// deeply it nests and how many clauses it holds in all.
+//
+// The two travel together because they close the same hazard from two
+// directions and every entry point needs both. Depth is what the
+// recursive walks in this package, in the store's lowering and in the
+// engine's evaluator would otherwise overflow the stack on; size is what
+// the store's lowering would otherwise spend (regex clauses) x
+// (label-value cardinality) on, before the query has taken an execution
+// slot. See MaxPredicateDepth and MaxPredicateNodes.
+func checkPredicateShape(e Expr) error {
+	budget := MaxPredicateNodes
+	return predicateShapeOK(e, 0, &budget)
+}
+
+func predicateShapeOK(e Expr, depth int, budget *int) error {
 	if e.Empty() {
 		return nil
 	}
 	if depth >= MaxPredicateDepth {
 		return Diag{"E001", fmt.Sprintf("predicate nests deeper than the limit of %d", MaxPredicateDepth)}
 	}
+	*budget--
+	if *budget < 0 {
+		return Diag{"E007", fmt.Sprintf("predicate holds more than %d clauses; the store resolves every one of them against the label dictionary before it reads a single row", MaxPredicateNodes)}
+	}
 	for _, sub := range e.And {
-		if err := predicateDepthOK(sub, depth+1); err != nil {
+		if err := predicateShapeOK(sub, depth+1, budget); err != nil {
 			return err
 		}
 	}
 	for _, sub := range e.Or {
-		if err := predicateDepthOK(sub, depth+1); err != nil {
+		if err := predicateShapeOK(sub, depth+1, budget); err != nil {
 			return err
 		}
 	}
 	if e.Not != nil {
-		return predicateDepthOK(*e.Not, depth+1)
+		return predicateShapeOK(*e.Not, depth+1, budget)
 	}
 	return nil
 }

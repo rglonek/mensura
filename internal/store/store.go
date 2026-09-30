@@ -321,25 +321,47 @@ type dictionary struct {
 	alias map[string][]int32
 }
 
-// rebuildIndex records the free positions in a freshly loaded dictionary,
+// rebuildIndex derives everything the loaders cannot: the free positions,
 // the count of positions that are not holes, and any value that occupies
-// more than one position.
+// more than one of them.
+//
+// The forward map is rebuilt rather than inspected. The two on-disk forms
+// are read one after the other into the same dictionary -- a legacy
+// packed array first, then the per-value records that may overwrite
+// positions inside it -- and each loader adds its own entries as it goes,
+// so an overwritten position left the *old* value in the map pointing at
+// a slot that now holds a different one. A query lowering
+// `host = "<old>"` then resolved to that slot and returned the rows of
+// whichever value really lives there: not an empty result, the wrong
+// rows. Deriving the map from Entries at the end makes the slice the one
+// source of truth, which is what every other reader of this struct
+// (labelValue, labelIndicesMatching, LabelValues) already treats it as.
+//
+// The first position a value occupies is the one the map names and the
+// rest become aliases, so lookupPositions still answers with all of them
+// and a comparison cannot silently exclude the rows stored under one.
 func (d *dictionary) rebuildIndex() {
 	d.holes = nil
 	d.alias = nil
 	d.live = 0
+	d.index = make(map[string]int32, len(d.Entries))
 	for i, e := range d.Entries {
 		if e == "" {
+			// A hole left by a lost record, not a value. Nothing may
+			// intern an empty value (ValidateLabelValue refuses it), so
+			// indexing it would let `label = ""` resolve to a position.
 			d.holes = append(d.holes, int32(i))
 			continue
 		}
 		d.live++
-		if at, ok := d.index[e]; ok && at != int32(i) {
-			if d.alias == nil {
-				d.alias = map[string][]int32{}
-			}
-			d.alias[e] = append(d.alias[e], int32(i))
+		if _, seen := d.index[e]; !seen {
+			d.index[e] = int32(i)
+			continue
 		}
+		if d.alias == nil {
+			d.alias = map[string][]int32{}
+		}
+		d.alias[e] = append(d.alias[e], int32(i))
 	}
 }
 

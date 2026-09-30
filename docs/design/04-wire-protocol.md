@@ -330,11 +330,20 @@ as a panel-level notice and still draws the frames.
 | `GET /v1/catalogue` | Sets, fields, metadata, bucket sets, conflicts; `ETag` |
 | `GET /v1/labels?key=` | Dictionary values for a label key |
 | `GET /v1/stats` | Engine stats: puts, scans, iterators, LSM metrics, disk usage |
+| `POST /v1/parse` | Parse MQL text to an AST, with the diagnostics only the text carries |
+| `POST /v1/print` | Render an AST back to canonical MQL text |
 | `POST /v1/admin/compact` | Full-keyspace compaction (used at end of batch ingest) |
 | `POST /v1/admin/retention/run` | Force a retention sweep |
+| `POST /v1/admin/quiesce` | Persist the catalogue and flush the memtables, so a filesystem snapshot of the data directory means something |
 | `DELETE /v1/admin/sets/{name}` | Drop a set (scope `admin`) |
-| `GET /v1/debug/plan` | Explain a query: shards touched, index range, pushdown expression, projection |
+| `POST /v1/debug/plan` | Explain a query: shards touched, index range, pushdown expression, projection |
 | `GET /metrics` | Prometheus exposition |
+
+`/v1/parse` and `/v1/print` carry the `query` scope, not `admin`: they are
+what the query editor calls on every keystroke, and there is one parser,
+in Go, which the frontend never reimplements. `/v1/debug/plan` takes a
+whole `QueryRequest` as its body, which is why it is a `POST` even though
+it changes nothing.
 
 `/v1/debug/*` binds to the loopback listener only: the debug surface is never
 reachable from whatever proxies the public path.

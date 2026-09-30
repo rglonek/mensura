@@ -69,3 +69,27 @@ func mustReparse(t *testing.T, text string) *Query {
 	}
 	return q
 }
+
+// A repeated CLAMP bound is refused rather than silently overwritten, the
+// way a repeated LIMIT clause and a repeated field modifier are: a Clamp
+// holds one pointer per bound, so the second value won and the first
+// vanished from the AST and from the text Print emits back.
+func TestClampRefusesARepeatedBound(t *testing.T) {
+	for _, text := range []string{
+		`FROM app SELECT cpu CLAMP MIN 0, MIN 5`,
+		`FROM app SELECT cpu CLAMP MAX 1, MAX 2`,
+		`FROM app SELECT cpu CLAMP MIN 0, MAX 1, MIN 3`,
+	} {
+		q, err := Parse(text)
+		if err == nil {
+			t.Fatalf("%s parsed into %+v; a repeated bound must be E006", text, q.Select[0].Modifiers.Clamp)
+		}
+		if !strings.Contains(err.Error(), "E006") {
+			t.Fatalf("%s: want E006, got %v", text, err)
+		}
+	}
+	// The ordinary pair still parses.
+	if _, err := Parse(`FROM app SELECT cpu CLAMP MIN 0, MAX 100 ELSE RAW`); err != nil {
+		t.Fatalf("a well-formed CLAMP was refused: %v", err)
+	}
+}

@@ -3808,128 +3808,6 @@ space a retention sweep just freed. A proxy says nothing rather than
 reporting zeroes that read like an idle store.
 
 
-## 7. Known gaps worth naming
-
-- **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
-  describes four things the code does not do, and they are named here
-  rather than left reading as features. A rotated file's undrained tail is
-  said to be recovered on restart "via the archive glob"
-  (`--rotated-glob`, `--catch-up-rotated`): there is no such flag and no
-  such sweep, so a process that dies part-way through draining a renamed
-  handle loses whatever was left in it — the replacement is still read
-  from offset 0, because the stored fingerprint no longer matches. §6.3
-  says `mensura-ingest check` warns about an occurrence-counting pattern
-  under `key: content`; the lint set is `L001`–`L007` and holds no such
-  check, and deciding "no numeric capture" from a spec alone is guesswork,
-  because extraction coerces per value. §7.1 offers TLS on the receive
-  listeners and a client-certificate subject mapped to stream labels, plus
-  per-connection byte-rate caps: the listeners are plaintext, and the only
-  per-connection bounds are `--max-connections` and the idle timeout. §10
-  offers Prometheus metrics on `--metrics-listen`: `mensura-ingest` has no
-  such flag and serves no metrics endpoint, so the progress document, the
-  console line and the `_mensura_ingest` set are the whole of its
-  telemetry — which is also the one telemetry path that stops working
-  when the store is unreachable.
-- **`GET /label-values?filter=` is not built.** [08](08-plugin.md) §2.3
-  described the builder's value list as "optionally filtered". The
-  resource reads `key` and nothing else, so a filter would have been
-  accepted and dropped — the failure `LABELS … WHERE` was itself fixed
-  for. Filtering needs a predicate *and* a time range, because the
-  filtered form is a scan of the matching rows rather than a dictionary
-  read, and a resource call carries neither; `LABELS <key> WHERE …` on
-  the query API is the built form. The parameter has been removed from
-  the table rather than left reading as a feature.
-- **No frontend.** The plugin backend answers Grafana correctly, but until the
-  React editor exists a panel must carry the AST in its query model. The
-  backend's `parse`/`print` resources exist precisely so the frontend never
-  implements a second parser.
-- **`route:` decides a destination set per record, and the *policy*
-  question is still open.** Open question 3 in [11](11-roadmap.md) asks
-  whether a route may name a set no spec declared; it may, and the store
-  creates it on first write. The *cardinality* half of that question is
-  closed: `limits.max_sets` and `limits.max_fields_per_set` (§6.181) bound
-  the catalogue on the declaration path and on the sample path alike, so a
-  route deriving its set name from a log line is refused by name past the
-  cap rather than growing the catalogue without limit. What is still
-  missing is a way to say *which* names a route may invent.
-- **`store_stream_label:` is refused, not ignored.** The key was accepted by
-  the spec decoder and acted on nowhere. Compiling a spec that sets it now
-  fails, on the same principle as `tls.client_ca`: a declaration that does
-  nothing is worse than one that is rejected.
-- **Sub-millisecond timestamps are truncated**, per open question 1.
-- **The unsharded shard is never swept.** A set written before any
-  retention was declared for it lands in `@all`, and `RunRetention` skips
-  that shard by name because it carries no time range to compare against a
-  horizon. In the ordinary case there is nothing there: `Write` applies a
-  request's `set_meta` before its batches, so the first batch of the first
-  ingester is already sharded, and §6.109 keeps the declaration across a
-  restart. A second ingester declaring retention for a set an earlier one
-  had already filled without it leaves those rows immortal; emptying them
-  needs a row-wise sweep of `@all`, which is not built.
-- **`NOT label = "v"` and `label != "v"` are not the same predicate.** The
-  inequality requires the row to carry the label (§4.4 of
-  [06](06-query.md)); the negation is a logical complement, so it also
-  matches every row that does not. Both readings are defensible and the
-  grammar offers both; the asymmetry is recorded here rather than resolved,
-  because changing either one silently changes what a stored panel draws.
-- **There is no spec reload.** [03](03-extraction.md) §11 describes
-  reloading a spec on `SIGHUP` or on a `--spec-reload-interval`, keeping
-  the running spec loudly when the new one will not compile and applying
-  new patterns to subsequent records only. `mensura-ingest` loads its
-  spec once, in `setup()`, and installs no signal handler: changing a
-  spec means restarting the process, which resumes each followed file
-  from its checkpoint. One bullet of that section *is* true, by a
-  different route: a field the catalogue stops seeing is marked
-  `stale: true` with a last-seen timestamp (§6.50), which is driven by
-  the field going unwritten rather than by the declaration going away.
-- **Documented CLI surface that does not exist.** `mensura-store
-  convert-dashboard`, `mensura-store config check`, `mensura-ingest
-  --label-from-path`, `--read-only-input`, and the whole ingest config
-  file of [09](09-operations.md) §1.2 — `store:`, `state_dir:`, `spec:`,
-  `labels:`, several `inputs:` entries, `progress:` — are described in
-  [02](02-ingest.md), [06](06-query.md) and [09](09-operations.md) and
-  are not built. [02](02-ingest.md) §2's own synopsis spelled two
-  subcommands with flags that do not exist either (`--ssh user@h:/path`
-  for the remote tail, `--listen …` for the receiver); the real spellings
-  are `--ssh-host` with `--path`, and `--listen-tcp`/`--listen-udp`/
-  `--listen-http`, and the synopsis has been corrected rather than
-  recorded, because those flags are there. `mensura-ingest` is configured by flags only, and the
-  subcommands that exist cover the single-input case each of the missing
-  ones is sugar for. What `config check` describes does happen: the store
-  refuses an inline secret at startup and names the key
-  ([config.go](../../cmd/mensura-store/config.go)); there is simply no
-  subcommand of that name.
-- **There is no environment-variable configuration layer.**
-  [09](09-operations.md) §1 describes three sources in increasing
-  precedence — config file, environment, flag — with variables following
-  the field path (`MENSURA_STORE_DB_CACHE_BYTES`). Only the two bearer
-  tokens are read from the environment (`MENSURA_STORE_TOKEN`,
-  `MENSURA_INGEST_TOKEN`), which is also the one thing §1 says may *only*
-  come from there. Everything else is config file or flag.
-- **Retention does not reclaim label dictionary entries.** There is one
-  dictionary per label key for the whole store ([05](05-storage.md) §8,
-  ADR-004) and every stored row holds an index into it, so a value dropped
-  because one set aged out would relabel the rows of every other set that
-  still carries it. A key's cardinality budget therefore only ever grows;
-  recovering it needs the per-set dictionaries ADR-004 rejected.
-- **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
-  is the only mitigation for a query with no `BY`.
-- **A label value that is literally `$name` cannot be queried.** The AST
-  stores a variable reference as the plain string `"$name"`, so it is
-  indistinguishable from a literal of the same text, and §6.14's `E010`
-  refuses both. Separating them needs a tagged value on `Compare` and
-  `InList`, which changes the JSON shape of every stored panel; the
-  round-trip is otherwise lossless.
-- **The sink's buffer is bounded by a count, not by a spill.** A cancelled
-  context (§ shutdown), a rejected credential (§6.26) and now retry
-  exhaustion (§6.31) all requeue rather than shed, so a long outage grows
-  memory until the store comes back. `SinkConfig.MaxBufferedSamples`
-  (100 000) is where that ends: past it the excess is dropped from the
-  oldest end of every buffered set in proportion to its size, counted and
-  logged with the reason, because an unbounded buffer turns a store outage
-  into an out-of-memory kill that loses everything rather than the tail.
-  Losing nothing at all still needs a spill-to-disk queue.
-
 ### 6.180 A window carried the opening record's other measurements
 
 An aggregation window was built with a copy of the opening record's whole
@@ -4342,3 +4220,224 @@ exactly why the next caller should not have to know that.
   peer *address* — and UDP was the one listener that could not show it.
   The refusal now goes through `warnRecord`, so it is collapsed on the
   powers of ten like every other per-record failure there.
+
+### 6.198 Every connect-break drew a synthetic zero beside real data
+
+Singular-series padding was decided inside `emitWindow`, which sees one
+window's points and nothing else: a real point whose neighbour *within
+that window* was a null got a padding point spliced beside it. The
+purpose of the padding, stated in [07](07-downsampling.md) §4 and in the
+function's own comment, is to stop a lone value rendering as a
+zero-length mark — but a point with a real neighbour in the *previous*
+window is not a lone value, and the window cannot see that neighbour.
+
+At any realistic zoom it never can, because the window is sized to the
+render budget: a six-hour range at 1000 datapoints gives a 43-second
+window, so a one-minute series puts exactly one sample in each. The last
+reading before an outage was therefore the only real point in its window,
+sitting next to the null gap detection had just injected, and it was
+padded — with `SSE const 0`, which is the default every field gets. The
+panel drew a healthy series diving vertically to zero 500 ms before every
+break, on any field that declares `max_interval`, which is the
+configuration `W103` exists to ask for. A value no source reported,
+rendered as if it had been measured, is the one thing the rest of this
+walk is built to prevent.
+
+`padIsolated` now runs once over the finished series, after the tail
+flush and after the trailing connect-break, and pads exactly the points
+that series strands: a null, or the end of the series, on **both** sides.
+That subsumes the old "the whole series reduced to one point" special
+case, and it also pads a point stranded by breaks that fall in two
+different windows — which the per-window test could not see, so such a
+point drew as half a segment or as nothing at all.
+
+### 6.199 A predicate was bounded in depth and not in size
+
+[06](06-query.md) §12's `E007` bounds a query's width (`MaxSelectFields`,
+`MaxByLabels`) and §6.118's `MaxPredicateDepth` bounds its depth. The
+third axis — how many clauses a `WHERE` holds — was open, and it is the
+only one whose cost is worse than linear: `buildExpr` lowers a regex
+clause by walking every value of its label key, up to
+`max_label_cardinality` (100 000 by default), so the work is
+(regex clauses) x (dictionary size). An AST arrives as JSON at the
+store's `max_request_bytes`, which holds on the order of a million
+clauses, and `mql.Validate` compiles every one of them *before* the query
+takes an execution slot, so `max_concurrent_jobs` did not apply either. A
+handful of such requests was the cheapest way to stop a store answering,
+on an endpoint whose whole audience is a query editor.
+
+`MaxPredicateNodes` (1024, the same order as `MaxSelectFields`) is
+counted in the parser, in `Validate` — before anything walks the
+predicate, so the `LABELS` form, whose filter is validated against a nil
+schema, is held to it too — and in `CheckPredicateDepth`, which is what
+`/v1/print`, `/v1/debug/plan` and the plugin's own resources call.
+`Store.Explain` takes it as well, beside the two width checks it already
+took for the same reason: it deliberately does not run `Validate`.
+
+### 6.200 Smaller corrections
+
+- **A repeated `CLAMP` bound is refused rather than overwritten.** A
+  `Clamp` holds one pointer per bound, so `CLAMP MIN 0, MIN 5` kept
+  whichever was written last and said nothing — and `Print` emits the
+  survivor, so the query came back from the editor silently missing a
+  bound the author had typed. [06](06-query.md) §12 lists a repeated
+  clause under `E006`, which is what `LIMIT SERIES` given twice and a
+  repeated field modifier already answer.
+- **The label dictionary's forward map is derived, not accumulated.** The
+  two on-disk forms are read one after the other into the same struct —
+  a legacy packed array first, then the per-value records, which write
+  into positions that array already filled — and each loader added its
+  own map entries as it went. An overwritten position left the *old*
+  value in the map pointing at a slot that now holds a different one, so
+  `host = "<old>"` lowered to that slot and the scan returned the rows of
+  whichever value really lives there: not an empty result, the wrong
+  rows. `rebuildIndex` now rebuilds the map from `Entries`, which is what
+  every other reader of the struct already treats as the truth, with the
+  first position a value occupies naming it and the rest becoming
+  aliases.
+- **§7 was in the middle of §6.** Entries 6.180 onwards had been appended
+  after the "Known gaps worth naming" heading, so the section a reader
+  scrolls to for the gaps ran straight into more divergences. §7 is at
+  the end of the document again.
+- **The "no such set" diagnostic is bounded.** `E002` listed every set
+  the catalogue holds so an operator could spot the typo, and `max_sets`
+  allows ten thousand of up to 128 characters each: a mistyped `FROM`
+  answered `400` with over a megabyte of names, which the plugin then
+  renders as a panel-level error string. Fifty names and a count is the
+  same bound `wire.MaxReportedRejections` puts on the other diagnostic a
+  client can make arbitrarily large.
+- **Two heatmap refusals are diagnostics, not faults.** `runHeatmap`
+  answered a missing `HISTOGRAM(...)` and an empty bucket set with a bare
+  error, which `handleQuery` turns into `500` — a fault in the store for
+  something the request got wrong. `mql.Validate` refuses both first, so
+  they are only reachable from a caller that builds a `wire.QueryRequest`
+  directly, but that is the caller least able to tell `500` from `400`.
+- **The wire protocol's endpoint table was missing three endpoints and
+  named the wrong method for a fourth.** `POST /v1/parse`,
+  `POST /v1/print` and `POST /v1/admin/quiesce` are part of the store's
+  HTTP surface and appeared nowhere in [04](04-wire-protocol.md); the
+  plan endpoint was listed as `GET /v1/debug/plan` while it takes a whole
+  `QueryRequest` as its body and the shipped client `POST`s it.
+
+
+## 7. Known gaps worth naming
+
+- **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
+  describes four things the code does not do, and they are named here
+  rather than left reading as features. A rotated file's undrained tail is
+  said to be recovered on restart "via the archive glob"
+  (`--rotated-glob`, `--catch-up-rotated`): there is no such flag and no
+  such sweep, so a process that dies part-way through draining a renamed
+  handle loses whatever was left in it — the replacement is still read
+  from offset 0, because the stored fingerprint no longer matches. §6.3
+  says `mensura-ingest check` warns about an occurrence-counting pattern
+  under `key: content`; the lint set is `L001`–`L007` and holds no such
+  check, and deciding "no numeric capture" from a spec alone is guesswork,
+  because extraction coerces per value. §7.1 offers TLS on the receive
+  listeners and a client-certificate subject mapped to stream labels, plus
+  per-connection byte-rate caps: the listeners are plaintext, and the only
+  per-connection bounds are `--max-connections` and the idle timeout. §10
+  offers Prometheus metrics on `--metrics-listen`: `mensura-ingest` has no
+  such flag and serves no metrics endpoint, so the progress document, the
+  console line and the `_mensura_ingest` set are the whole of its
+  telemetry — which is also the one telemetry path that stops working
+  when the store is unreachable.
+- **`GET /label-values?filter=` is not built.** [08](08-plugin.md) §2.3
+  described the builder's value list as "optionally filtered". The
+  resource reads `key` and nothing else, so a filter would have been
+  accepted and dropped — the failure `LABELS … WHERE` was itself fixed
+  for. Filtering needs a predicate *and* a time range, because the
+  filtered form is a scan of the matching rows rather than a dictionary
+  read, and a resource call carries neither; `LABELS <key> WHERE …` on
+  the query API is the built form. The parameter has been removed from
+  the table rather than left reading as a feature.
+- **No frontend.** The plugin backend answers Grafana correctly, but until the
+  React editor exists a panel must carry the AST in its query model. The
+  backend's `parse`/`print` resources exist precisely so the frontend never
+  implements a second parser.
+- **`route:` decides a destination set per record, and the *policy*
+  question is still open.** Open question 3 in [11](11-roadmap.md) asks
+  whether a route may name a set no spec declared; it may, and the store
+  creates it on first write. The *cardinality* half of that question is
+  closed: `limits.max_sets` and `limits.max_fields_per_set` (§6.181) bound
+  the catalogue on the declaration path and on the sample path alike, so a
+  route deriving its set name from a log line is refused by name past the
+  cap rather than growing the catalogue without limit. What is still
+  missing is a way to say *which* names a route may invent.
+- **`store_stream_label:` is refused, not ignored.** The key was accepted by
+  the spec decoder and acted on nowhere. Compiling a spec that sets it now
+  fails, on the same principle as `tls.client_ca`: a declaration that does
+  nothing is worse than one that is rejected.
+- **Sub-millisecond timestamps are truncated**, per open question 1.
+- **The unsharded shard is never swept.** A set written before any
+  retention was declared for it lands in `@all`, and `RunRetention` skips
+  that shard by name because it carries no time range to compare against a
+  horizon. In the ordinary case there is nothing there: `Write` applies a
+  request's `set_meta` before its batches, so the first batch of the first
+  ingester is already sharded, and §6.109 keeps the declaration across a
+  restart. A second ingester declaring retention for a set an earlier one
+  had already filled without it leaves those rows immortal; emptying them
+  needs a row-wise sweep of `@all`, which is not built.
+- **`NOT label = "v"` and `label != "v"` are not the same predicate.** The
+  inequality requires the row to carry the label (§4.4 of
+  [06](06-query.md)); the negation is a logical complement, so it also
+  matches every row that does not. Both readings are defensible and the
+  grammar offers both; the asymmetry is recorded here rather than resolved,
+  because changing either one silently changes what a stored panel draws.
+- **There is no spec reload.** [03](03-extraction.md) §11 describes
+  reloading a spec on `SIGHUP` or on a `--spec-reload-interval`, keeping
+  the running spec loudly when the new one will not compile and applying
+  new patterns to subsequent records only. `mensura-ingest` loads its
+  spec once, in `setup()`, and installs no signal handler: changing a
+  spec means restarting the process, which resumes each followed file
+  from its checkpoint. One bullet of that section *is* true, by a
+  different route: a field the catalogue stops seeing is marked
+  `stale: true` with a last-seen timestamp (§6.50), which is driven by
+  the field going unwritten rather than by the declaration going away.
+- **Documented CLI surface that does not exist.** `mensura-store
+  convert-dashboard`, `mensura-store config check`, `mensura-ingest
+  --label-from-path`, `--read-only-input`, and the whole ingest config
+  file of [09](09-operations.md) §1.2 — `store:`, `state_dir:`, `spec:`,
+  `labels:`, several `inputs:` entries, `progress:` — are described in
+  [02](02-ingest.md), [06](06-query.md) and [09](09-operations.md) and
+  are not built. [02](02-ingest.md) §2's own synopsis spelled two
+  subcommands with flags that do not exist either (`--ssh user@h:/path`
+  for the remote tail, `--listen …` for the receiver); the real spellings
+  are `--ssh-host` with `--path`, and `--listen-tcp`/`--listen-udp`/
+  `--listen-http`, and the synopsis has been corrected rather than
+  recorded, because those flags are there. `mensura-ingest` is configured by flags only, and the
+  subcommands that exist cover the single-input case each of the missing
+  ones is sugar for. What `config check` describes does happen: the store
+  refuses an inline secret at startup and names the key
+  ([config.go](../../cmd/mensura-store/config.go)); there is simply no
+  subcommand of that name.
+- **There is no environment-variable configuration layer.**
+  [09](09-operations.md) §1 describes three sources in increasing
+  precedence — config file, environment, flag — with variables following
+  the field path (`MENSURA_STORE_DB_CACHE_BYTES`). Only the two bearer
+  tokens are read from the environment (`MENSURA_STORE_TOKEN`,
+  `MENSURA_INGEST_TOKEN`), which is also the one thing §1 says may *only*
+  come from there. Everything else is config file or flag.
+- **Retention does not reclaim label dictionary entries.** There is one
+  dictionary per label key for the whole store ([05](05-storage.md) §8,
+  ADR-004) and every stored row holds an index into it, so a value dropped
+  because one set aged out would relabel the rows of every other set that
+  still carries it. A key's cardinality budget therefore only ever grows;
+  recovering it needs the per-set dictionaries ADR-004 rejected.
+- **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
+  is the only mitigation for a query with no `BY`.
+- **A label value that is literally `$name` cannot be queried.** The AST
+  stores a variable reference as the plain string `"$name"`, so it is
+  indistinguishable from a literal of the same text, and §6.14's `E010`
+  refuses both. Separating them needs a tagged value on `Compare` and
+  `InList`, which changes the JSON shape of every stored panel; the
+  round-trip is otherwise lossless.
+- **The sink's buffer is bounded by a count, not by a spill.** A cancelled
+  context (§ shutdown), a rejected credential (§6.26) and now retry
+  exhaustion (§6.31) all requeue rather than shed, so a long outage grows
+  memory until the store comes back. `SinkConfig.MaxBufferedSamples`
+  (100 000) is where that ends: past it the excess is dropped from the
+  oldest end of every buffered set in proportion to its size, counted and
+  logged with the reason, because an unbounded buffer turns a store outage
+  into an out-of-memory kill that loses everything rather than the tail.
+  Losing nothing at all still needs a spill-to-disk queue.
