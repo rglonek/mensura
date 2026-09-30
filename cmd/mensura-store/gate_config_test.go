@@ -21,6 +21,7 @@ limits:
   max_label_keys: -1
   max_sets: -1
   max_fields_per_set: -1
+  max_bucket_sets_per_set: -1
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -40,6 +41,7 @@ limits:
 		"max_label_keys":          sc.MaxLabelKeys,
 		"max_sets":                sc.MaxSets,
 		"max_fields_per_set":      sc.MaxFieldsPerSet,
+		"max_bucket_sets_per_set": sc.MaxBucketSetsPerSet,
 	} {
 		if got > 0 {
 			t.Errorf("%s = %d: a negative value must switch the gate off, not be ignored", name, got)

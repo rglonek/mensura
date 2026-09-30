@@ -98,6 +98,31 @@ type Config struct {
 	MaxSets         int
 	MaxFieldsPerSet int
 
+	// MaxBucketSetsPerSet bounds how many distinct bucket sets one
+	// logical set may declare, which was the last dimension of
+	// client-chosen catalogue growth with no bound at all.
+	//
+	// It is not the same shape as MaxFieldsPerSet, and that is why it
+	// needed its own gate. A bucket-set declaration arrives as
+	// wire.FieldMeta carrying a *bucket set name* and a *bucket index*,
+	// and applyFieldMeta grows that bucket set's column and edge lists
+	// to the index -- up to maxBucketIndex, 4096 -- so one entry retains
+	// ~140 KiB whatever field it names. Every one of those entries may
+	// name the *same* field, so the field budget beside this one counted
+	// a number that never moved: a single 32 MiB write request holding
+	// half a million such declarations grew the catalogue past any host's
+	// memory, and the catalogue is persisted as one JSON record, so the
+	// save went with it.
+	//
+	// A new bucket set past the cap is refused by name, which is the rule
+	// MaxSets and MaxFieldsPerSet already follow: one the catalogue
+	// already holds always works, and a non-positive value switches the
+	// gate off. The default is far past anything these documents
+	// describe -- the worked examples declare one bucket set per set, and
+	// a set carrying more than a handful of distinct histogram layouts is
+	// not a histogram.
+	MaxBucketSetsPerSet int
+
 	// MaxConcurrentJobs bounds how many queries may execute at once. A
 	// query buffers its series in memory, so an unbounded number of them
 	// is an unbounded memory footprint.
@@ -120,6 +145,7 @@ func DefaultConfig() Config {
 		MaxLabelKeys:          1000,
 		MaxSets:               10_000,
 		MaxFieldsPerSet:       10_000,
+		MaxBucketSetsPerSet:   64,
 		MaxConcurrentJobs:     8,
 		Logger:                log.New(os.Stderr, "mensura-store ", log.LstdFlags),
 	}
@@ -468,6 +494,9 @@ func Open(cfg Config) (*Store, error) {
 	}
 	if cfg.MaxFieldsPerSet == 0 {
 		cfg.MaxFieldsPerSet = DefaultConfig().MaxFieldsPerSet
+	}
+	if cfg.MaxBucketSetsPerSet == 0 {
+		cfg.MaxBucketSetsPerSet = DefaultConfig().MaxBucketSetsPerSet
 	}
 	opts := engine.DefaultOptions()
 	opts.Path = cfg.DataDir

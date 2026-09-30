@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rglonek/mensura/pkg/extract"
 	"github.com/rglonek/mensura/pkg/model"
@@ -112,6 +115,11 @@ type Sink struct {
 	// moment they should stop reading rather than the next tick.
 	gaveUp     chan struct{}
 	gaveUpOnce sync.Once
+
+	// batchBytes is the body budget actually in force, which starts at
+	// SinkConfig.BatchBytes and is halved whenever the store answers
+	// 413. See shrinkBatchBytes.
+	batchBytes atomic.Int64
 
 	// now is the clock, overridable through setClock.
 	//
@@ -218,6 +226,7 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 		gaveUp:   make(chan struct{}),
 		now:      time.Now,
 	}
+	s.batchBytes.Store(int64(cfg.BatchBytes))
 	s.wg.Add(1)
 	go s.flushLoop()
 	return s
@@ -566,6 +575,23 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 	if err != nil {
 		var fatal *wire.ErrFatal
 		if errors.As(err, &fatal) {
+			// A body the store found too large is not a verdict on the
+			// samples inside it: the same samples in a smaller request
+			// are a request the store would take. Halving the budget and
+			// putting the batch back converges on a body it accepts,
+			// instead of dropping the batch and freezing every followed
+			// file's checkpoint behind the hole that leaves. Nothing in
+			// the protocol lets an ingester discover the store's
+			// max_request_bytes, so this is how it is learned.
+			if fatal.Status == http.StatusRequestEntityTooLarge {
+				if to, again := s.shrinkBatchBytes(); again {
+					s.requeueBatches(batches, count)
+					s.requeueMeta(meta, sets)
+					s.log.Printf("WARNING the store refused a %d-sample request as too large (%v); halving the body budget to %d bytes and retrying", count, fatal, to)
+					return false, err
+				}
+				s.log.Printf("ERROR the store refused a %d-sample request as too large (%v) and the body budget is already at the %d-byte floor; a single sample is larger than the store will accept", count, fatal, minBatchBytes)
+			}
 			// Retrying a malformed batch forever is how a pipeline stalls
 			// silently, so it is dropped, counted and logged with enough
 			// detail to fix the spec.
@@ -830,15 +856,53 @@ func sampleBytes(s *model.Sample) int {
 // byte, and the HTML-safety escapes for '<', '>' and '&' that
 // json.Marshal applies unless a decoder is told otherwise. A byte that is
 // none of those costs itself.
+//
+// It walks runes rather than bytes, because two of those rules are about
+// runes and counting bytes made this an *under*-estimate -- the one
+// direction the budget above may not err in.
+//
+//   - A byte that is not valid UTF-8 is emitted as \ufffd: six bytes for
+//     one. That is not a pathological input, it is a log line in any
+//     encoding that is not UTF-8 -- Latin-1 or CP1252 accented text,
+//     Windows smart quotes, a truncated multi-byte sequence -- and a
+//     `kind: string` field is a whole log message, so a batch of them was
+//     charged a sixth of what it encodes to. Measured at 5.4x over
+//     BatchBytes on ordinary Latin-1 text.
+//   - U+2028 and U+2029 are escaped as \u2028 and \u2029: six bytes for
+//     three.
+//
+// An under-count matters for the reason the constants above spell out: it
+// lets a take exceed BatchBytes, and an operator following the flag's own
+// advice ("--batch-bytes ... must stay under the store's
+// max_request_bytes") then presents a body past that limit. The store
+// answers 413, which wire.Client classifies as fatal, so the sink drops
+// the whole batch, reports it to the delivery observers as a hole, and
+// every followed file's checkpoint freezes behind it.
 func jsonStringBytes(s string) int {
-	n := len(s)
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"', c == '\\', c == '\n', c == '\r', c == '\t':
-			n++ // one backslash
-		case c < 0x20, c == '<', c == '>', c == '&':
-			n += 5 // \u00XX
+	n := 0
+	for i := 0; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			switch {
+			case c == '"', c == '\\', c == '\n', c == '\r', c == '\t':
+				n += 2 // a backslash and the escape character
+			case c < 0x20, c == '<', c == '>', c == '&':
+				n += 6 // \u00XX
+			default:
+				n++
+			}
+			i++
+			continue
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			n += 6 // one invalid byte becomes \ufffd
+		case r == '\u2028', r == '\u2029':
+			n += 6 // three bytes become \u2028 or \u2029
+		default:
+			n += size
+		}
+		i += size
 	}
 	return n
 }
@@ -1070,14 +1134,68 @@ func (s *Sink) requeueMeta(meta []wire.FieldMeta, sets []wire.SetMeta) {
 // takeLocked, and the honest degenerate answer when the declarations
 // alone fill the body is one sample per request until they have gone.
 func (s *Sink) sampleBudget(meta []wire.FieldMeta, sets []wire.SetMeta) int {
-	if s.cfg.BatchBytes <= 0 {
+	limit := int(s.batchBytes.Load())
+	if limit <= 0 {
+		// A caller that built a Sink directly rather than through
+		// NewSink has not stored the effective budget, so fall back to
+		// the configured one.
+		limit = s.cfg.BatchBytes
+	}
+	if limit <= 0 {
 		return 0
 	}
-	budget := s.cfg.BatchBytes - metaBytes(meta, sets)
+	budget := limit - metaBytes(meta, sets)
 	if budget < 1 {
 		budget = 1
 	}
 	return budget
+}
+
+// minBatchBytes is the floor shrinkBatchBytes will not go below.
+//
+// Past it the store's own limit is smaller than a single record can be --
+// the record cap is a megabyte, and a `kind: string` field holding one
+// costs several times that once JSON escaping is paid for -- so no amount
+// of halving will make that sample deliverable and it has to be dropped
+// like any other batch the store refuses outright.
+const minBatchBytes = 64 << 10
+
+// shrinkBatchBytes halves the body budget after the store has answered
+// 413, and reports whether the batch is worth another attempt.
+//
+// A 413 is fatal for the *body*, which is why wire.Client classifies it
+// that way, but it is not a verdict on the samples: the store said the
+// request was too big, and a smaller one carrying the same samples is a
+// request it would take. The sink used to treat it as a lost batch --
+// dropped, counted, reported to the delivery observers as a hole, which
+// freezes every followed file's checkpoint behind it -- so an operator
+// whose --batch-bytes sat above the store's max_request_bytes lost data
+// at full rate, and nothing in the protocol lets an ingester discover
+// that number to avoid it. Halving and retrying converges on a body the
+// store accepts within a handful of flushes, and says so once per step.
+//
+// The budget is never raised again. A store's body limit is a
+// configuration rather than a weather condition, so a shrink that stuck
+// is the honest description of what this ingester may send; growing it
+// back on a hunch would rediscover the same refusal, and each
+// rediscovery costs a request.
+func (s *Sink) shrinkBatchBytes() (int, bool) {
+	for {
+		cur := s.batchBytes.Load()
+		if cur <= 0 {
+			cur = int64(s.cfg.BatchBytes)
+		}
+		if cur <= minBatchBytes {
+			return int(cur), false
+		}
+		next := cur / 2
+		if next < minBatchBytes {
+			next = minBatchBytes
+		}
+		if s.batchBytes.CompareAndSwap(cur, next) {
+			return int(next), true
+		}
+	}
 }
 
 // metaBytes is what the declarations occupy in the request body,

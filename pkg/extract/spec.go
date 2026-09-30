@@ -973,6 +973,61 @@ func (p *Profile) compile(s *Spec) error {
 		searches = append(searches, pat.Search)
 	}
 	p.matcher = newACMatcher(searches)
+	return p.checkBucketSetColumns()
+}
+
+// checkBucketSetColumns refuses two bucket sets that write the same
+// column into the same destination set.
+//
+// compile already refuses a collision *within* one bucket set, because
+// the columns share one row. Two bucket sets collide on exactly the same
+// row whenever their patterns write the same `set:`, and that is a
+// plausible spec rather than a contrived one: the conventional HDR bucket
+// names are "00".."23", so a profile with a read histogram and a write
+// histogram both aimed at one set collides on all twenty-four.
+//
+// Nothing said so, and every consequence was silent. At run time both
+// patterns write one column with two different meanings, so the stored
+// series is an interleaving of two measurements. In the catalogue it is
+// worse: Sink.DeclareFields sends one FieldMeta per (set, column) and
+// marks it sent, so the *second* bucket set's shared columns are never
+// declared -- applyFieldMeta grows its column list to the indices that
+// did arrive and leaves the rest empty, and runHeatmap skips an empty
+// column. The panel for that bucket set therefore draws with its shared
+// buckets simply missing, with no error anywhere.
+//
+// Two bucket sets writing *different* sets may share column names
+// freely, which is why this is decided per destination rather than per
+// profile.
+func (p *Profile) checkBucketSetColumns() error {
+	for _, d := range p.Declarations() {
+		// Declarations lists one entry per branch, so the same bucket
+		// set can appear several times under one destination.
+		seen := map[string]struct{}{}
+		owner := map[string]string{}
+		for _, bs := range d.BucketSets {
+			if _, dup := seen[bs.Name]; dup {
+				continue
+			}
+			seen[bs.Name] = struct{}{}
+			cols := append([]string(nil), bs.Buckets...)
+			if bs.Cumulative {
+				for _, b := range bs.Buckets {
+					cols = append(cols, b+"plus")
+				}
+			}
+			if bs.Tail {
+				cols = append(cols, tailField)
+			}
+			for _, c := range cols {
+				if prev, clash := owner[c]; clash && prev != bs.Name {
+					return fmt.Errorf("bucket sets %s and %s both write the column %q into set %q; they land on one row, so one overwrites the other and the later declaration's column is never registered -- rename the columns, or write the two histograms to different sets",
+						prev, bs.Name, c, d.Set)
+				}
+				owner[c] = bs.Name
+			}
+		}
+	}
 	return nil
 }
 
@@ -1044,6 +1099,18 @@ func patternCaptureNames(pat *Pattern) []string {
 func (b *BucketSet) compile() error {
 	if b.Name == "" || len(b.Buckets) == 0 {
 		return fmt.Errorf("bucket set needs a name and buckets")
+	}
+	// The name is held to the same rule the store holds it to, here
+	// rather than per write. It travels in wire.FieldMeta and becomes a
+	// key of the catalogue's bucket-set map, so a name the store refuses
+	// is refused on every declaration -- and a refused declaration is a
+	// 400, which the write client classifies as fatal: the first batch
+	// carrying it is dropped outright and reported to the delivery
+	// observers as a hole. This is the check `route:` targets, `kind:`
+	// and the bucket columns were each given, on the last name in a
+	// bucket set that had none.
+	if err := model.ValidateBucketSetName(b.Name); err != nil {
+		return err
 	}
 	switch b.Parse {
 	case "":

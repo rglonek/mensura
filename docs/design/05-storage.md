@@ -284,6 +284,21 @@ switches the gate off. Declarations (`field_meta`, `set_meta`) are held to
 the budget as well, weighed whole before any of the request is applied, so
 the cheapest way past the cap is not the one that carries no data.
 
+`max_bucket_sets_per_set` (64) bounds the third thing a declaration
+creates, and it needs a gate of its own rather than sharing the field one.
+A bucket-set declaration arrives as one `field_meta` entry carrying a
+*bucket set name* and a *bucket index*, and the store grows that bucket
+set's column and edge lists to the index — up to the 4096 columns §8
+allows — so a single entry retains about 140 KiB whatever field it names.
+Every entry may name the same field and the same set, so the two budgets
+beside it were both watching numbers that never moved. The bucket set
+name is held to the field charset for the same reason a set name and a
+field name are: it is a key of the catalogue's per-set bucket-set map and
+it is served from `/v1/catalogue`, so it may not be arbitrary bytes of
+arbitrary length. The free text a field declaration carries (`unit`,
+`unit_hint`, `description`) is bounded at 4096 bytes each on the same
+grounds: the entry count was capped and the bytes per entry were not.
+
 Internal sets, all under the reserved prefix and all writable only by the store
 itself:
 

@@ -508,7 +508,25 @@ func (s *Store) buildExpr(e mql.Expr, proj map[string]struct{}) (engine.Expr, []
 			// The regex is evaluated once against the dictionary, not once
 			// per row: the scan only ever sees an integer set.
 			vals, all := s.labelIndicesMatching(m.Label, re.MatchString)
-			if len(vals) == all && all > 0 && !negate {
+			if len(vals) == all && all > 0 {
+				if negate {
+					// The mirror of the fold below, and it was the one
+					// arm of this lowering with neither a constant nor a
+					// diagnostic. `!~` on a regex that matches every
+					// known value of the key excludes every row that
+					// carries the label, and a row that does not carry
+					// it fails the existence half -- so the clause can
+					// never match. It lowered to
+					// And(Exists, Not(In(every value))), which is
+					// correct and says nothing: every selected shard was
+					// read in full and the panel came back empty with no
+					// warning to explain it, which is the failure the
+					// W201 beside it exists to prevent. Const(false)
+					// makes it the same answer the positive arm gives,
+					// and impossible skips the shard reads.
+					warns = append(warns, mql.Diag{Code: "W201", Msg: fmt.Sprintf("regex /%s/ matches every value of %s, so %s !~ /%s/ can never match", m.Regex, m.Label, m.Label, m.Regex)})
+					return engine.Const(false), true
+				}
 				warns = append(warns, mql.Diag{Code: "W202", Msg: fmt.Sprintf("regex /%s/ matches every value of %s; the clause was folded away", m.Regex, m.Label)})
 				return engine.Exists(m.Label), false
 			}
