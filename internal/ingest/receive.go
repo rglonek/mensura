@@ -705,6 +705,24 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 		// answered 200, so the sender was told the whole body had landed.
 		// handleConn refuses a cut-short record for exactly that reason;
 		// a request/response listener can do better still and say so.
+		// Refused on the declared length before a single record is
+		// read, where the sender declared one.
+		//
+		// This endpoint is a stream: records reach the sink as they are
+		// framed, so by the time the *running* count below notices the
+		// overflow, part of the body has already been delivered. The
+		// sender is then told its request failed while some of its lines
+		// were in fact stored -- and because a received record's key
+		// hint is the listener's own arrival sequence rather than a byte
+		// offset, re-sending the body writes those lines a second time
+		// under `key: offset`. Content-Length is what almost every
+		// sender supplies, and deciding on it turns the common case into
+		// a clean refusal that applies nothing at all.
+		if req.ContentLength > maxHTTPBodyBytes {
+			http.Error(w, fmt.Sprintf("request body is %d bytes, which is larger than the limit of %d; split it across requests", req.ContentLength, maxHTTPBodyBytes),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
 		body := io.LimitReader(req.Body, maxHTTPBodyBytes+1)
 		br := bufio.NewReaderSize(body, 64<<10)
 		n, refused, consumed := 0, 0, int64(0)
@@ -713,8 +731,18 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			rec, rerr := readRecord(br, r.ing.cfg.ReadBufferBytes)
 			consumed += int64(rec.Consumed)
 			if consumed > maxHTTPBodyBytes {
-				http.Error(w, fmt.Sprintf("request body is larger than the limit of %d bytes; split it across requests", maxHTTPBodyBytes),
-					http.StatusRequestEntityTooLarge)
+				// A chunked or length-less body that overran the cap.
+				// The counts travel with the refusal, because the
+				// records already framed have already reached the sink
+				// and a sender that cannot see that has no way to resume
+				// without duplicating them.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":    fmt.Sprintf("request body is larger than the limit of %d bytes; split it across requests", maxHTTPBodyBytes),
+					"accepted": n,
+					"refused":  refused,
+				})
 				return
 			}
 			// The same three-way test handleConn applies, and for the

@@ -59,6 +59,12 @@ type fileConfig struct {
 		// reclaims. Negative disables, as it does above.
 		MaxSets         int `yaml:"max_sets"`
 		MaxFieldsPerSet int `yaml:"max_fields_per_set"`
+		// MaxBucketSetsPerSet bounds the distinct bucket sets one set may
+		// declare. It is separate from max_fields_per_set because a
+		// bucket-set declaration retains a column list and an edge list
+		// sized by its declared index, however few field names the
+		// request carries. Negative disables, as above.
+		MaxBucketSetsPerSet int `yaml:"max_bucket_sets_per_set"`
 
 		// Accepted by the decoder only so they can be refused by name.
 		// Neither is implemented, and KnownFields(true) reported them as
@@ -226,6 +232,7 @@ func (c *fileConfig) toStoreConfig() (store.Config, error) {
 	sc.MaxLabelKeys = orDefault(c.Limits.MaxLabelKeys, sc.MaxLabelKeys)
 	sc.MaxSets = orDefault(c.Limits.MaxSets, sc.MaxSets)
 	sc.MaxFieldsPerSet = orDefault(c.Limits.MaxFieldsPerSet, sc.MaxFieldsPerSet)
+	sc.MaxBucketSetsPerSet = orDefault(c.Limits.MaxBucketSetsPerSet, sc.MaxBucketSetsPerSet)
 	if c.Limits.MaxConcurrentJobs > 0 {
 		sc.MaxConcurrentJobs = c.Limits.MaxConcurrentJobs
 	}

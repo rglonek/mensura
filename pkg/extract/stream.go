@@ -3,6 +3,7 @@ package extract
 import (
 	"container/heap"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -601,8 +602,16 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			// span: a replay that met it with no buffer open would judge
 			// it on its own instead of discarding it here.
 			st.holdRecord(buf, st.mark)
-			out, _ := st.processBuffered(buf)
-			return out, fmt.Errorf("extract: multiline record timestamps moved backwards")
+			out, verdict := st.processBuffered(buf)
+			// Both verdicts travel. Two records are judged here -- the
+			// buffered one this flushes and the continuation line it
+			// refuses -- and the buffered one's used to be dropped, so a
+			// profile whose joined records match no pattern under-counted
+			// Progress.UnmatchedLines by one every time an interleaved
+			// writer produced a continuation line with an earlier
+			// timestamp. recordOutcome unwraps a join, so each sentinel
+			// still reaches the counter it belongs to.
+			return out, errors.Join(verdict, fmt.Errorf("extract: multiline record timestamps moved backwards"))
 		}
 		for i := range m.Join {
 			j := &m.Join[i]

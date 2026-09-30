@@ -52,6 +52,7 @@ limits:
   max_label_keys: 1000            # distinct label keys in all; <0 disables
   max_sets: 10000                 # distinct sets in the catalogue; <0 disables
   max_fields_per_set: 10000       # distinct fields under one set; <0 disables
+  max_bucket_sets_per_set: 64     # distinct bucket sets under one set; <0 disables
 
 # Per-client rate limiting is not implemented (12-implementation.md §5), so
 # there is no write_rate_per_client key and no max_concurrent_requests:

@@ -695,7 +695,7 @@ func (a *API) readBody(r *http.Request) ([]byte, func(), error) {
 	// that is what has to fit in memory. Content-Length only helps when
 	// the body arrives as it was sent.
 	reserve := a.cfg.MaxRequestBytes
-	if r.Header.Get("Content-Encoding") != "gzip" && r.ContentLength > 0 && r.ContentLength < reserve {
+	if !gzipEncoded(r) && r.ContentLength > 0 && r.ContentLength < reserve {
 		reserve = r.ContentLength
 	}
 	for {
@@ -746,9 +746,21 @@ func writeBodyErr(w http.ResponseWriter, err error) {
 	writeErr(w, bodyErrStatus(err), err.Error())
 }
 
+// gzipEncoded reports whether a request body arrives compressed.
+//
+// The comparison is case-insensitive because a content coding is a
+// case-insensitive token (RFC 9110 section 8.4.1). It was matched exactly
+// against "gzip", so a client sending `Content-Encoding: GZIP` -- which is
+// as valid as the lower-case form -- had its deflate bytes handed
+// straight to the JSON decoder and got a 400 about malformed JSON for a
+// request that was entirely well formed.
+func gzipEncoded(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Content-Encoding")), "gzip")
+}
+
 func readBody(r *http.Request, max int64) ([]byte, error) {
 	var reader io.Reader = http.MaxBytesReader(nil, r.Body, max)
-	if r.Header.Get("Content-Encoding") == "gzip" {
+	if gzipEncoded(r) {
 		zr, err := gzip.NewReader(reader)
 		if err != nil {
 			return nil, oversizeOr(err, max)

@@ -415,9 +415,25 @@ func (i *Ingest) inWindow(tsMs int64) bool {
 	return true
 }
 
+// recordOutcome turns one extraction verdict into the pipeline's
+// counters.
+//
+// A joined verdict is unwrapped rather than counted once. One call can
+// carry two records' fates: a continuation line whose timestamp moved
+// backwards is refused *and* flushes the record it was meant to join, so
+// extract.Stream reports both, and collapsing them into a single
+// ExtractError lost whichever one the flushed record deserved.
 func (i *Ingest) recordOutcome(err error) {
+	if err == nil {
+		return
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range joined.Unwrap() {
+			i.recordOutcome(e)
+		}
+		return
+	}
 	switch err {
-	case nil:
 	case extract.ErrNoMatch:
 		i.cfg.Progress.Unmatched()
 	case extract.ErrNoTimestamp:

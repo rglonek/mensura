@@ -226,7 +226,18 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 		// changed was renamed away and re-created, and its length says
 		// nothing at all -- a replacement that has already grown past
 		// the acknowledged offset looks perfectly healthy by size.
-		size, ident, serr := i.remoteStat(ctx, opts, path)
+		// Bounded, the way the in-connection probe below already is.
+		// `ssh` under BatchMode=yes fails fast on a refused connection
+		// but not on one that hangs -- a black-holed route, a host that
+		// accepts the TCP connection and never completes the key
+		// exchange -- and this call sits between two connections with
+		// nothing else to wake it. An unbounded wait there stopped this
+		// path following its file for as long as the network stayed in
+		// that state, while every other path carried on, so the failure
+		// looked like a quiet file rather than an unreachable host.
+		sctx, scancel := context.WithTimeout(ctx, remoteStatTimeout)
+		size, ident, serr := i.remoteStat(sctx, opts, path)
+		scancel()
 		if serr != nil {
 			// The probe is retried on the next pass rather than treated
 			// as an answer; startAtPending stays set until it succeeds.
@@ -837,6 +848,11 @@ func sshDest(opts RemoteOptions) string {
 	return opts.Host
 }
 
+// remoteStatTimeout bounds one size-and-identity probe. It is shared by
+// the probe a live connection runs and the one that precedes a
+// reconnect, so an unreachable host costs the same wait either way.
+const remoteStatTimeout = 30 * time.Second
+
 // remoteStat reports the current length of a remote file and an identity
 // for the file itself.
 //
@@ -954,7 +970,7 @@ func (i *Ingest) runRemoteTail(ctx context.Context, opts RemoteOptions, path, ta
 				return
 			case <-t.C:
 				persistOwed(false)
-				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				sctx, cancel := context.WithTimeout(ctx, remoteStatTimeout)
 				size, now, serr := i.remoteStat(sctx, opts, path)
 				cancel()
 				if serr != nil {

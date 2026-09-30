@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rglonek/mensura/pkg/extract"
 	"github.com/rglonek/mensura/pkg/model"
@@ -830,15 +831,53 @@ func sampleBytes(s *model.Sample) int {
 // byte, and the HTML-safety escapes for '<', '>' and '&' that
 // json.Marshal applies unless a decoder is told otherwise. A byte that is
 // none of those costs itself.
+//
+// It walks runes rather than bytes, because two of those rules are about
+// runes and counting bytes made this an *under*-estimate -- the one
+// direction the budget above may not err in.
+//
+//   - A byte that is not valid UTF-8 is emitted as \ufffd: six bytes for
+//     one. That is not a pathological input, it is a log line in any
+//     encoding that is not UTF-8 -- Latin-1 or CP1252 accented text,
+//     Windows smart quotes, a truncated multi-byte sequence -- and a
+//     `kind: string` field is a whole log message, so a batch of them was
+//     charged a sixth of what it encodes to. Measured at 5.4x over
+//     BatchBytes on ordinary Latin-1 text.
+//   - U+2028 and U+2029 are escaped as \u2028 and \u2029: six bytes for
+//     three.
+//
+// An under-count matters for the reason the constants above spell out: it
+// lets a take exceed BatchBytes, and an operator following the flag's own
+// advice ("--batch-bytes ... must stay under the store's
+// max_request_bytes") then presents a body past that limit. The store
+// answers 413, which wire.Client classifies as fatal, so the sink drops
+// the whole batch, reports it to the delivery observers as a hole, and
+// every followed file's checkpoint freezes behind it.
 func jsonStringBytes(s string) int {
-	n := len(s)
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"', c == '\\', c == '\n', c == '\r', c == '\t':
-			n++ // one backslash
-		case c < 0x20, c == '<', c == '>', c == '&':
-			n += 5 // \u00XX
+	n := 0
+	for i := 0; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			switch {
+			case c == '"', c == '\\', c == '\n', c == '\r', c == '\t':
+				n += 2 // a backslash and the escape character
+			case c < 0x20, c == '<', c == '>', c == '&':
+				n += 6 // \u00XX
+			default:
+				n++
+			}
+			i++
+			continue
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			n += 6 // one invalid byte becomes \ufffd
+		case r == '\u2028', r == '\u2029':
+			n += 6 // three bytes become \u2028 or \u2029
+		default:
+			n += size
+		}
+		i += size
 	}
 	return n
 }

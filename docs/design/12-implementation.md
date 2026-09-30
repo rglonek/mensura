@@ -4320,6 +4320,124 @@ took for the same reason: it deliberately does not run `Validate`.
   `QueryRequest` as its body and the shipped client `POST`s it.
 
 
+### 6.201 A bucket-set declaration was the one catalogue entry with no budget
+
+`max_sets` and `max_fields_per_set` (§6.181) bound the two names a client
+chooses on the write path. A bucket-set declaration creates a third, and
+nothing counted it.
+
+One `field_meta` entry carries a bucket set *name* and a bucket *index*,
+and `applyFieldMeta` grows that bucket set's column and edge lists to the
+index — bounded at 4096 by `maxBucketIndex`, which is a bound on the
+*width* of one histogram, not on how many of them there are. So a single
+entry retains about 140 KiB. Every entry may carry the same `set` and the
+same `field`, so both existing budgets watched numbers that never moved:
+one write request at the default 32 MiB body limit holds on the order of
+half a million such declarations, and the catalogue is held in memory and
+persisted as one JSON record. Measured at 140 KiB per entry, which is tens
+of gigabytes for one request — an out-of-memory kill of the store, and in
+`mode: plugin` that is the process that owns the data directory.
+
+The name was not validated either, on any path. It becomes a key of the
+catalogue's per-set bucket-set map, is persisted inside the catalogue
+record and is served from `/v1/catalogue`, so a write could put arbitrary
+bytes of arbitrary length under it — a NUL, the `@` that separates a set
+from its shard suffix, the store's own reserved prefix — permanently,
+because nothing reclaims one.
+
+`limits.max_bucket_sets_per_set` (default 64, negative disables) closes
+the count, with the rules the two budgets beside it already follow: only a
+*new* bucket set is refused, the refusal names it, and the whole request
+is weighed before any of it is applied. `model.ValidateBucketSetName`
+closes the name, in `applyFieldMeta` and in `BucketSet.compile` alike, so
+a spec is refused by `check` rather than by a `400` on every write. The
+free text a field declaration carries (`unit`, `unit_hint`,
+`description`) is bounded at 4096 bytes each on the same grounds: the
+entry count was capped and the bytes per entry were not.
+
+### 6.202 The batch-size estimate counted bytes where the encoder counts runes
+
+§6.182 made `sampleBytes` an upper bound on what one sample costs in a
+request body, because an under-count lets a take exceed `--batch-bytes`
+and present a body past the store's `max_request_bytes` — which comes back
+`413`, a status the write client classifies as fatal, so the sink drops
+the whole batch, reports it to the delivery observers as a hole, and every
+followed file's checkpoint freezes behind it.
+
+It was still an under-count, because two of `encoding/json`'s escaping
+rules are about *runes* and `jsonStringBytes` walked bytes:
+
+- A byte that is not valid UTF-8 is emitted as `\ufffd`: six bytes for
+  one. That is not a pathological input. A `kind: string` field is a whole
+  log message, and any log that is not UTF-8 — Latin-1 or CP1252 accented
+  text, Windows smart quotes, a cut multi-byte sequence — is full of them.
+- `U+2028` and `U+2029` are escaped as `\u2028` and `\u2029`: six bytes
+  for three.
+
+Measured at 5.4x over `BatchBytes` on ordinary Latin-1 text. The estimate
+now decodes runes and charges each of those cases what the encoder really
+emits.
+
+### 6.203 Smaller corrections
+
+- **A negated regex that matches every value now says so.** `!~` excludes
+  every row that carries the label, and a row that does not carry it fails
+  the existence half, so a regex matching every known value of the key
+  makes the clause constant false. It lowered to
+  `And(Exists, Not(In(every value)))`, which is correct and reads every
+  selected shard in full, and it emitted no diagnostic — the panel came
+  back empty with nothing explaining it, which is the failure the `W201`
+  beside it exists to prevent. The positive form has always answered with
+  a constant and a warning; the negated one now answers with `W201` and
+  `impossible`, so no shard is read.
+- **Two bucket sets may not write the same column into the same set.**
+  `BucketSet.compile` refuses a collision *within* one bucket set,
+  because the columns share one row. Across two of them aimed at one
+  `set:` every consequence was silent: both patterns write one column
+  with two different meanings, and `Sink.DeclareFields` sends one
+  `FieldMeta` per (set, column) and marks it sent, so the second bucket
+  set's shared columns are never declared at all — `applyFieldMeta` grows
+  its column list to the indices that did arrive, `runHeatmap` skips an
+  empty column, and the panel draws with its shared buckets missing. The
+  conventional HDR names are `"00".."23"`, so a read histogram and a
+  write histogram aimed at one set collide on all twenty-four. It is
+  decided per destination, so two bucket sets writing different sets may
+  still share names.
+- **An oversize `/ingest/v1/lines` body is refused before it is applied.**
+  The endpoint is a stream — records reach the sink as they are framed —
+  so the running byte count could only notice the overflow after part of
+  the body had been delivered. The sender was then told its request had
+  failed while some of its lines really were stored, and because a
+  received record's key hint is the listener's arrival sequence rather
+  than a byte offset, re-sending the body writes those lines a second
+  time under `key: offset`. `Content-Length` is decided before a single
+  record is read; a chunked body that overruns still answers `413` but
+  now reports `accepted` and `refused` with it, so a partial application
+  is visible rather than invisible.
+- **Both verdicts of one call now reach the counters.** A continuation
+  line whose timestamp moved backwards is refused *and* flushes the record
+  it was meant to join, so `extract.Stream` has two records to report on
+  from one `Process` call. The flushed record's verdict was dropped, so a
+  profile whose joined records match no pattern under-counted
+  `unmatched_lines` by one every time an interleaved writer produced such
+  a line — and that counter is what an operator reads to find out the spec
+  is wrong for the file. The two travel joined, and `recordOutcome`
+  unwraps a join so each sentinel still reaches the counter it belongs to.
+- **`Content-Encoding` is matched case-insensitively.** A content coding
+  is a case-insensitive token (RFC 9110 §8.4.1) and the store compared it
+  exactly against `gzip`, so a client sending `Content-Encoding: GZIP` had
+  its deflate bytes handed straight to the JSON decoder and was answered
+  `400` about malformed JSON for a request that was entirely well formed.
+- **The reconnect-time SSH probe is bounded.** The probe a live remote
+  connection runs has had a 30-second timeout; the one that precedes each
+  reconnect used the caller's context and nothing else. `ssh` under
+  `BatchMode=yes` fails fast on a refused connection but not on one that
+  hangs, and that call sits between two connections with nothing to wake
+  it — so one black-holed route stopped that path following its file for
+  as long as the network stayed in that state, while every other path
+  carried on. Both now share `remoteStatTimeout`.
+
+
 ## 7. Known gaps worth naming
 
 - **Documented ingest behaviour that does not exist.** [02](02-ingest.md)

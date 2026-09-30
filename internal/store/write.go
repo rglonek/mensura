@@ -614,6 +614,10 @@ func sameLimit(a, b *float64) bool {
 // used as an allocation size, so it may not be taken on trust.
 const maxBucketIndex = 4096
 
+// maxMetaTextBytes bounds the free-text metadata one field declaration may
+// carry. See the check in applyFieldMeta.
+const maxMetaTextBytes = 4096
+
 // applyFieldMeta merges declared metadata. Last writer wins, but a
 // disagreement between two ingesters is recorded and surfaced rather than
 // resolved silently.
@@ -650,6 +654,22 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 				return badRequestf("%s.%s: %s", m.Set, m.Field, err.Error())
 			}
 		}
+		// The bucket set name, held to the rule the set and field names
+		// beside it are already held to.
+		//
+		// It was the one client-chosen name in a declaration that nothing
+		// checked, and it is not a passing value: it becomes a key of the
+		// catalogue's per-set bucket-set map, is persisted inside the
+		// single JSON catalogue record and is served from /v1/catalogue.
+		// So a write could put arbitrary bytes of arbitrary length -- a
+		// NUL, the '@' that separates a set from its shard suffix, the
+		// store's own reserved prefix -- under a name no other endpoint
+		// would accept, permanently, because nothing removes one.
+		if m.BucketSet != "" {
+			if err := model.ValidateBucketSetName(m.BucketSet); err != nil {
+				return badRequestf("%s.%s: %s", m.Set, m.Field, err.Error())
+			}
+		}
 		// Named here rather than skipped below. The index is used as an
 		// allocation size so it cannot be taken on trust, but silently
 		// ignoring the declaration left the field in the catalogue with
@@ -657,6 +677,23 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 		// was declared for draws nothing.
 		if m.BucketSet != "" && (m.BucketIndex < 0 || m.BucketIndex >= maxBucketIndex) {
 			return badRequestf("%s.%s: bucket index %d is outside 0..%d", m.Set, m.Field, m.BucketIndex, maxBucketIndex-1)
+		}
+		// The free text, bounded. Unit, unit hint and description are
+		// held in memory and written inside the one JSON record the
+		// whole catalogue is persisted as, and their length was the
+		// other dimension of a declaration that nothing measured: the
+		// entry *count* is capped by MaxFieldsPerSet, the bytes per
+		// entry were not. Every value these documents show is a few
+		// characters; the bound is far past anything a real declaration
+		// carries and it is refused by name rather than truncated,
+		// because a description the store silently shortened is one an
+		// operator cannot tell from the one they wrote.
+		for _, t := range [...]struct {
+			what, value string
+		}{{"unit", m.Unit}, {"unit_hint", m.UnitHint}, {"description", m.Description}} {
+			if len(t.value) > maxMetaTextBytes {
+				return badRequestf("%s.%s: %s is %d bytes, which is beyond the limit of %d; it is held in memory and persisted inside the single catalogue record", m.Set, m.Field, t.what, len(t.value), maxMetaTextBytes)
+			}
 		}
 		// The declared cadence, held to the rule the spec compiler holds
 		// it to. A negative value matched neither arm of the switch
@@ -832,12 +869,14 @@ func (s *Store) applyFieldMeta(metas []wire.FieldMeta) error {
 // second one is refused.
 func (s *Store) declarationRoomLocked(metas []wire.FieldMeta) error {
 	maxSets, maxFields := s.cfg.MaxSets, s.cfg.MaxFieldsPerSet
-	if maxSets <= 0 && maxFields <= 0 {
+	maxBuckets := s.cfg.MaxBucketSetsPerSet
+	if maxSets <= 0 && maxFields <= 0 && maxBuckets <= 0 {
 		return nil
 	}
 	sets := len(s.catalogue)
 	newSets := map[string]struct{}{}
 	newFields := map[string]map[string]struct{}{}
+	newBucketSets := map[string]map[string]struct{}{}
 	for _, m := range metas {
 		if m.Set == "" || m.Field == "" {
 			continue
@@ -849,6 +888,35 @@ func (s *Store) declarationRoomLocked(metas []wire.FieldMeta) error {
 				sets++
 				if maxSets > 0 && sets > maxSets {
 					return badRequestf("set %q would be a new set past the limit of %d; a set name is a catalogue entry that is held in memory and persisted with every save, and nothing ever reclaims one", m.Set, maxSets)
+				}
+			}
+		}
+		// The bucket-set budget, weighed with the rest of the request and
+		// before any of it is applied.
+		//
+		// It is counted apart from the field budget above because it is
+		// not the same resource: applyFieldMeta grows a bucket set's
+		// column and edge lists to the declared index, so one entry
+		// retains ~140 KiB however many *fields* the request names -- and
+		// every entry may name the same field, which is exactly how an
+		// unbounded number of them used to slip past a cap that was
+		// watching field names.
+		if maxBuckets > 0 && m.BucketSet != "" {
+			if _, have := newBucketSets[m.Set]; !have {
+				newBucketSets[m.Set] = map[string]struct{}{}
+			}
+			held := false
+			if known {
+				_, held = e.BucketSets[m.BucketSet]
+			}
+			if _, seen := newBucketSets[m.Set][m.BucketSet]; !held && !seen {
+				newBucketSets[m.Set][m.BucketSet] = struct{}{}
+				have := 0
+				if known {
+					have = len(e.BucketSets)
+				}
+				if have+len(newBucketSets[m.Set]) > maxBuckets {
+					return badRequestf("bucket set %q would be a new bucket set on set %q past the limit of %d; each one is a column list and an edge list held in memory and persisted inside the single catalogue record, and nothing ever reclaims one", m.BucketSet, m.Set, maxBuckets)
 				}
 			}
 		}

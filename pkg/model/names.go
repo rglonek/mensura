@@ -63,6 +63,29 @@ func ValidateFieldName(s string) error {
 	return nil
 }
 
+// ValidateBucketSetName enforces the bucket-set charset.
+//
+// A bucket set is a name a *client* chooses, exactly as a set name and a
+// field name are, and it was the one of the three that nothing checked:
+// it travels in wire.FieldMeta, becomes a key of the catalogue's
+// per-set bucket-set map, is persisted inside the single JSON catalogue
+// record and is served from /v1/catalogue. So a write could put a
+// megabyte of arbitrary bytes -- NULs, the '@' that separates a set from
+// its shard suffix, the store's own reserved prefix -- into the
+// catalogue under a name no other endpoint would accept and no MQL query
+// could usefully address.
+//
+// The field rule is the right one rather than the set rule: a bucket set
+// is addressed as HISTOGRAM(<name>) in MQL, which quotes a name that is
+// not a bare identifier, and bucket sets are conventionally named after
+// the columns they expand into.
+func ValidateBucketSetName(s string) error {
+	if !validIdent(s, true) {
+		return fmt.Errorf("invalid bucket set name %q: expected [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", s)
+	}
+	return nil
+}
+
 func ValidateLabelKey(s string) error {
 	if !validIdent(s, false) {
 		return fmt.Errorf("invalid label key %q: expected [A-Za-z_][A-Za-z0-9_.-]{0,127}", s)
