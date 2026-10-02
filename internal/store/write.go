@@ -174,6 +174,11 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 
 	resp := &wire.WriteResponse{}
 	index := 0
+	// How the samples accepted so far in this request have classified
+	// each column name, per set. See checkColumnNamespace: the catalogue
+	// is only updated after a shard commits, so without this a batch
+	// carrying both spellings of one name would slip the whole check.
+	columnKind := map[string]map[string]bool{}
 	for _, batch := range req.Batches {
 		if err := model.ValidateSetName(batch.Set); err != nil {
 			for range batch.Samples {
@@ -190,6 +195,12 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 				index++
 			}
 			continue
+		}
+
+		kinds, ok := columnKind[batch.Set]
+		if !ok {
+			kinds = map[string]bool{}
+			columnKind[batch.Set] = kinds
 		}
 
 		byShard := map[string][]engine.Record{}
@@ -229,7 +240,7 @@ func (s *Store) Write(req *wire.WriteRequest, idempotencyKey, clientName string)
 				}
 				sm.Labels["client"] = clientName
 			}
-			row, err := s.rowFor(batch.Set, sm)
+			row, err := s.rowFor(batch.Set, sm, kinds)
 			if err != nil {
 				// A fault the store owns is not a rejection of this
 				// sample. rowFor reports both through one error, and
@@ -428,7 +439,10 @@ func (s *Store) SetKeyScheme(set string, scheme model.KeyScheme) {
 // had already burned dictionary entries and written them to disk, so a
 // stream of malformed samples grew the dictionary permanently and could
 // exhaust a label key's cardinality budget without storing a single row.
-func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
+// kinds records how the samples already accepted in this request have
+// classified each column name: true for a label, false for a field. It is
+// nil for a caller that has no request to track.
+func (s *Store) rowFor(set string, sm *model.Sample, kinds map[string]bool) (engine.Row, error) {
 	for k, v := range sm.Labels {
 		// A label named "timestamp" would overwrite the indexed column
 		// with a dictionary index, putting the row at a fabricated time
@@ -444,6 +458,11 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 		if _, clash := sm.Labels[k]; clash {
 			return nil, fmt.Errorf("%q is both a label and a field", k)
 		}
+	}
+	// And the same rule across the whole set, not only within this one
+	// sample.
+	if err := s.checkColumnNamespace(set, sm, kinds); err != nil {
+		return nil, err
 	}
 	// The catalogue budgets, checked here for the reason the label
 	// budgets are checked in intern(): before anything is interned or
@@ -467,7 +486,96 @@ func (s *Store) rowFor(set string, sm *model.Sample) (engine.Row, error) {
 	for k, v := range sm.Fields {
 		row[k] = v
 	}
+	// Recorded only now, with the row built and every value interned, so
+	// a sample that was refused further up does not decide how the next
+	// one is read.
+	if kinds != nil {
+		for k := range sm.Labels {
+			kinds[k] = true
+		}
+		for k := range sm.Fields {
+			kinds[k] = false
+		}
+	}
 	return row, nil
+}
+
+// checkColumnNamespace refuses a sample that uses a column name the other
+// way round from how this set already holds it.
+//
+// Labels and fields share one column namespace on a row -- a label is
+// stored as its dictionary index in a column of its own name, exactly
+// where a field of that name would go. rowFor has always refused the
+// collision *within* one sample, because that row would carry two values
+// for one column. Across samples nothing checked it, and each row is then
+// internally consistent, so both were accepted: the set ends up with one
+// column holding dictionary indices on some rows and measurements on
+// others, and the catalogue lists the name under `fields` *and* under
+// `labels` with nothing saying the two disagree.
+//
+// Every reader then reads it with the wrong meaning half the time.
+// `SELECT status` plots the index of the value "ok" -- a small integer
+// that looks exactly like a measurement -- beside a real 503, and
+// `BY status` resolves a measurement through the dictionary, which lands
+// out of range and renders as an absent group, so rows silently merge
+// into the wrong series. Neither produces an error, a warning or an empty
+// panel: it produces a plausible graph of numbers no source reported,
+// which is the failure this store refuses a timestamp-less row and a
+// crossed clamp pair to avoid.
+//
+// It is reachable from ordinary configuration rather than from abuse: two
+// profiles writing one set that disagree about whether a capture is a
+// label, two ingesters running different spec versions, or a spec edit
+// that moves a name from `fields:` into `labels:`. The first writer
+// defines the namespace and a later disagreement is named, which is the
+// same answer the within-sample rule gives and the only one that keeps
+// the stored column readable.
+func (s *Store) checkColumnNamespace(set string, sm *model.Sample, kinds map[string]bool) error {
+	refuse := func(name, was, now string) error {
+		return fmt.Errorf("%q is already a %s on set %q and this sample carries it as a %s; labels and fields share one column namespace, so the two land in the same column with different meanings -- rename one of them, write them to different sets, or drop the set and start again",
+			name, was, set, now)
+	}
+	for k := range sm.Labels {
+		if wasLabel, seen := kinds[k]; seen && !wasLabel {
+			return refuse(k, "field", "label")
+		}
+	}
+	for k := range sm.Fields {
+		if wasLabel, seen := kinds[k]; seen && wasLabel {
+			return refuse(k, "label", "field")
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, known := s.catalogue[set]
+	if !known {
+		return nil
+	}
+	for k := range sm.Labels {
+		if fieldObserved(e, k) {
+			return refuse(k, "field", "label")
+		}
+	}
+	for k := range sm.Fields {
+		if _, isLabel := e.Labels[k]; isLabel {
+			return refuse(k, "label", "field")
+		}
+	}
+	return nil
+}
+
+// fieldObserved reports whether a sample has really carried this name as
+// a field on this set.
+//
+// It is not the same as "the catalogue has a Fields entry". applyFieldMeta
+// creates one from a spec's `fields:` block, for a column no row need
+// ever carry -- and a profile may perfectly well declare a unit or a
+// description for a name it also lists under `labels:`, which would then
+// make every sample it produces look like a namespace collision. Only an
+// accepted sample stamps LastSeenMs, so only that is evidence.
+func fieldObserved(e *setEntry, name string) bool {
+	f, ok := e.Fields[name]
+	return ok && f.observed()
 }
 
 // catalogueRoom refuses a sample that would grow the catalogue past its

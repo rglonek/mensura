@@ -938,6 +938,7 @@ merely names its operator labels does not:
 | `L005` | no | a capture that is *not* declared as a label but whose name is one an `identity:` rule can attach as a stream label; where that rule applies, the sample carries the name as a label and as a field, which the store refuses outright |
 | `L006` | yes | the same collision on `host` or `source`, which no rule has to supply because every acquisition path defaults them — so it happens on *every* record and the pattern can never store a row |
 | `L007` | no | an aggregating pattern captures something its windows cannot represent: a field other than `aggregate.field`, which is discarded because a window has no value for it, or a label outside `on:`, which is carried from whichever record opened the window ([§6.180](#6180-a-window-carried-the-opening-records-other-measurements)) |
+| `L008` | yes | a destination set a spec writes with one name as a label and another as a field; labels and fields share one column namespace, so the store refuses whichever classification arrives second and that pattern can never store a row ([§6.204](#6204-one-column-name-two-meanings)) |
 
 `L005` is advisory because an `identity:` rule scoped by `match_path` does
 not apply to every stream, so a pattern in another profile may legitimately
@@ -4453,6 +4454,102 @@ emits.
   carried on. Both now share `remoteStatTimeout`.
 
 
+### 6.204 One column name, two meanings
+
+Labels and fields share one column namespace on a row. A label is stored
+as its dictionary *index* in a column of its own name, which is exactly
+where a field of that name would go, and `rowFor` has always refused a
+sample that carries one name as both — that row would hold two values for
+one column.
+
+Across samples nothing checked it. Each row is then internally
+consistent, so both are accepted, and the set ends up with a column
+holding dictionary indices on the rows that wrote it as a label and
+measurements on the rows that wrote it as a field. The catalogue lists
+the name under `fields` *and* under `labels`, with nothing saying the two
+disagree.
+
+Every reader then reads it with the wrong meaning half the time.
+`SELECT status` plots the index of the value `"ok"` — a small integer
+indistinguishable from a measurement — beside a real `503`, and
+`BY status` resolves a measurement through the dictionary, which lands
+out of range and renders as an absent slot, so those rows silently merge
+into a series that is not theirs. Neither produces an error, a warning or
+an empty panel: it produces a plausible graph of numbers no source
+reported, which is the failure a timestamp-less row and a crossed clamp
+pair are refused to avoid.
+
+It is reachable from ordinary configuration rather than from abuse: two
+profiles writing one set that disagree about whether a capture is a
+label, two ingesters running different spec versions, or a spec edit that
+moves a name out of `fields:` and into `labels:`. The line protocol and
+`/ingest/v1/samples` let a sender choose freely as well.
+
+`checkColumnNamespace` refuses the disagreement by name, which is the
+same answer the within-sample rule gives and the only one that keeps the
+stored column readable. The first writer defines the namespace. Two
+details matter:
+
+- **A declaration is not evidence.** `applyFieldMeta` creates a `Fields`
+  entry from a spec's `fields:` block for a column no row need ever
+  carry, and a profile may perfectly well declare a unit or a description
+  for a name it also lists under `labels:`. Only `observeSet` stamps
+  `LastSeenMs`, and only from accepted samples, so that timestamp is the
+  record of evidence — new `fieldEntry.observed()`, which `stale()` now
+  reads as well.
+- **The catalogue lags the request.** It is only updated once a shard has
+  committed, so a single batch carrying both spellings would slip the
+  check entirely. `Write` tracks the classifications its own accepted
+  samples have used, per set, and `rowFor` consults both.
+
+Two things close the rest of it. `Spec.Lint` gains `L008`, fatal, for a
+destination set a spec writes with one name as a label and another as a
+field — decidable from the spec alone, which is where every other name in
+a spec is decided, and the shape `L006` is already fatal for. And a store
+that already holds a mixed column cannot be repaired by a write, so
+`mql.Validate` answers `W105` when a selected field is also a label key
+on the set, or a `BY` label is also a field.
+
+### 6.205 A heatmap cell with no points travelled as null
+
+`runHeatmap` creates a cell the first time a row carries one of the
+bucket set's columns, and *then* charges the datapoint gate. When the
+gate trips on that same row the cell exists and holds nothing, so its
+three parallel arrays were marshalled as `"ts_ms": null, "values": null`
+— on the response whose whole purpose is to hand back the partial shape
+plus the reason. `runTimeseries` has built those arrays as lists since a
+series that emits nothing became possible; the heatmap path was the one
+left behind, and a consumer should not have to tell "no points" apart
+from "no array" before it can draw what the gate did return.
+
+### 6.206 Smaller corrections
+
+- **`Parse` and `Validate` disagreed by one on the predicate size.** The
+  parser charged a node per `parseUnary` entry, which counts the arms of
+  an `AND`/`OR` chain and not the node that holds them, while
+  `checkPredicateShape` counts both — so a predicate of exactly
+  `MaxPredicateNodes` clauses parsed cleanly and was then refused as
+  `E007`, on two surfaces this package exists to keep the same language.
+  A parenthesised group went the other way: the parser charged a node the
+  AST does not have, because the group returns the expression inside it
+  rather than building one. New `countNode` is called exactly where an
+  `Expr` is built, so the parser's count is the number the AST checker
+  derives.
+- **`Store.Stats` reached the engine with no gate.** Every other
+  operation that touches pebble takes `enterEngine` so `Close` can wait
+  for it; this one did not, and it is reached from three places that are
+  not request-scoped the way a write is — `/v1/stats`, a Prometheus
+  scrape, and in `mode: plugin` Grafana's health check, which goes
+  through no `http.Server` at all and keeps being answered until the
+  process exits. `Snapshot` tests the engine's own closed flag first,
+  which narrows the window and cannot close it: `Close` can land between
+  that test and the `pebble.DB.Metrics()` call it guards, and pebble's
+  contract is that no method may run beside `Close`. The counters are
+  still answered while the store is shutting down — new
+  `engine.DB.CounterSnapshot` — which is what this endpoint mostly
+  reports.
+
+
 ## 7. Known gaps worth naming
 
 - **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
@@ -4464,7 +4561,7 @@ emits.
   handle loses whatever was left in it — the replacement is still read
   from offset 0, because the stored fingerprint no longer matches. §6.3
   says `mensura-ingest check` warns about an occurrence-counting pattern
-  under `key: content`; the lint set is `L001`–`L007` and holds no such
+  under `key: content`; the lint set is `L001`–`L008` and holds no such
   check, and deciding "no numeric capture" from a spec alone is guesswork,
   because extraction coerces per value. §7.1 offers TLS on the receive
   listeners and a client-certificate subject mapped to stream labels, plus

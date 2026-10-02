@@ -211,6 +211,19 @@ pattern's own `labels:`) becomes a label; every other named capture becomes a
 field. One list, one rule, and it is visible in the spec rather than inferred
 from a value's shape.
 
+The classification has to be the *same* everywhere one destination set is
+written. Labels and fields share one column namespace on a row — a label
+is stored as its dictionary index in a column of its own name, exactly
+where a field of that name would go — so a set that one pattern writes
+`status` into as a label and another writes it into as a field holds
+indices on some rows and measurements on others, in one column. The store
+refuses whichever classification arrives second, by name, and `check`
+reports the disagreement as `L008` before anything runs. Two patterns
+writing *different* sets may classify a name however they like: the
+columns never meet. Declaring metadata in `fields:` for a name that is
+also a label is not a disagreement — nothing writes it as a field — and
+is left alone.
+
 Cardinality guard: the store refuses a sample whose label would take a key
 past `max_label_cardinality` (default 100 000 distinct values per label),
 naming the label in that sample's rejection — the write is a partial

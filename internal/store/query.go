@@ -844,10 +844,20 @@ func (s *Store) runHeatmap(ctx context.Context, q *mql.Query, req *wire.QueryReq
 			times = append(times, t)
 		}
 		sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+		// Lists, never null, for the reason runTimeseries builds its
+		// three arrays that way: a cell can legitimately hold nothing.
+		// The datapoint gate is created and then tripped on the same
+		// row, so the cell exists with no entries in it, and the arrays
+		// travelled as `"ts_ms": null, "values": null` -- which a
+		// consumer has to tell apart from "no points" before it can draw
+		// the partial result the gate exists to hand back.
 		ser := wire.Series{
 			Name:        heatmapSeriesName(groups[k.group], q.By, bs, k.bucket),
 			Labels:      groups[k.group],
 			BucketEdges: bs.Edges,
+			TSMs:        []int64{},
+			Values:      []float64{},
+			IsNull:      []bool{},
 		}
 		for _, t := range times {
 			// Same screen the timeseries path applies, for the same

@@ -280,8 +280,20 @@ const staleAfter = 7 * 24 * time.Hour
 // stale reports whether the field has not been written recently. A field
 // that was never observed has no age, so it is never stale.
 func (f fieldEntry) stale() bool {
-	return f.LastSeenMs > 0 && time.Since(time.UnixMilli(f.LastSeenMs)) > staleAfter
+	return f.observed() && time.Since(time.UnixMilli(f.LastSeenMs)) > staleAfter
 }
+
+// observed reports whether a sample has actually carried this name as a
+// field, as opposed to a spec merely declaring metadata for it.
+//
+// Only observeSet stamps LastSeenMs, and it does so from accepted
+// samples alone, so the timestamp is the record of evidence. The
+// distinction matters wherever the catalogue is read as a statement
+// about what the rows hold rather than about what a spec said: a
+// declaration creates a Fields entry for a name no row may ever carry,
+// and a `fields:` block that also names one of the profile's labels
+// creates one for a name every row carries as a *label*.
+func (f fieldEntry) observed() bool { return f.LastSeenMs > 0 }
 
 // kind is the field kind to report, with the default applied.
 //
@@ -1692,7 +1704,25 @@ func (s *Store) DropShards(name string) (int, error) {
 }
 
 // Stats returns engine statistics for the admin endpoint.
-func (s *Store) Stats() engine.StatsSnapshot { return s.db.Snapshot() }
+//
+// Gated like every other operation that reaches the engine. It was the
+// one that was not, and it is reached from three places that are not
+// request-scoped the way a write is: /v1/stats, a Prometheus scrape of
+// the metrics listener, and -- in plugin mode -- Grafana's health check,
+// which goes through no http.Server at all and keeps being answered
+// until the process exits. Snapshot asks pebble for its metrics, and
+// pebble's contract is that Close may not run concurrently with any
+// other method: the `closed` test inside Snapshot narrows the window but
+// cannot close it, because Close can land between that test and the call
+// it guards. The counters are still answered while the store is shutting
+// down, which is what this endpoint mostly reports.
+func (s *Store) Stats() engine.StatsSnapshot {
+	if !s.enterEngine() {
+		return s.db.CounterSnapshot()
+	}
+	defer s.leaveEngine()
+	return s.db.Snapshot()
+}
 
 // ---------- catalogue reads (mql.Schema) ----------
 
