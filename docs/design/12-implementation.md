@@ -4535,6 +4535,16 @@ from "no array" before it can draw what the gate did return.
   rather than building one. New `countNode` is called exactly where an
   `Expr` is built, so the parser's count is the number the AST checker
   derives.
+- **`--from 7d` named Go's duration parser for a unit this product
+  spells the same way.** Every duration an operator writes takes a day
+  unit — the store's `--retention 30d` and its `retention:` block, a
+  spec's `retention:`, `shard:` and `max_interval:`, and `EVERY`/`GAP`
+  in a query — except `--from` and `--to`, which went straight to
+  `time.ParseDuration` and answered `time: unknown unit "d"`. The
+  ingest flags now fall back to `mql.ParseDuration`, which is this
+  project's own syntax, and the store's query client goes through the
+  `expandDays` its own `--retention` already uses. Go's parser is still
+  tried first, so compound forms such as `1h30m` are unchanged.
 - **`Store.Stats` reached the engine with no gate.** Every other
   operation that touches pebble takes `enterEngine` so `Close` can wait
   for it; this one did not, and it is reached from three places that are
