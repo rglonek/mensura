@@ -705,8 +705,17 @@ func (d *DB) Flush() error {
 	return d.pdb.Flush()
 }
 
-func (d *DB) Snapshot() StatsSnapshot {
-	s := StatsSnapshot{
+// CounterSnapshot is the half of Snapshot that touches nothing but this
+// package's own atomics.
+//
+// It exists because Snapshot asks pebble for its metrics, and pebble's
+// contract is that no method may run concurrently with Close. A caller
+// that is not holding the store's engine gate -- the admin stats
+// endpoint, a Prometheus scrape, the plugin's health check -- has to be
+// able to answer with what it can read safely rather than racing the
+// teardown.
+func (d *DB) CounterSnapshot() StatsSnapshot {
+	return StatsSnapshot{
 		Puts:          d.stats.Puts.Load(),
 		Gets:          d.stats.Gets.Load(),
 		Scans:         d.stats.Scans.Load(),
@@ -714,6 +723,10 @@ func (d *DB) Snapshot() StatsSnapshot {
 		RowsScanned:   d.stats.RowsScanned.Load(),
 		OpenIterators: d.stats.OpenIterators.Load(),
 	}
+}
+
+func (d *DB) Snapshot() StatsSnapshot {
+	s := d.CounterSnapshot()
 	if d.closed.Load() {
 		// Pebble's metrics are not available after Close; the counters
 		// above still are, and are what the admin endpoint mostly wants.

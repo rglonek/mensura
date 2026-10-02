@@ -531,6 +531,7 @@ in tests. Warnings never fail a query; errors always do.
 | `W102` | warning | Counter-kind field selected without `RATE`/`DELTA`, under a format where those apply — never under `FORMAT table`/`logs`, where `E008` refuses them |
 | `W103` | warning | No `GAP` and no `max_interval` metadata: outages will render as continuous lines |
 | `W104` | warning | A `string`-kind field selected under `FORMAT timeseries`: only values that read as numbers are plotted, so the series may draw nothing |
+| `W105` | warning | A selected field is also a label key on the set (or a `BY` label is also a field). Labels and fields share one column namespace on a row -- a label is stored as its dictionary index in a column of its own name -- so the column holds indices on the rows written one way and measurements on the rows written the other. The store refuses a write that would create this; the warning is for data an earlier build already accepted |
 | `W201` | warning | A comparison can never match any dictionary value, so the result will be empty: a value, an `IN` list or a regex that matches nothing, or a `!~` whose regex matches *every* value of the label (which excludes every row that carries it, while a row that does not carry it fails the existence half) |
 | `W202` | warning | Regex matches every value of the label; clause folded away |
 | `W203` | warning | Field is not in the catalogue for the set, or is `stale` in it (not seen recently) |

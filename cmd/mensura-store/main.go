@@ -442,7 +442,12 @@ func runQueryClient(argv []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	d, err := time.ParseDuration(*from)
+	// expandDays, so --from takes the same "30d" the store's own
+	// --retention and its `retention:` block already take. Go's parser
+	// has no day unit, so `--from 7d` used to answer
+	// `time: unknown unit "d"` for a spelling the rest of the product
+	// accepts everywhere else.
+	d, err := time.ParseDuration(expandDays(*from))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

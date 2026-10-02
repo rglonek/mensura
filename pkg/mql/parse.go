@@ -111,6 +111,27 @@ func ParseDiags(src string) (*Query, []Diag, error) {
 
 func (p *parser) cur() token { return p.toks[p.i] }
 
+// countNode charges one predicate node against MaxPredicateNodes.
+//
+// It is called exactly where an Expr is built -- once per comparison,
+// once per NOT, and once per AND/OR chain -- so the parser's count is the
+// same number checkPredicateShape derives from the finished AST.
+//
+// It used to be charged once per parseUnary entry instead, which counts
+// the arms of an AND/OR chain and not the node that holds them: a
+// predicate of exactly MaxPredicateNodes clauses parsed cleanly and was
+// then refused by Validate as E007, so the text and the JSON surfaces --
+// which this package exists to keep the same language -- disagreed by
+// one. A parenthesised group went the other way, counting a node the AST
+// does not have.
+func (p *parser) countNode() error {
+	p.nodes++
+	if p.nodes > MaxPredicateNodes {
+		return p.errf("predicate holds more than %d clauses", MaxPredicateNodes)
+	}
+	return nil
+}
+
 func (p *parser) errf(format string, args ...any) error {
 	return &ParseError{Pos: p.cur().pos, Msg: fmt.Sprintf(format, args...)}
 }
@@ -721,6 +742,11 @@ func (p *parser) parseOr() (Expr, error) {
 		}
 		terms = append(terms, right)
 	}
+	// The compound node itself, which is a node of the AST like any
+	// other. See countNode.
+	if err := p.countNode(); err != nil {
+		return Expr{}, err
+	}
 	return Expr{Or: terms}, nil
 }
 
@@ -740,6 +766,9 @@ func (p *parser) parseAnd() (Expr, error) {
 		}
 		terms = append(terms, right)
 	}
+	if err := p.countNode(); err != nil {
+		return Expr{}, err
+	}
 	return Expr{And: terms}, nil
 }
 
@@ -751,24 +780,13 @@ func (p *parser) parseUnary() (Expr, error) {
 	if p.depth >= MaxPredicateDepth {
 		return Expr{}, p.errf("predicate nests deeper than the limit of %d", MaxPredicateDepth)
 	}
-	// And the size bound, on the same function and for the same reason it
-	// carries the depth bound: every clause and every parenthesised group
-	// passes through here exactly once, so counting entries counts the
-	// predicate. An AND/OR chain is a loop rather than a nesting, so the
-	// depth counter does not see it -- this one does.
-	p.nodes++
-	if p.nodes > MaxPredicateNodes {
-		return Expr{}, p.errf("predicate holds more than %d clauses", MaxPredicateNodes)
-	}
 	p.depth++
 	defer func() { p.depth-- }()
-	if p.acceptKeyword("NOT") {
-		inner, err := p.parseUnary()
-		if err != nil {
-			return Expr{}, err
-		}
-		return Expr{Not: &inner}, nil
-	}
+	// A parenthesised group is not a node: it builds no Expr of its own,
+	// it returns the one inside it. Counting it would make the text
+	// surface stricter than the AST one for the same predicate, which is
+	// the mirror of the off-by-one this accounting was changed to close
+	// -- see countNode.
 	if p.acceptPunct("(") {
 		inner, err := p.parsePredicate()
 		if err != nil {
@@ -778,6 +796,17 @@ func (p *parser) parseUnary() (Expr, error) {
 			return Expr{}, p.errf("expected ) to close the group")
 		}
 		return inner, nil
+	}
+	// Everything below builds exactly one Expr.
+	if err := p.countNode(); err != nil {
+		return Expr{}, err
+	}
+	if p.acceptKeyword("NOT") {
+		inner, err := p.parseUnary()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Not: &inner}, nil
 	}
 	if p.acceptKeyword("HAS") {
 		name, err := p.name("a field name")

@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -246,7 +247,20 @@ func defaultStateDir() string {
 	return ""
 }
 
+// maxRelativeMs is the largest millisecond count a time.Duration can
+// hold, which is what a relative flag is converted into.
+const maxRelativeMs = int64(math.MaxInt64) / int64(time.Millisecond)
+
 // parseTimeFlag accepts an absolute RFC3339 stamp or a duration before now.
+//
+// Go's parser is tried first, so compound forms such as "1h30m" still
+// work, and mql.ParseDuration second, because it is this project's own
+// duration syntax and it has a day unit Go's does not. Every other
+// duration an operator writes -- the store's `--retention 30d` and its
+// `retention:` block, a spec's `retention:`, `shard:` and
+// `max_interval:`, and `EVERY`/`GAP` in a query -- takes "30d", so
+// `--from 7d` answering `time: unknown unit "d"` named Go's parser for a
+// unit the rest of the product spells the same way.
 func parseTimeFlag(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil
@@ -256,7 +270,11 @@ func parseTimeFlag(s string) (time.Time, error) {
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("expected RFC3339 or a duration, got %q", s)
+		ms, merr := mql.ParseDuration(s)
+		if merr != nil || ms > maxRelativeMs || ms < -maxRelativeMs {
+			return time.Time{}, fmt.Errorf("expected RFC3339 or a duration such as 90m or 7d, got %q", s)
+		}
+		d = time.Duration(ms) * time.Millisecond
 	}
 	return time.Now().Add(-d), nil
 }
@@ -553,16 +571,17 @@ func runQuery(argv []string) error {
 	if err != nil {
 		return err
 	}
-	d, err := time.ParseDuration(*from)
+	// The same relative-duration syntax --from takes everywhere else.
+	at, err := parseTimeFlag(*from)
 	if err != nil {
-		return err
+		return fmt.Errorf("--from: %w", err)
 	}
 	now := time.Now()
 	client := wire.NewClient(*storeURL, os.Getenv("MENSURA_INGEST_TOKEN"))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	resp, err := client.Query(ctx, &wire.QueryRequest{
-		AST: q, FromMs: now.Add(-d).UnixMilli(), ToMs: now.UnixMilli(),
+		AST: q, FromMs: at.UnixMilli(), ToMs: now.UnixMilli(),
 		MaxPoints: *maxPoints, IntervalMs: interval.Milliseconds(),
 	})
 	if err != nil {

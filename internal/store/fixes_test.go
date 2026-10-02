@@ -217,7 +217,7 @@ func TestANonFiniteStoredFloatLeavesAnEmptyTableCell(t *testing.T) {
 		Labels: map[string]string{"host": "a"},
 		Fields: map[string]model.Value{"v": model.Float(math.NaN())},
 	}
-	row, err := s.rowFor("app", &sm)
+	row, err := s.rowFor("app", &sm, nil)
 	if err != nil {
 		t.Fatalf("rowFor: %v", err)
 	}

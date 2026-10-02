@@ -237,6 +237,19 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 			if info.Kind == model.KindString && format == FormatTimeseries {
 				warns = append(warns, Diag{"W104", fmt.Sprintf("field %q is declared as a string field; a timeseries panel plots only values that read as numbers, so the series may draw nothing -- FORMAT table or logs renders it", fe.Field)})
 			}
+			// A name the catalogue holds as a *label* as well is a
+			// column with two meanings. Labels and fields share one
+			// column namespace on a row -- a label is stored as its
+			// dictionary index in a column of its own name -- so such a
+			// set holds indices on the rows that wrote it as a label and
+			// measurements on the rows that wrote it as a field, and
+			// selecting it plots the two interleaved. The store refuses
+			// a write that would create this now; the warning is for the
+			// data an earlier build already accepted, which no write
+			// will ever correct.
+			if s.HasLabel(q.From, fe.Field) {
+				warns = append(warns, Diag{"W105", fmt.Sprintf("field %q is also a label key on set %q; a label is stored as its dictionary index in a column of the same name, so rows written one way hold an index where rows written the other hold a measurement -- this series interleaves the two", fe.Field, q.From)})
+			}
 			// Only where the advice can be taken. RATE and DELTA are
 			// timeseries-only modifiers -- E008 below refuses either one
 			// under FORMAT table or logs -- so telling a table query to
@@ -342,6 +355,18 @@ func Validate(q *Query, s Schema, maxSeries, maxPoints int) ([]Diag, error) {
 		// label instead of a plausible graph of the wrong thing.
 		if s != nil && !s.HasLabel(q.From, l) {
 			return warns, Diag{"E004", fmt.Sprintf("unknown label %q on set %q; no row carries it, so grouping by it would put every row in one series", l, q.From)}
+		}
+		// The mirror of the W105 above, on the grouping side. The
+		// catalogue holding the name as a field as well means either a
+		// spec declared metadata for one of its own labels, or rows
+		// really did write a measurement into this column -- and a
+		// measurement resolved through the dictionary lands out of
+		// range, so those rows fall into the absent slot rather than
+		// their own series.
+		if s != nil {
+			if _, isField := s.Field(q.From, l); isField {
+				warns = append(warns, Diag{"W105", fmt.Sprintf("label %q is also a field on set %q; labels and fields share one column namespace, so any row that wrote it as a field holds a measurement where this grouping expects a dictionary index and falls into the absent slot rather than its own series", l, q.From)})
+			}
 		}
 	}
 	// A limit is checked at both ends. Only the upper end used to be, and

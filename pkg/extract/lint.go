@@ -63,7 +63,15 @@ func (l Lint) String() string {
 // necessarily wrong -- a label outside `on:` whose value is functionally
 // determined by the keys that *are* in `on:` is reported identically to
 // one that varies, and this cannot tell them apart from the spec alone.
-func (l Lint) Fatal() bool { return l.Code == "L001" || l.Code == "L006" }
+// L008 is fatal for the reason L006 is. Labels and fields share one
+// column namespace on a row, so a destination set that one pattern
+// writes a name into as a label and another writes it into as a field is
+// a set where one of the two can never store a row: the store refuses
+// the second classification it meets, by name, for every record, for the
+// life of the process.
+func (l Lint) Fatal() bool {
+	return l.Code == "L001" || l.Code == "L006" || l.Code == "L008"
+}
 
 // Fatal reports whether any finding in a set is fatal.
 func Fatal(lints []Lint) bool {
@@ -98,6 +106,135 @@ func (s *Spec) Lint() []Lint {
 		out = append(out, p.lintCaptures(stream)...)
 		out = append(out, p.lintAggregateCaptures()...)
 	}
+	// Document-level, because the two halves of the collision can sit in
+	// different profiles.
+	out = append(out, s.lintColumnNamespace()...)
+	return out
+}
+
+// columnOrigin names where a destination set first met a column name, so
+// a conflict can point at both sides of it.
+type columnOrigin struct {
+	profile string
+	pattern int
+}
+
+func (o columnOrigin) String() string {
+	return fmt.Sprintf("profile %s pattern %d", o.profile, o.pattern)
+}
+
+// lintColumnNamespace reports a destination set that one pattern writes a
+// name into as a label and another writes it into as a field.
+//
+// Labels and fields share one column namespace on a row: a label is
+// stored as its dictionary index in a column of its own name, exactly
+// where a field of that name would go. The store refuses a sample that
+// carries one name as both, and it refuses a sample whose classification
+// disagrees with what the set already holds -- so of the two patterns,
+// whichever writes second has every record it produces rejected, by
+// name, for the life of the process, with nothing pointing back at the
+// spec.
+//
+// Before the store checked it the outcome was worse and quieter: both
+// classifications were accepted and the column ended up holding
+// dictionary indices on some rows and measurements on others, which
+// draws as a plausible series of numbers no source reported.
+//
+// It is decidable from the spec alone, which is where every other name
+// in a spec is decided. `fields:` declarations are deliberately not
+// consulted: declaring a unit or a description for a name the profile
+// also lists under `labels:` is harmless metadata, and the store treats
+// it as such. Only what a pattern actually puts on a row counts.
+func (s *Spec) lintColumnNamespace() []Lint {
+	labels := map[string]map[string]columnOrigin{}
+	fields := map[string]map[string]columnOrigin{}
+	note := func(into map[string]map[string]columnOrigin, set, name string, o columnOrigin) {
+		if into[set] == nil {
+			into[set] = map[string]columnOrigin{}
+		}
+		if _, seen := into[set][name]; !seen {
+			into[set][name] = o
+		}
+	}
+	var out []Lint
+	for _, p := range s.Profiles {
+		for pi, pat := range p.Patterns {
+			origin := columnOrigin{profile: p.Name, pattern: pi + 1}
+			for _, set := range patternDestinations(pat) {
+				for _, name := range patternCaptureNames(pat) {
+					if name == "" || name == "buckets" || name == "histogram" {
+						continue // payloads expand() consumes, never columns
+					}
+					if isDeclaredLabel(p, pat, name) {
+						note(labels, set, name, origin)
+						continue
+					}
+					note(fields, set, name, origin)
+				}
+				// The columns a bucket set expands into are fields like
+				// any other, and they are written straight onto the row.
+				if bs, ok := p.buckets[pat.BucketSet]; ok && pat.BucketSet != "" {
+					for _, b := range bs.Buckets {
+						note(fields, set, b, origin)
+						if bs.Cumulative {
+							note(fields, set, b+"plus", origin)
+						}
+					}
+					if bs.Tail {
+						note(fields, set, tailField, origin)
+					}
+				}
+			}
+		}
+	}
+	for _, set := range sortedSetNames(labels) {
+		for _, name := range sortedNames(labels[set]) {
+			asField, clash := fields[set][name]
+			if !clash {
+				continue
+			}
+			asLabel := labels[set][name]
+			out = append(out, Lint{
+				Code: "L008",
+				Msg: fmt.Sprintf("set %q is written with %q as a label (%s) and as a field (%s); labels and fields share one column namespace, so the two land in the same column with different meanings and the store refuses whichever arrives second -- rename one of them, or write the two patterns to different sets",
+					set, name, asLabel, asField),
+			})
+		}
+	}
+	return out
+}
+
+// patternDestinations lists the sets a pattern can write, using the same
+// branch rule Declarations does: `set:` only when an `extract:` regex can
+// match, plus one per route.
+func patternDestinations(pat *Pattern) []string {
+	var out []string
+	if len(pat.extract) > 0 && pat.Set != "" {
+		out = append(out, pat.Set)
+	}
+	for i := range pat.Route {
+		if pat.Route[i].Set != "" {
+			out = append(out, pat.Route[i].Set)
+		}
+	}
+	return out
+}
+
+func sortedSetNames(m map[string]map[string]columnOrigin) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedNames(m map[string]columnOrigin) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }
 
