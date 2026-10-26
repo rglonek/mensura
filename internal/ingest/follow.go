@@ -32,6 +32,10 @@ type FollowOptions struct {
 	// MaxRecordBytes bounds one record. A longer one is truncated and
 	// counted rather than buffered without limit.
 	MaxRecordBytes int
+	// RotatedGlob finds a renamed file after rotation, so a crash while
+	// its tail is still being drained can finish that file on restart.
+	// Empty searches the directory of the live path.
+	RotatedGlob string
 }
 
 // Follow tails files continuously, handling rotation, until the context is
@@ -76,6 +80,7 @@ func (i *Ingest) Follow(ctx context.Context, opts FollowOptions) error {
 	}
 	// Checkpoints advance only for bytes the store has accepted.
 	i.cfg.Sink.Observe(f)
+	f.recoverRotated(ctx)
 
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
@@ -210,6 +215,7 @@ func (f *follower) nextFlushPos() string { return flushPos(int(f.flushSeq.Add(1)
 type tailer struct {
 	path        string
 	stream      string
+	specGen     uint64
 	file        *os.File
 	fingerprint string
 	// fingerprintAt is how many bytes fingerprint covers. It is the
@@ -529,6 +535,21 @@ func (f *follower) poll(ctx context.Context) error {
 		if t == nil {
 			continue
 		}
+		// A reloaded spec applies to a file that is not mid-record. One
+		// that is still holding a multiline or a window keeps its profile
+		// until that record closes, then the next sweep reopens it.
+		if t.specGen != f.ing.SpecGen() {
+			if _, held := t.ex.HeldFrom(); !held {
+				f.retireKeepingCheckpoint(ctx, t)
+				t, err = f.ensure(p)
+				if err != nil || t == nil {
+					if err != nil && firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+			}
+		}
 		f.applyRewind(t)
 		// Rotation is checked before reading: a copytruncate followed
 		// quickly by fresh appends can restore the size, so "smaller than
@@ -753,7 +774,7 @@ func (f *follower) ensure(path string) (*tailer, error) {
 		f.mu.Unlock()
 		return nil, nil
 	}
-	profile := f.ing.cfg.Spec.SelectProfile(path, full[:hn], f.ing.cfg.Labels, "")
+	profile := f.ing.Spec().SelectProfile(path, full[:hn], f.ing.cfg.Labels, "")
 	if profile == nil {
 		_ = fh.Close()
 		f.ing.cfg.Progress.NoProfile(path)
@@ -763,7 +784,7 @@ func (f *follower) ensure(path string) (*tailer, error) {
 		f.mu.Unlock()
 		return nil, nil
 	}
-	ex, err := f.ing.cfg.Spec.NewStream(profile, extract.StreamOptions{
+	ex, err := f.ing.Spec().NewStream(profile, extract.StreamOptions{
 		RefTime: info.ModTime(), From: f.ing.cfg.From, To: f.ing.cfg.To,
 	})
 	if err != nil {
@@ -773,7 +794,7 @@ func (f *follower) ensure(path string) (*tailer, error) {
 	f.ing.cfg.Sink.DeclareFields(profile)
 
 	t = &tailer{
-		path: path, stream: stream, file: fh,
+		path: path, stream: stream, specGen: f.ing.SpecGen(), file: fh,
 		labels: f.ing.streamLabels(path, full[:hn]), ex: ex, cp: cp,
 	}
 	t.reset(start)
@@ -1079,8 +1100,11 @@ func (f *follower) checkRotation(ctx context.Context, t *tailer) error {
 		return err
 	}
 	if !os.SameFile(openInfo, pathInfo) {
-		// rename+create: drain the old handle first, then start the new
-		// file from its beginning.
+		// rename+create: remember where the old inode went before draining
+		// it. A crash in the drain used to lose whatever was left, because
+		// the replacement is a different file and the checkpoint for this
+		// path restarts at zero.
+		f.noteRotated(t)
 		if err := f.read(ctx, t); err != nil {
 			return err
 		}
@@ -1265,6 +1289,12 @@ func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
 	if !rewind {
 		return
 	}
+	// The drain is queued. Flush it before forgetting the rotated file:
+	// a crash after this checkpoint is saved and before the memtable is
+	// durable is the window noteRotated exists to close, and it is only
+	// closed once the store has the bytes.
+	flushed := f.ing.cfg.Sink.Flush(ctx) == nil
+	disk, had := f.cps.Load(t.stream)
 	// The replacement file starts from its beginning, and the record on
 	// disk is rewound to say so now rather than on the next flush: a
 	// crash in between would otherwise resume the *new* file at the old
@@ -1279,9 +1309,147 @@ func (f *follower) closeTailer(ctx context.Context, t *tailer, rewind bool) {
 	t.setFingerprint("", 0)
 	cp := t.checkpointSnapshot()
 	cp.Offset, cp.AckedOffset, cp.UpdatedUnix = 0, 0, time.Now().Unix()
+	if had && !flushed {
+		cp.PendingTail = disk.PendingTail
+	}
 	if err := f.cps.Save(&cp); err != nil {
 		f.ing.cfg.Log.Printf("ERROR saving checkpoint for %s: %v", t.path, err)
 	}
+}
+
+func (f *follower) noteRotated(t *tailer) {
+	path, ok := findSameFile(t.file, t.path, f.opts.RotatedGlob)
+	if !ok {
+		f.ing.cfg.Log.Printf("WARNING %s was rotated and the renamed file could not be found; a crash while draining it will lose the unread tail (set --rotated-glob if the file moves out of this directory)", t.path)
+		return
+	}
+	cp := t.checkpointSnapshot()
+	cp.PendingTail = &RotatedTail{
+		Path: path, Offset: t.ackedOffset(),
+		Fingerprint: t.fingerprint, FingerprintBytes: t.fingerprintAt,
+	}
+	if err := f.cps.Save(&cp); err != nil {
+		f.ing.cfg.Log.Printf("ERROR saving the rotated tail of %s: %v", t.path, err)
+	}
+}
+
+func (f *follower) recoverRotated(ctx context.Context) {
+	cps, err := f.cps.List()
+	if err != nil {
+		f.ing.cfg.Log.Printf("ERROR reading checkpoints to finish rotated files: %v", err)
+		return
+	}
+	for _, cp := range cps {
+		if cp.PendingTail == nil {
+			continue
+		}
+		if err := f.finishRotated(ctx, cp); err != nil {
+			f.ing.cfg.Log.Printf("ERROR finishing rotated file %s: %v", cp.PendingTail.Path, err)
+			continue
+		}
+		cp.PendingTail = nil
+		if err := f.cps.Save(cp); err != nil {
+			f.ing.cfg.Log.Printf("ERROR clearing the rotated tail of %s: %v", cp.Path, err)
+		}
+	}
+}
+
+func (f *follower) finishRotated(ctx context.Context, cp *Checkpoint) error {
+	tail := cp.PendingTail
+	fh, err := os.Open(tail.Path)
+	if err != nil {
+		return err
+	}
+	defer fh.Close()
+	info, err := fh.Stat()
+	if err != nil {
+		return err
+	}
+	if tail.Offset > info.Size() {
+		tail.Offset = 0
+	}
+	if _, err := fh.Seek(tail.Offset, io.SeekStart); err != nil {
+		return err
+	}
+	head := make([]byte, 64<<10)
+	n, _ := fh.ReadAt(head, 0)
+	profile := f.ing.Spec().SelectProfile(tail.Path, head[:n], f.ing.cfg.Labels, "")
+	if profile == nil {
+		return fmt.Errorf("no profile matched")
+	}
+	ex, err := f.ing.Spec().NewStream(profile, extract.StreamOptions{RefTime: info.ModTime(), From: f.ing.cfg.From, To: f.ing.cfg.To})
+	if err != nil {
+		return err
+	}
+	f.ing.cfg.Sink.DeclareFields(profile)
+	labels := f.ing.streamLabels(tail.Path, head[:n])
+	if _, err := fh.Seek(tail.Offset, io.SeekStart); err != nil {
+		return err
+	}
+	br := bufio.NewReaderSize(fh, 64<<10)
+	off := tail.Offset
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rec, rerr := readRecord(br, f.opts.MaxRecordBytes)
+		if len(rec.Line) > 0 && (rec.Terminated || errors.Is(rerr, io.EOF)) {
+			ex.Mark(off)
+			results, perr := ex.Process(string(rec.Line))
+			f.ing.recordOutcome(perr)
+			for i, res := range results {
+				if err := f.ing.cfg.Sink.Add(ctx, res, labels, keyHint(cp.Stream, offsetPos(off), i)); err != nil && ctx.Err() != nil {
+					return err
+				}
+			}
+			off += int64(rec.Consumed)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return rerr
+		}
+	}
+	results, _ := ex.Flush()
+	for i, res := range results {
+		_ = f.ing.cfg.Sink.Add(ctx, res, labels, keyHint(cp.Stream, offsetPos(off), i))
+	}
+	return f.ing.cfg.Sink.Flush(ctx)
+}
+
+func findSameFile(file *os.File, livePath, globPattern string) (string, bool) {
+	if file == nil {
+		return "", false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return "", false
+	}
+	var candidates []string
+	if dir := filepath.Dir(livePath); dir != "" {
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			candidates = append(candidates, filepath.Join(dir, e.Name()))
+		}
+	}
+	if globPattern != "" {
+		matches, _ := filepath.Glob(globPattern)
+		candidates = append(candidates, matches...)
+	}
+	for _, p := range candidates {
+		if p == livePath {
+			continue
+		}
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if os.SameFile(info, st) {
+			return p, true
+		}
+	}
+	return "", false
 }
 
 // BeginFlush snapshots every tailer's read position at the moment the sink

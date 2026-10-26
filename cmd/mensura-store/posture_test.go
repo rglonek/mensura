@@ -28,7 +28,7 @@ func TestIsLoopbackAddr(t *testing.T) {
 		{"[::]:9631", false, false},
 		{"10.0.0.1:9631", false, false},
 		{"myhost:9631", false, false}, // a name may resolve anywhere
-		{"LOCALHOST:9631", false, false},
+		{"LOCALHOST:9631", true, false},
 		{"127.0.0.1", false, true}, // no port at all
 	} {
 		got, err := isLoopbackAddr(tc.addr)
@@ -67,9 +67,17 @@ func TestAuthPostureRefusesAnOpenListener(t *testing.T) {
 	if err := public("bearer", func(c *fileConfig) { c.Listen.Debug.Addr = "10.0.0.1:9634" }); err == nil {
 		t.Error("a non-loopback debug listener was accepted under bearer auth")
 	}
-	// Bearer auth is what makes a routable bind legitimate.
-	if err := public("bearer", func(c *fileConfig) { c.Listen.Write.Addr = "0.0.0.0:9631" }); err != nil {
-		t.Errorf("bearer auth on a public address was refused: %v", err)
+	// Bearer auth on a cleartext public address is not enough: the token
+	// would travel where anyone on the path can read it.
+	if err := public("bearer", func(c *fileConfig) { c.Listen.Write.Addr = "0.0.0.0:9631" }); err == nil {
+		t.Error("bearer auth on a cleartext public address was accepted")
+	}
+	if err := public("bearer", func(c *fileConfig) {
+		c.Listen.Write.Addr = "0.0.0.0:9631"
+		c.Listen.Write.TLS.Cert = "cert.pem"
+		c.Listen.Write.TLS.Key = "key.pem"
+	}); err != nil {
+		t.Errorf("bearer auth with TLS on a public address was refused: %v", err)
 	}
 	// And the documented loopback posture still starts.
 	if err := public("none", func(c *fileConfig) {

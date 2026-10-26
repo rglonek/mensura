@@ -705,6 +705,104 @@ func (d *DB) Flush() error {
 	return d.pdb.Flush()
 }
 
+// DeleteDict removes one dictionary record. A missing key is success: the
+// caller is blanking a value that may only have lived in memory.
+func (d *DB) DeleteDict(name string) error {
+	if d.closed.Load() {
+		return ErrClosed
+	}
+	return d.pdb.Delete(dictKey(name), d.writeOpts)
+}
+
+// DeleteOlderThan removes rows of one physical set whose indexed timestamp
+// is strictly before beforeMs. It is how retention reaches the unsharded
+// "@all" shard, which has no time suffix a range-delete can name.
+//
+// Indexed sets are deleted by the index range, and the forward pointer
+// under D/ goes with each row. An unindexed set is scanned and deleted by
+// the timestamp column. The count is rows removed.
+func (d *DB) DeleteOlderThan(set string, beforeMs int64) (int, error) {
+	if d.closed.Load() {
+		return 0, ErrClosed
+	}
+	d.dropMu.RLock()
+	defer d.dropMu.RUnlock()
+	sm, ok := d.setRef(set)
+	if !ok {
+		return 0, nil
+	}
+	type doomed struct {
+		index []byte
+		data  []byte
+	}
+	var dead []doomed
+	if sm.indexed != "" {
+		lower := indexPrefix(sm.id, sm.indexCol)
+		upper := indexBound(sm.id, sm.indexCol, beforeMs)
+		it, err := d.pdb.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+		if err != nil {
+			return 0, err
+		}
+		for it.First(); it.Valid(); it.Next() {
+			pk, ok := indexKeyPK(it.Key())
+			if !ok {
+				continue
+			}
+			dead = append(dead, doomed{
+				index: append([]byte(nil), it.Key()...),
+				data:  dataKey(sm.id, pk),
+			})
+		}
+		err = it.Error()
+		_ = it.Close()
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		lower := dataPrefix(sm.id)
+		it, err := d.pdb.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: prefixEnd(lower)})
+		if err != nil {
+			return 0, err
+		}
+		proj := map[string]struct{}{model.TimestampField: {}}
+		for it.First(); it.Valid(); it.Next() {
+			row, err := decodeRow(it.Value(), proj)
+			if err != nil {
+				continue
+			}
+			ts, ok := row[model.TimestampField].AsInt()
+			if !ok || ts >= beforeMs {
+				continue
+			}
+			dead = append(dead, doomed{data: append([]byte(nil), it.Key()...)})
+		}
+		err = it.Error()
+		_ = it.Close()
+		if err != nil {
+			return 0, err
+		}
+	}
+	if len(dead) == 0 {
+		return 0, nil
+	}
+	b := d.pdb.NewBatch()
+	defer b.Close()
+	for _, row := range dead {
+		if len(row.index) > 0 {
+			if err := b.Delete(row.index, nil); err != nil {
+				return 0, err
+			}
+		}
+		if err := b.Delete(row.data, nil); err != nil {
+			return 0, err
+		}
+	}
+	if err := d.pdb.Apply(b, d.writeOpts); err != nil {
+		return 0, err
+	}
+	return len(dead), nil
+}
+
 // CounterSnapshot is the half of Snapshot that touches nothing but this
 // package's own atomics.
 //

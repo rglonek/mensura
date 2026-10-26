@@ -126,8 +126,12 @@ func (r *remoteService) Catalogue(ctx context.Context) (wire.Catalogue, error) {
 	return cat, nil
 }
 
-func (r *remoteService) Explain(context.Context, *wire.QueryRequest) (map[string]any, error) {
-	return nil, ErrNoLocalEngine
+func (r *remoteService) Explain(ctx context.Context, req *wire.QueryRequest) (map[string]any, error) {
+	var plan map[string]any
+	if err := r.client.PostJSON(ctx, "/v1/explain", req, &plan); err != nil {
+		return nil, err
+	}
+	return plan, nil
 }
 
 func (r *remoteService) EngineStats() (engine.StatsSnapshot, bool) {

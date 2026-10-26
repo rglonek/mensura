@@ -44,6 +44,17 @@ const maxDeclaredDurationMs = int64(math.MaxInt64) / int64(time.Millisecond)
 // after the batch has committed. Recording at the start of the request
 // instead would answer the retry of a *failed* write with "duplicate",
 // and the batch would be lost with nothing counting it.
+// idempotencyWindow is how long a committed request key suppresses a
+// retry. The wire protocol specifies ten minutes; a short LRU answered
+// "not a duplicate" as soon as 4096 newer keys had arrived, and an
+// offset-keyed batch was written twice.
+const idempotencyWindow = 10 * time.Minute
+
+type idemItem struct {
+	key string
+	exp time.Time
+}
+
 type idempotencyCache struct {
 	mu   sync.Mutex
 	max  int
@@ -98,28 +109,43 @@ func (c *idempotencyCache) seen(key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.keys[key]
-	if ok {
-		c.ll.MoveToFront(el)
+	if !ok {
+		return false
 	}
-	return ok
+	item := el.Value.(*idemItem)
+	if time.Now().After(item.exp) {
+		c.ll.Remove(el)
+		delete(c.keys, key)
+		return false
+	}
+	c.ll.MoveToFront(el)
+	return true
 }
 
-// record marks a key as committed. It is idempotent.
+// record marks a key as committed until idempotencyWindow from now.
+// It is idempotent: a repeat refreshes the deadline.
 func (c *idempotencyCache) record(key string) {
 	if key == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	exp := time.Now().Add(idempotencyWindow)
 	if el, ok := c.keys[key]; ok {
+		el.Value.(*idemItem).exp = exp
 		c.ll.MoveToFront(el)
 		return
 	}
-	c.keys[key] = c.ll.PushFront(key)
-	if c.ll.Len() > c.max {
+	c.keys[key] = c.ll.PushFront(&idemItem{key: key, exp: exp})
+	now := time.Now()
+	for c.ll.Len() > 0 {
 		last := c.ll.Back()
+		item := last.Value.(*idemItem)
+		if c.ll.Len() <= c.max && now.Before(item.exp) {
+			break
+		}
 		c.ll.Remove(last)
-		delete(c.keys, last.Value.(string))
+		delete(c.keys, item.key)
 	}
 }
 

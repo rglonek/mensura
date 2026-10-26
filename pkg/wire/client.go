@@ -27,6 +27,10 @@ type Client struct {
 	Compress bool
 	// MaxRetries bounds retry attempts for retryable statuses.
 	MaxRetries int
+	// RequireDurable asks the store to flush a batch-durability memtable
+	// before it acknowledges the write. Follow and receive set it so a
+	// checkpoint cannot move past bytes a crash would drop.
+	RequireDurable bool
 	// Rand supplies retry jitter; nil uses a package-level source.
 	Rand *rand.Rand
 }
@@ -179,6 +183,9 @@ func (c *Client) postWrite(ctx context.Context, payload []byte, encoding, idempo
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Idempotency-Key", idempotencyKey)
+	if c.RequireDurable {
+		httpReq.Header.Set(HeaderRequireDurable, "1")
+	}
 	if encoding != "" {
 		httpReq.Header.Set("Content-Encoding", encoding)
 	}

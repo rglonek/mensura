@@ -66,6 +66,11 @@ func (e *ParseError) Error() string { return fmt.Sprintf("E001 at %d: %s", e.Pos
 // query needs.
 const MaxQueryBytes = 1 << 20
 
+// MaxRegexBytes bounds one regular expression. The engine is RE2, so the
+// cost is linear, but an unbounded pattern is still an unbounded compile
+// and an unbounded amount of memory on a query the editor sends freely.
+const MaxRegexBytes = 8192
+
 func lex(src string) ([]token, error) {
 	if len(src) > MaxQueryBytes {
 		return nil, &ParseError{0, fmt.Sprintf("query is %d bytes, which is longer than the %d-byte limit", len(src), MaxQueryBytes)}

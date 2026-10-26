@@ -111,9 +111,7 @@ func (d *Datasource) runOne(ctx context.Context, q backend.DataQuery, fromAlert 
 		MaxPoints:  int(q.MaxDataPoints),
 		IntervalMs: q.Interval.Milliseconds(),
 		Options: wire.QueryOptions{
-			DisableSeriesSafety: model.DisableSeriesSafety,
-			DisableSizeSafety:   model.DisableSizeSafety,
-			FromAlert:           fromAlert,
+			FromAlert: fromAlert,
 		},
 	}
 	out, err := d.svc.Query(ctx, wreq)

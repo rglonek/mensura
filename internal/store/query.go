@@ -38,17 +38,12 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	}
 	q := req.AST
 
-	// The datasource ceilings, with a disabled gate expressed as 0. The
-	// validator and the executor must agree on these, or a query that
-	// switched a gate off is still rejected for exceeding it.
+	// The ceilings are the store's. A query used to be able to zero them
+	// with disable_series_safety / disable_size_safety, which meant any
+	// query-scoped caller — including a panel JSON field — could make one
+	// scan buffer every row. Raising a ceiling is a configuration change.
 	seriesCeiling := s.cfg.MaxSeriesPerGraph
-	if req.Options.DisableSeriesSafety {
-		seriesCeiling = 0
-	}
 	pointsCeiling := s.cfg.MaxDataPointsReceived
-	if req.Options.DisableSizeSafety {
-		pointsCeiling = 0
-	}
 
 	// Validation runs before the auxiliary forms, not after them. The
 	// switch below used to return first, so a LABELS query's WHERE was
@@ -59,6 +54,9 @@ func (s *Store) Query(ctx context.Context, req *wire.QueryRequest) (*wire.QueryR
 	warns, verr := mql.Validate(q, s.Schema(), seriesCeiling, pointsCeiling)
 	if verr != nil {
 		return nil, verr
+	}
+	if req.Options.DisableSeriesSafety || req.Options.DisableSizeSafety {
+		warns = append(warns, mql.Diag{Code: "W402", Msg: "disable_series_safety and disable_size_safety are ignored; the series and point ceilings are the store's, and raising them is a configuration change"})
 	}
 
 	// The auxiliary forms answer with the same envelope as a data query,

@@ -136,13 +136,14 @@ func printExpr(e Expr, nested bool) string {
 	case e.Not != nil:
 		return "NOT " + printExpr(*e.Not, true)
 	case e.Eq != nil:
-		return quoteIdent(e.Eq.Label) + " = " + printValue(e.Eq.Value)
+		return quoteIdent(e.Eq.Label) + " = " + printValue(e.Eq.Value, e.Eq.Literal)
 	case e.Ne != nil:
-		return quoteIdent(e.Ne.Label) + " != " + printValue(e.Ne.Value)
+		return quoteIdent(e.Ne.Label) + " != " + printValue(e.Ne.Value, e.Ne.Literal)
 	case e.In != nil:
 		vals := make([]string, len(e.In.Values))
 		for i, v := range e.In.Values {
-			vals[i] = printValue(v)
+			lit := i < len(e.In.Literal) && e.In.Literal[i]
+			vals[i] = printValue(v, lit)
 		}
 		return quoteIdent(e.In.Label) + " IN (" + strings.Join(vals, ", ") + ")"
 	case e.Match != nil:
@@ -168,8 +169,8 @@ func wrap(s string, nested bool) string {
 // a round trip does not turn $host into a literal. A bare "$" followed by
 // anything that is not a variable name is a literal and is quoted, so the
 // two cases stay distinguishable in both directions.
-func printValue(v string) string {
-	if IsVariable(v) {
+func printValue(v string, literal bool) string {
+	if IsVariable(v) && !literal {
 		return v
 	}
 	return quoteMQL(v)

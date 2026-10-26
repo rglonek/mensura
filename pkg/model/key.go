@@ -30,6 +30,14 @@ func PrimaryKey(set string, s *Sample, scheme KeyScheme) [16]byte {
 	binary.BigEndian.PutUint64(ts[:], uint64(s.TSMs))
 	hashPart(h, set)
 	_, _ = h.Write(ts[:])
+	// A zero fraction is omitted so a sample written before sub-microsecond
+	// ordering existed keeps the key it already has. A non-zero fraction
+	// is part of the identity: two events in one millisecond are two rows.
+	if s.SubUS != 0 {
+		var sub [2]byte
+		binary.BigEndian.PutUint16(sub[:], uint16(s.SubUS))
+		_, _ = h.Write(sub[:])
+	}
 	labels := s.SortedLabelKeys()
 	hashLen(h, len(labels))
 	for _, k := range labels {

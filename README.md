@@ -30,10 +30,12 @@ network hop.
 go build -o bin/mensura-store ./cmd/mensura-store
 go build -o bin/mensura-ingest ./cmd/mensura-ingest
 
-# A store. Loopback with auth off is fine; a non-loopback bind without auth
-# is refused at startup rather than quietly serving an open write API.
+# A store. Loopback with auth off is fine; a non-loopback bind needs bearer
+# auth and TLS. stream durability keeps a WAL, so a crash does not drop
+# batches a follower has already checkpointed. batch is for a one-shot
+# import you can re-run.
 bin/mensura-store --data-dir /var/lib/mensura --listen-write 127.0.0.1:9631 \
-                  --durability batch --retention 0 &
+                  --durability stream --retention 0 &
 
 # Check the spec against a real file before importing anything: `check`
 # reports match rates and prints the first lines it could not handle.
@@ -50,7 +52,7 @@ Continuous ingest instead of a one-shot import:
 ```bash
 bin/mensura-ingest follow  --spec spec.yaml --path '/var/log/app/*.log'
 bin/mensura-ingest follow  --spec spec.yaml --ssh-host db1 --path '/var/log/service/*.log'
-bin/mensura-ingest receive --spec spec.yaml --listen-tcp :9640 --listen-udp :9640 --mode metrics
+bin/mensura-ingest receive --spec spec.yaml --listen-tcp 127.0.0.1:9640 --mode metrics
 ```
 
 ## MQL

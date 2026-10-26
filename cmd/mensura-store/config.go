@@ -167,24 +167,24 @@ func loadConfig(path string) (*fileConfig, error) {
 		return nil, fmt.Errorf("config %s: limits.max_concurrent_requests is not implemented; use max_concurrent_writes for the write API and max_concurrent_jobs for queries", path)
 	}
 	if cfg.Limits.WriteRatePerClient != nil {
-		return nil, fmt.Errorf("config %s: limits.write_rate_per_client is not implemented; back-pressure is by write-slot shedding (max_concurrent_writes)", path)
+		if cfg.Limits.WriteRatePerClient.RPS < 0 || cfg.Limits.WriteRatePerClient.Burst < 0 {
+			return nil, fmt.Errorf("config %s: limits.write_rate_per_client rps and burst must not be negative", path)
+		}
 	}
 	switch cfg.Auth.Mode {
 	case "", "none", "bearer":
 	default:
 		return nil, fmt.Errorf("config %s: auth.mode %q is not supported (none or bearer)", path, cfg.Auth.Mode)
 	}
-	// mTLS is not implemented. Accepting the key and ignoring it would
-	// leave an operator believing client certificates are being verified.
 	for name, l := range map[string]listenSpec{
 		"write": cfg.Listen.Write, "query": cfg.Listen.Query,
 		"debug": cfg.Listen.Debug, "metrics": cfg.Listen.Metrics,
 	} {
-		if l.TLS.ClientCA != "" {
-			return nil, fmt.Errorf("config %s: listen.%s.tls.client_ca is set, but client-certificate verification is not implemented; remove it rather than rely on it", path, name)
-		}
 		if (l.TLS.Cert == "") != (l.TLS.Key == "") {
 			return nil, fmt.Errorf("config %s: listen.%s.tls needs both cert and key", path, name)
+		}
+		if l.TLS.ClientCA != "" && l.TLS.Cert == "" {
+			return nil, fmt.Errorf("config %s: listen.%s.tls.client_ca requires tls.cert and tls.key", path, name)
 		}
 	}
 	return cfg, nil
@@ -335,6 +335,10 @@ func (c *fileConfig) toAPIConfig(mode string) store.APIConfig {
 			Hash:   strings.TrimPrefix(cl.Hash, "sha256:"),
 			Scopes: scopes,
 		})
+	}
+	if c.Limits.WriteRatePerClient != nil {
+		api.WriteRate = float64(c.Limits.WriteRatePerClient.RPS)
+		api.WriteBurst = c.Limits.WriteRatePerClient.Burst
 	}
 	return api
 }

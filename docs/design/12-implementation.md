@@ -52,7 +52,7 @@ Requires Go 1.24 or newer. The only heavyweight dependencies are Pebble
 # 1. Start a store. Loopback with auth off is allowed; a non-loopback bind
 #    without auth is refused at startup.
 mensura-store --data-dir /var/lib/mensura --listen-write 127.0.0.1:9631 \
-              --durability batch --retention 0
+              --durability stream --retention 0
 
 # 2. Check a spec against a real file before importing anything.
 mensura-ingest check --spec examples/specs/appserver.yaml --sample /logs/web1/app.log
@@ -171,9 +171,9 @@ mensura-ingest receive --spec examples/specs/appserver.yaml --listen-tcp :9640 -
 | Ingest: batch, follow with rotation and checkpoints, SSH follow, TCP/UDP/HTTP receive, progress reporting | implemented |
 | HTTP API: write, query, catalogue, labels, stats, parse/print, admin compact/retention/quiesce/drop-set, loopback debug plan, Prometheus metrics, bearer auth | implemented |
 | Plugin backend: `QueryData`, `CheckHealth`, `CallResource`, one frame per series, alert-mode `SSE OFF` | implemented |
-| Plugin frontend: React builder, Monaco code mode, variable editor, packaging and signing | **not implemented** (M3/M6) |
+| Plugin frontend: MQL text editor that parses through the backend | implemented in `examples/grafana/src` (Monaco, the visual builder, signing: not built) |
 | Protobuf wire encoding, zstd | **not implemented**: v1 speaks JSON with gzip (§6.1) |
-| mTLS, per-client rate limits | **not implemented**: bearer auth and server TLS only; back-pressure is by write-slot shedding (§6.2) |
+| mTLS, per-client rate limits | mTLS when `tls.client_ca` is set; `write_rate_per_client` is a token bucket on the write API. Back-pressure is still also by write-slot shedding |
 | S3, SFTP and HTTP batch sources; nested archive unpacking | **not implemented**: local files, directories, globs, and single-file gzip/bzip2 (§6.3). A `.tar`/`.tgz`/`.zip` source is refused with an explanation rather than read as one stream |
 | Percentile estimation from bucket sets, `AGGREGATE … BY` | **not implemented** (M5) |
 | Streaming live tail, annotations, dashboard library, dashboard converter | **not implemented** (M6) |
@@ -337,11 +337,11 @@ and bloom knobs described in [05](05-storage.md) §9.
 
 ### 6.9 Idempotency window is a bounded LRU
 
-[04](04-wire-protocol.md) §3.2 describes a 10-minute idempotency window. The
-implementation remembers the most recent 4 096 request keys. Under steady load
-that is a shorter window; when idle it is a longer one. Content-addressed row
-keys make an expired key harmless, which is why the bound is on memory rather
-than on time.
+[04](04-wire-protocol.md) §3.2 describes a 10-minute idempotency window.
+A committed key is remembered for ten minutes, with a cap of 100 000 keys
+so a flood cannot grow the map without limit. Content-addressed row keys
+make an expired key harmless; offset-keyed retries inside the window do
+not write a second row.
 
 ### 6.10 Shard suffixes carry their own width
 
@@ -4602,26 +4602,19 @@ from "no array" before it can draw what the gate did return.
 
 ## 7. Known gaps worth naming
 
-- **Documented ingest behaviour that does not exist.** [02](02-ingest.md)
-  describes four things the code does not do, and they are named here
-  rather than left reading as features. A rotated file's undrained tail is
-  said to be recovered on restart "via the archive glob"
-  (`--rotated-glob`, `--catch-up-rotated`): there is no such flag and no
-  such sweep, so a process that dies part-way through draining a renamed
-  handle loses whatever was left in it — the replacement is still read
-  from offset 0, because the stored fingerprint no longer matches. §6.3
-  says `mensura-ingest check` warns about an occurrence-counting pattern
-  under `key: content`; the lint set is `L001`–`L008` and holds no such
-  check, and deciding "no numeric capture" from a spec alone is guesswork,
-  because extraction coerces per value. §7.1 offers TLS on the receive
-  listeners and a client-certificate subject mapped to stream labels, plus
-  per-connection byte-rate caps: the listeners are plaintext, and the only
-  per-connection bounds are `--max-connections` and the idle timeout. §10
-  offers Prometheus metrics on `--metrics-listen`: `mensura-ingest` has no
-  such flag and serves no metrics endpoint, so the progress document, the
-  console line and the `_mensura_ingest` set are the whole of its
-  telemetry — which is also the one telemetry path that stops working
-  when the store is unreachable.
+- **A rotated file's unread tail is recovered.** `--rotated-glob` (and, with
+  no glob, the directory of the live path) is searched for the renamed
+  inode before the drain. The checkpoint records that path and offset, and
+  the next start finishes the file before following the replacement.
+  A file that was unlinked, rather than renamed, still has nowhere to be
+  reopened from.
+- **Receive listeners are not an open write API.** A non-loopback TCP or
+  HTTP bind requires TLS and `--allow-source`; HTTP also requires
+  `--receive-token`. UDP is refused off loopback. `--max-connections`
+  caps HTTP as well as TCP. `--metrics-listen` serves the ingest counters.
+- **`check` warns on nested quantifiers** (`L009`). Occurrence-counting
+  patterns under `key: content` are still not guessed at from the spec
+  alone, because extraction coerces per value.
 - **`GET /label-values?filter=` is not built.** [08](08-plugin.md) §2.3
   described the builder's value list as "optionally filtered". The
   resource reads `key` and nothing else, so a filter would have been
@@ -4631,49 +4624,37 @@ from "no array" before it can draw what the gate did return.
   read, and a resource call carries neither; `LABELS <key> WHERE …` on
   the query API is the built form. The parameter has been removed from
   the table rather than left reading as a feature.
-- **No frontend.** The plugin backend answers Grafana correctly, but until the
-  React editor exists a panel must carry the AST in its query model. The
-  backend's `parse`/`print` resources exist precisely so the frontend never
-  implements a second parser.
-- **`route:` decides a destination set per record, and the *policy*
-  question is still open.** Open question 3 in [11](11-roadmap.md) asks
-  whether a route may name a set no spec declared; it may, and the store
-  creates it on first write. The *cardinality* half of that question is
-  closed: `limits.max_sets` and `limits.max_fields_per_set` (§6.181) bound
-  the catalogue on the declaration path and on the sample path alike, so a
-  route deriving its set name from a log line is refused by name past the
-  cap rather than growing the catalogue without limit. What is still
-  missing is a way to say *which* names a route may invent.
+- **The query editor is a text box.** `examples/grafana/src` parses through
+  the backend. Monaco, the visual builder and plugin signing are not built.
+  A panel can still store the AST directly.
+- **`route:` names are a closed list.** A route target is a literal set
+  name written in the spec. A name containing `$` or `{` is refused, and
+  `route_allow` (when set) is the only list of names a route may write.
+  The store still creates a declared name on first write, bounded by
+  `limits.max_sets`.
 - **`store_stream_label:` is refused, not ignored.** The key was accepted by
   the spec decoder and acted on nowhere. Compiling a spec that sets it now
   fails, on the same principle as `tls.client_ca`: a declaration that does
   nothing is worse than one that is rejected.
-- **Sub-millisecond timestamps are truncated**, per open question 1.
-- **The unsharded shard is never swept.** A set written before any
-  retention was declared for it lands in `@all`, and `RunRetention` skips
-  that shard by name because it carries no time range to compare against a
-  horizon. In the ordinary case there is nothing there: `Write` applies a
-  request's `set_meta` before its batches, so the first batch of the first
-  ingester is already sharded, and §6.109 keeps the declaration across a
-  restart. A second ingester declaring retention for a set an earlier one
-  had already filled without it leaves those rows immortal; emptying them
-  needs a row-wise sweep of `@all`, which is not built.
+- **Sub-millisecond timestamps stay sub-millisecond inside the millisecond.**
+  The indexed timestamp and the render walk are still milliseconds. The
+  leftover microseconds are stored on the sample and included in the
+  content key, so two events in one millisecond do not collapse into one
+  row. A sample with no fraction keeps the key it had before.
+- **`@all` is swept row by row.** A set that later gains a retention
+  horizon deletes rows in the unsharded shard older than that horizon.
+  New writes with a positive retention go to dated shards, as before.
 - **`NOT label = "v"` and `label != "v"` are not the same predicate.** The
   inequality requires the row to carry the label (§4.4 of
   [06](06-query.md)); the negation is a logical complement, so it also
-  matches every row that does not. Both readings are defensible and the
-  grammar offers both; the asymmetry is recorded here rather than resolved,
-  because changing either one silently changes what a stored panel draws.
-- **There is no spec reload.** [03](03-extraction.md) §11 describes
-  reloading a spec on `SIGHUP` or on a `--spec-reload-interval`, keeping
-  the running spec loudly when the new one will not compile and applying
-  new patterns to subsequent records only. `mensura-ingest` loads its
-  spec once, in `setup()`, and installs no signal handler: changing a
-  spec means restarting the process, which resumes each followed file
-  from its checkpoint. One bullet of that section *is* true, by a
-  different route: a field the catalogue stops seeing is marked
-  `stale: true` with a last-seen timestamp (§6.50), which is driven by
-  the field going unwritten rather than by the declaration going away.
+  matches every row that does not. Both readings stay, because changing
+  either one would change what a stored panel draws. `NOT label = "v"`
+  now warns `W106` and names the `!=` form.
+- **SIGHUP reloads the spec.** A spec that does not compile is logged and
+  the running one stays. A spec that compiles applies to a followed file
+  the next time it is not holding a partial record, and to new receive
+  peers. `--spec-reload-interval` is still not a flag. A field the
+  catalogue stops seeing is marked `stale: true` (§6.50).
 - **Documented CLI surface that does not exist.** `mensura-store
   convert-dashboard`, `mensura-store config check`, `mensura-ingest
   --label-from-path`, `--read-only-input`, and the whole ingest config
@@ -4698,26 +4679,20 @@ from "no array" before it can draw what the gate did return.
   tokens are read from the environment (`MENSURA_STORE_TOKEN`,
   `MENSURA_INGEST_TOKEN`), which is also the one thing §1 says may *only*
   come from there. Everything else is config file or flag.
-- **Retention does not reclaim label dictionary entries.** There is one
-  dictionary per label key for the whole store ([05](05-storage.md) §8,
-  ADR-004) and every stored row holds an index into it, so a value dropped
-  because one set aged out would relabel the rows of every other set that
-  still carries it. A key's cardinality budget therefore only ever grows;
-  recovering it needs the per-set dictionaries ADR-004 rejected.
+- **Unused label values return to the cardinality budget.** After a
+  retention sweep deletes rows, any dictionary index no remaining row
+  carries is blanked. The slot stays a hole, so an index that is still
+  stored keeps resolving to the same string. The dictionary stays global
+  per key (ADR-004).
 - **No `AGGREGATE` clause**, so the `W301` warning about interleaved streams
   is the only mitigation for a query with no `BY`.
-- **A label value that is literally `$name` cannot be queried.** The AST
-  stores a variable reference as the plain string `"$name"`, so it is
-  indistinguishable from a literal of the same text, and §6.14's `E010`
-  refuses both. Separating them needs a tagged value on `Compare` and
-  `InList`, which changes the JSON shape of every stored panel; the
-  round-trip is otherwise lossless.
-- **The sink's buffer is bounded by a count, not by a spill.** A cancelled
-  context (§ shutdown), a rejected credential (§6.26) and now retry
-  exhaustion (§6.31) all requeue rather than shed, so a long outage grows
-  memory until the store comes back. `SinkConfig.MaxBufferedSamples`
-  (100 000) is where that ends: past it the excess is dropped from the
-  oldest end of every buffered set in proportion to its size, counted and
-  logged with the reason, because an unbounded buffer turns a store outage
-  into an out-of-memory kill that loses everything rather than the tail.
-  Losing nothing at all still needs a spill-to-disk queue.
+- **A literal `$name` is a quoted string.** `host = $name` is a variable.
+  `host = "$name"` is the literal text, recorded as `literal: true` on the
+  comparison so an old panel whose JSON has no such field still treats
+  `"$name"` as a variable.
+- **The sink's buffer blocks at its cap.** Past
+  `SinkConfig.MaxBufferedSamples` (100 000) writers wait instead of
+  dropping the oldest samples. A receiver has nothing to re-read; a
+  follower's checkpoint stays behind the bytes still in the file. A
+  spill-to-disk queue is still not built. A malformed batch is still
+  dropped and counted.

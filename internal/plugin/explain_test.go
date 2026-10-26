@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -83,13 +84,25 @@ func TestExplainResourceNeedsAnAST(t *testing.T) {
 	}
 }
 
-// A proxy-mode datasource has no local engine, and the store's plan
-// endpoint lives on its loopback-only debug listener, so saying so beats
-// inventing a plan on this side.
-func TestProxyExplainSaysThereIsNoLocalEngine(t *testing.T) {
-	r := &remoteService{}
-	if _, err := r.Explain(context.Background(), &wire.QueryRequest{}); err != ErrNoLocalEngine {
-		t.Fatalf("want ErrNoLocalEngine, got %v", err)
+// Proxy mode explains through the store's query API. The plan used to be
+// reachable only on the loopback debug listener, so a datasource that does
+// not own the data directory could not explain a query at all.
+func TestProxyExplainUsesTheQueryAPI(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/explain" {
+			t.Errorf("explain posted to %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"shards": []string{"app@20231114"}})
+	}))
+	defer srv.Close()
+	r := &remoteService{client: wire.NewClient(srv.URL, "")}
+	plan, err := r.Explain(context.Background(), &wire.QueryRequest{AST: mustParse(t, "FROM app SELECT cpu")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(plan["shards"])
+	if !strings.Contains(string(raw), "app@20231114") {
+		t.Fatalf("plan = %v", plan)
 	}
 	if _, ok := r.EngineStats(); ok {
 		t.Fatal("a proxy reported engine statistics it cannot have")

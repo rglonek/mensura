@@ -66,6 +66,66 @@ type APIConfig struct {
 
 	// Mode is reported by /v1/hello: server, plugin or proxy.
 	Mode string
+
+	// WriteRate and WriteBurst limit each authenticated client (and the
+	// single anonymous identity) on the write API. Zero rate means no
+	// limit. A write the limit refuses is 429, which the ingest client
+	// already treats as back-pressure.
+	WriteRate  float64
+	WriteBurst int
+}
+
+// writeLimiter is a per-client token bucket. It is nil when no rate is
+// configured, and allow then always succeeds.
+type writeLimiter struct {
+	mu      sync.Mutex
+	rate    float64
+	burst   float64
+	buckets map[string]*tokenBucket
+}
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newWriteLimiter(rate float64, burst int) *writeLimiter {
+	if rate <= 0 {
+		return nil
+	}
+	if burst <= 0 {
+		burst = int(rate)
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	return &writeLimiter{rate: rate, burst: float64(burst), buckets: map[string]*tokenBucket{}}
+}
+
+func (l *writeLimiter) allow(name string, now time.Time) bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[name]
+	if b == nil {
+		b = &tokenBucket{tokens: l.burst, last: now}
+		l.buckets[name] = b
+	}
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens += elapsed * l.rate
+		if b.tokens > l.burst {
+			b.tokens = l.burst
+		}
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 // API is the HTTP handler set for a store.
@@ -74,6 +134,7 @@ type API struct {
 	cfg   APIConfig
 
 	writeSlots chan struct{}
+	limiter    *writeLimiter
 	// bodyBytes is what the admitted bodies reserved, not what they turned
 	// out to be: the size is not known until the body has been read, which
 	// is the very thing being bounded.
@@ -101,7 +162,11 @@ func NewAPI(s *Store, cfg APIConfig) *API {
 	if cfg.MaxBufferedRequestBytes < cfg.MaxRequestBytes {
 		cfg.MaxBufferedRequestBytes = cfg.MaxRequestBytes
 	}
-	return &API{store: s, cfg: cfg, writeSlots: make(chan struct{}, cfg.MaxConcurrentWrites)}
+	return &API{
+		store: s, cfg: cfg,
+		writeSlots: make(chan struct{}, cfg.MaxConcurrentWrites),
+		limiter:    newWriteLimiter(cfg.WriteRate, cfg.WriteBurst),
+	}
 }
 
 // HashSecret is the helper an operator uses to configure a credential
@@ -113,13 +178,30 @@ func HashSecret(secret string) string {
 
 // Handler builds the public mux: write, query and catalogue reads.
 func (a *API) Handler() http.Handler {
+	mux := a.dataMux()
+	a.mountAdmin(mux)
+	return mux
+}
+
+// DataHandler is the write and query surface without admin routes.
+//
+// auth.mode none is the loopback posture, and every local process can
+// open that socket. Writes and queries stay; dropping a set does not.
+// Admin routes are mounted only when a bearer credential can be required
+// to carry the admin scope.
+func (a *API) DataHandler() http.Handler { return a.dataMux() }
+
+func (a *API) dataMux() *http.ServeMux {
 	mux := a.readOnlyMux()
 	mux.HandleFunc("/v1/write", a.wrap(ScopeWrite, a.handleWrite))
+	return mux
+}
+
+func (a *API) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/admin/compact", a.wrap(ScopeAdmin, a.handleCompact))
 	mux.HandleFunc("/v1/admin/retention/run", a.wrap(ScopeAdmin, a.handleRetention))
 	mux.HandleFunc("/v1/admin/quiesce", a.wrap(ScopeAdmin, a.handleQuiesce))
 	mux.HandleFunc("/v1/admin/sets/", a.wrap(ScopeAdmin, a.handleDropSet))
-	return mux
 }
 
 // QueryHandler is the read surface only: no /v1/write, no /v1/admin.
@@ -140,6 +222,9 @@ func (a *API) readOnlyMux() *http.ServeMux {
 	mux.HandleFunc("/v1/stats", a.wrap(ScopeQuery, a.handleStats))
 	mux.HandleFunc("/v1/parse", a.wrap(ScopeQuery, a.handleParse))
 	mux.HandleFunc("/v1/print", a.wrap(ScopeQuery, a.handlePrint))
+	mux.HandleFunc("/v1/explain", a.wrap(ScopeQuery, func(w http.ResponseWriter, r *http.Request, _ string) {
+		a.handleExplain(w, r)
+	}))
 	return mux
 }
 
@@ -154,7 +239,15 @@ func (a *API) DebugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/debug/plan", a.handleExplain)
 	mux.HandleFunc("/v1/debug/stats", func(w http.ResponseWriter, r *http.Request) { a.handleStats(w, r, "debug") })
-	return loopbackOnly(mux, a.store.cfg.Logger)
+	var h http.Handler = mux
+	// Bearer mode already knows who is calling. Loopback alone let any
+	// local user read plans and engine stats with no credential. auth
+	// none has no credential to require; the loopback check is the
+	// whole of its control, and admin routes are not mounted here.
+	if a.cfg.AuthMode == "bearer" {
+		h = a.wrapHandler(ScopeQuery, mux)
+	}
+	return loopbackOnly(h, a.store.cfg.Logger)
 }
 
 // loopbackOnly rejects any request whose peer is not on the loopback
@@ -215,8 +308,19 @@ func (a *API) wrap(scope Scope, h func(http.ResponseWriter, *http.Request, strin
 			writeErr(w, http.StatusUnauthorized, "not authorised")
 			return
 		}
+		if scope == ScopeWrite && !a.limiter.allow(name, time.Now()) {
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusTooManyRequests, "write rate exceeded")
+			return
+		}
 		h(w, r, name)
 	}
+}
+
+func (a *API) wrapHandler(scope Scope, h http.Handler) http.Handler {
+	return a.wrap(scope, func(w http.ResponseWriter, r *http.Request, _ string) {
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (a *API) authorise(r *http.Request, scope Scope) (string, bool) {
@@ -224,10 +328,14 @@ func (a *API) authorise(r *http.Request, scope Scope) (string, bool) {
 		return "anonymous", true
 	}
 	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") {
+	// The scheme is a case-insensitive token (RFC 9110). Only the exact
+	// prefix "Bearer " used to match, so a client sending "bearer" was
+	// refused for a request that was well formed.
+	const scheme = "bearer "
+	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
 		return "", false
 	}
-	sum := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
+	sum := sha256.Sum256([]byte(header[len(scheme):]))
 	got := hex.EncodeToString(sum[:])
 	for _, c := range a.cfg.Clients {
 		if subtle.ConstantTimeCompare([]byte(got), []byte(strings.ToLower(c.Hash))) != 1 {
@@ -342,6 +450,22 @@ func (a *API) handleWrite(w http.ResponseWriter, r *http.Request, client string)
 		}
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// A follow or receive checkpoint moves when this response is 200.
+	// Under durability batch that 200 used to mean "the memtable has the
+	// rows", and a crash before the next flush lost them while the
+	// checkpoint had already moved past the bytes. Flushing first makes
+	// the acknowledgement mean what the checkpoint thinks it means.
+	// Stream and paranoid already have a WAL, so the flush is not owed.
+	resp.Durable = a.store.WritesAreDurable()
+	if !resp.Durable && r.Header.Get(wire.HeaderRequireDurable) == "1" {
+		if err := a.store.Flush(); err != nil {
+			a.writeErrs.Add(1)
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		resp.Durable = true
 	}
 	a.writes.Add(1)
 	// Refused, not len(Rejected): the named list is capped so the response

@@ -93,19 +93,48 @@ func (st *Stream) tryFormat(i int, line string) (time.Time, string, error) {
 // timestamp lands in the millisecond it belongs to instead of the one
 // after it.
 func epochMillis(layout string, n int64) (int64, error) {
+	ts, err := epochTime(layout, n)
+	if err != nil {
+		return 0, err
+	}
+	return ts.UnixMilli(), nil
+}
+
+// epochTime parses an epoch count and keeps the sub-millisecond fraction
+// on the Time. Callers that store a sample read UnixMilli for the indexed
+// timestamp and the leftover microseconds for ordering within that
+// millisecond. Truncating here made two events in the same millisecond
+// one row.
+func epochTime(layout string, n int64) (time.Time, error) {
 	switch layout {
 	case "epoch_s":
 		if n > model.MaxTSMs/1000 || n < -(model.MaxTSMs/1000) {
-			return 0, fmt.Errorf("%w: %d seconds is beyond the representable range; a value this large is usually epoch milliseconds, microseconds or nanoseconds declared as epoch_s", ErrNoTimestamp, n)
+			return time.Time{}, fmt.Errorf("%w: %d seconds is beyond the representable range; a value this large is usually epoch milliseconds, microseconds or nanoseconds declared as epoch_s", ErrNoTimestamp, n)
 		}
-		return n * 1000, nil
+		return time.UnixMilli(n * 1000).UTC(), nil
 	case "epoch_ms":
-		return n, nil
+		return time.UnixMilli(n).UTC(), nil
 	case "epoch_us":
-		return floorDiv(n, 1000), nil
+		if n > model.MaxTSMs*1000 || n < -(model.MaxTSMs*1000) {
+			return time.Time{}, fmt.Errorf("%w: %d microseconds is beyond the representable range", ErrNoTimestamp, n)
+		}
+		return time.UnixMicro(n).UTC(), nil
 	default:
-		return floorDiv(n, 1_000_000), nil
+		ms := floorDiv(n, 1_000_000)
+		if ms > model.MaxTSMs || ms < -model.MaxTSMs {
+			return time.Time{}, fmt.Errorf("%w: %d nanoseconds is beyond the representable range", ErrNoTimestamp, n)
+		}
+		return time.Unix(0, n).UTC(), nil
 	}
+}
+
+// subUS is the microseconds within the millisecond, 0..999.
+func subUS(ts time.Time) int {
+	us := ts.Nanosecond() / 1000
+	if us < 0 {
+		us = -us
+	}
+	return us % 1000
 }
 
 // floorDiv divides towards negative infinity, because Go's / truncates
@@ -125,11 +154,11 @@ func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, pre
 		if err != nil {
 			return time.Time{}, err
 		}
-		ms, err := epochMillis(layout, n)
+		ts, err := epochTime(layout, n)
 		if err != nil {
 			return time.Time{}, err
 		}
-		return time.UnixMilli(ms).UTC(), nil
+		return ts, nil
 	}
 	ts, err := time.ParseInLocation(layout, text, loc)
 	if err != nil {

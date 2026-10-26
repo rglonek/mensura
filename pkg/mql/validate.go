@@ -659,6 +659,9 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag, depth int) error {
 		if err := validateArm(q, *e.Not, s, warns, "not", depth+1); err != nil {
 			return err
 		}
+		if e.Not.Eq != nil {
+			*warns = append(*warns, Diag{"W106", fmt.Sprintf("NOT %s = %q also matches rows that do not carry %s; %s != %q requires the label to be present", e.Not.Eq.Label, e.Not.Eq.Value, e.Not.Eq.Label, e.Not.Eq.Label, e.Not.Eq.Value)})
+		}
 	}
 	check := func(label string) error {
 		// Refused before it is looked up, and refused with no schema at
@@ -714,13 +717,17 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag, depth int) error {
 	}
 	switch {
 	case e.Eq != nil:
-		if err := unresolved(e.Eq.Value); err != nil {
-			return err
+		if !e.Eq.Literal {
+			if err := unresolved(e.Eq.Value); err != nil {
+				return err
+			}
 		}
 		return check(e.Eq.Label)
 	case e.Ne != nil:
-		if err := unresolved(e.Ne.Value); err != nil {
-			return err
+		if !e.Ne.Literal {
+			if err := unresolved(e.Ne.Value); err != nil {
+				return err
+			}
 		}
 		return check(e.Ne.Label)
 	case e.In != nil:
@@ -733,7 +740,14 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag, depth int) error {
 		if len(e.In.Values) == 0 {
 			return Diag{"E007", fmt.Sprintf("IN on %q lists no values; an empty list can never match", e.In.Label)}
 		}
-		if err := unresolved(e.In.Values...); err != nil {
+		var vars []string
+		for i, v := range e.In.Values {
+			if i < len(e.In.Literal) && e.In.Literal[i] {
+				continue
+			}
+			vars = append(vars, v)
+		}
+		if err := unresolved(vars...); err != nil {
 			return err
 		}
 		return check(e.In.Label)
@@ -749,6 +763,9 @@ func validateExpr(q *Query, e Expr, s Schema, warns *[]Diag, depth int) error {
 		// mistake with two very different diagnoses.
 		if vs := regexVariables(m.Regex); len(vs) > 0 {
 			return Diag{"E010", fmt.Sprintf("variable $%s was not substituted; the datasource must interpolate it before the query runs", vs[0])}
+		}
+		if len(m.Regex) > MaxRegexBytes {
+			return Diag{"E007", fmt.Sprintf("regex is %d bytes, past the limit of %d", len(m.Regex), MaxRegexBytes)}
 		}
 		if _, err := regexp.Compile(m.Regex); err != nil {
 			return Diag{"E001", fmt.Sprintf("invalid regex /%s/: %v", m.Regex, err)}
@@ -844,14 +861,17 @@ func Variables(q *Query) []string {
 		if e.Not != nil {
 			walk(*e.Not)
 		}
-		if e.Eq != nil {
+		if e.Eq != nil && !e.Eq.Literal {
 			add(e.Eq.Value)
 		}
-		if e.Ne != nil {
+		if e.Ne != nil && !e.Ne.Literal {
 			add(e.Ne.Value)
 		}
 		if e.In != nil {
-			for _, v := range e.In.Values {
+			for i, v := range e.In.Values {
+				if i < len(e.In.Literal) && e.In.Literal[i] {
+					continue
+				}
 				add(v)
 			}
 		}

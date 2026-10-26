@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -97,6 +98,12 @@ type commonFlags struct {
 	flushEvery    time.Duration
 	maxBuffered   int
 	maxFatalDrops int
+	// requireDurable is set by follow and receive. Their checkpoints move
+	// when the store acknowledges a batch, so that acknowledgement has to
+	// survive a crash. Batch import re-reads its files and stays fast.
+	requireDurable bool
+	metricsAddr    string
+	specPath       string
 }
 
 func (c *commonFlags) register(fs *flag.FlagSet) {
@@ -117,7 +124,8 @@ func (c *commonFlags) register(fs *flag.FlagSet) {
 	fs.IntVar(&c.batchSize, "batch-size", 0, "samples buffered before a write is sent; 0 uses the built-in 1024")
 	fs.IntVar(&c.batchBytes, "batch-bytes", 0, "largest write body, which must stay under the store's max_request_bytes; 0 uses the built-in 4 MiB")
 	fs.DurationVar(&c.flushEvery, "flush-interval", 0, "how often a partly-filled batch is sent anyway; 0 uses the built-in 50ms")
-	fs.IntVar(&c.maxBuffered, "max-buffered-samples", 0, "samples held while the store refuses writes, past which the oldest are dropped and counted; 0 uses the built-in 100000")
+	fs.IntVar(&c.maxBuffered, "max-buffered-samples", 0, "samples held while the store refuses writes; writers block at the cap rather than dropping samples; 0 uses the built-in 100000")
+	fs.StringVar(&c.metricsAddr, "metrics-listen", "", "Prometheus metrics address, for example 127.0.0.1:9641")
 	fs.IntVar(&c.maxFatalDrops, "max-fatal-drops", 0, "unretryable batches dropped before the process gives up, so a supervisor notices a spec the store rejects; 0 uses the built-in 100, negative never gives up")
 }
 
@@ -184,6 +192,7 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	}
 	client := wire.NewClient(c.storeURL, os.Getenv("MENSURA_INGEST_TOKEN"))
 	client.Compress = c.compress
+	client.RequireDurable = c.requireDurable
 
 	logger := log.New(os.Stderr, "mensura-ingest ", log.LstdFlags)
 	sink := ingest.NewSink(client, c.sinkConfig(), logger)
@@ -198,7 +207,7 @@ func (c *commonFlags) setup() (*ingest.Ingest, *ingest.Sink, error) {
 	}
 
 	ing, err := ingest.New(ingest.Config{
-		Spec: spec, Sink: sink, Labels: c.labels, From: from, To: to,
+		Spec: spec, SpecPath: c.spec, Sink: sink, Labels: c.labels, From: from, To: to,
 		StateDir: c.stateDir, ClientName: c.client, Log: logger,
 		// The record cap the batch importer and the TCP listener read.
 		// The follow paths take their own copy of it in FollowOptions
@@ -346,6 +355,7 @@ func runFollow(argv []string) error {
 	sshPort := fs.Int("ssh-port", 0, "remote port")
 	sshCred := fs.String("ssh-credential", "", "path to the SSH identity to use")
 	strictHost := fs.Bool("ssh-strict-host-key", true, "verify the remote host key")
+	rotated := fs.String("rotated-glob", "", "glob to find a renamed file after rotation, so a crash can finish its unread tail")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -373,6 +383,7 @@ func runFollow(argv []string) error {
 			log.Printf("keeping follow checkpoints in %s (--state-dir)", common.stateDir)
 		}
 	}
+	common.requireDurable = true
 	ing, sink, err := common.setup()
 	if err != nil {
 		return err
@@ -386,6 +397,9 @@ func runFollow(argv []string) error {
 	defer func() { _ = sink.Close(context.Background()) }()
 	stopReporting := startReporting(ctx, ing, sink, common)
 	defer stopReporting()
+	stopMetrics := startMetrics(common, ing, sink)
+	defer stopMetrics()
+	go watchSpec(ctx, ing)
 
 	list := splitList(*paths)
 	if *sshHost != "" {
@@ -412,6 +426,7 @@ func runFollow(argv []string) error {
 	return ing.Follow(ctx, ingest.FollowOptions{
 		Paths: list, StartAt: *startAt, PollInterval: *poll,
 		IdleFlush: *idleFlush, MaxRecordBytes: common.maxRecord,
+		RotatedGlob: *rotated,
 	})
 }
 
@@ -430,6 +445,9 @@ func runReceive(argv []string) error {
 	maxPeers := fs.Int("max-peers", 0, "how many distinct senders may hold extraction state")
 	maxConns := fs.Int("max-connections", 0, "how many TCP connections may be served at once; 0 uses the built-in 1024")
 	peerIdle := fs.Duration("peer-idle", 0, "how long a silent sender's extraction state is kept; 0 uses the built-in 30m")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate for a non-loopback TCP or HTTP listener")
+	tlsKey := fs.String("tls-key", "", "TLS private key for a non-loopback TCP or HTTP listener")
+	token := fs.String("receive-token", os.Getenv("MENSURA_RECEIVE_TOKEN"), "bearer token required on a non-loopback HTTP listener")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -439,6 +457,7 @@ func runReceive(argv []string) error {
 	if *mode != "logs" && *mode != "metrics" {
 		return fmt.Errorf("--mode %q: expected logs or metrics", *mode)
 	}
+	common.requireDurable = true
 	ing, sink, err := common.setup()
 	if err != nil {
 		return err
@@ -448,6 +467,9 @@ func runReceive(argv []string) error {
 	defer func() { _ = sink.Close(context.Background()) }()
 	stopReporting := startReporting(ctx, ing, sink, common)
 	defer stopReporting()
+	stopMetrics := startMetrics(common, ing, sink)
+	defer stopMetrics()
+	go watchSpec(ctx, ing)
 
 	// splitList, not a bare Split: an entry written with a space after
 	// the comma would never have matched a sender address.
@@ -461,6 +483,9 @@ func runReceive(argv []string) error {
 		MaxPeers:         *maxPeers,
 		MaxConnections:   *maxConns,
 		PeerIdle:         *peerIdle,
+		TLSCert:          *tlsCert,
+		TLSKey:           *tlsKey,
+		Token:            *token,
 	})
 }
 
@@ -648,5 +673,44 @@ func startReporting(ctx context.Context, ing *ingest.Ingest, sink *ingest.Sink, 
 	return func() {
 		once.Do(func() { close(done) })
 		<-stopped
+	}
+}
+
+func watchSpec(ctx context.Context, ing *ingest.Ingest) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	defer signal.Stop(ch)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ch:
+			if err := ing.ReloadSpec(); err != nil {
+				log.Printf("ERROR spec reload: %v; keeping the running spec", err)
+				continue
+			}
+			log.Printf("INFO reloaded the extraction spec; open files pick it up once they are not holding a partial record")
+		}
+	}
+}
+
+func startMetrics(c commonFlags, ing *ingest.Ingest, sink *ingest.Sink) func() {
+	if c.metricsAddr == "" {
+		return func() {}
+	}
+	srv := &http.Server{
+		Addr: c.metricsAddr, Handler: ingest.MetricsHandler(ing.Progress(), sink),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("ERROR metrics listener: %v", err)
+		}
+	}()
+	log.Printf("ingest metrics on %s", c.metricsAddr)
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
 	}
 }

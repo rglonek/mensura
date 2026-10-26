@@ -130,7 +130,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 	for k, v := range i.cfg.Labels {
 		labels[k] = v
 	}
-	profile := i.cfg.Spec.SelectProfile(path, nil, labels, "ssh")
+	profile := i.Spec().SelectProfile(path, nil, labels, "ssh")
 	if profile == nil {
 		return fmt.Errorf("ingest: no profile matched remote path %s", path)
 	}
@@ -268,7 +268,7 @@ func (i *Ingest) followRemotePath(ctx context.Context, opts RemoteOptions, cps *
 			}
 			lag.set(path, size-progress.pendingOffset())
 		}
-		ex, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{
+		ex, err := i.Spec().NewStream(profile, extract.StreamOptions{
 			RefTime: time.Now(), From: i.cfg.From, To: i.cfg.To,
 		})
 		if err != nil {

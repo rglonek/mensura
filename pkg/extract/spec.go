@@ -27,6 +27,10 @@ type Spec struct {
 	Identity []IdentityRule    `yaml:"identity"`
 	Profiles []*Profile        `yaml:"profiles"`
 	Sets     map[string]SetOpt `yaml:"sets"`
+	// RouteAllow, when non-empty, is the only set of names a route: rule
+	// may write. A route target is otherwise any static name in the spec;
+	// this is how an operator says which of those names may be created.
+	RouteAllow []string `yaml:"route_allow"`
 
 	path string
 }
@@ -166,6 +170,27 @@ type Multiline struct {
 	continueRe     *regexp.Regexp
 	idleTimeout    time.Duration
 	maxRecordBytes int
+}
+
+// maxRegexBytes is the largest pattern this package will compile. RE2
+// does not backtrack, and a pattern past this size is a spec that should
+// be split rather than a matcher the process should build.
+const maxRegexBytes = 8192
+
+func checkRegexSize(where, expr string) error {
+	if len(expr) > maxRegexBytes {
+		return fmt.Errorf("%s: regex is %d bytes, past the limit of %d", where, len(expr), maxRegexBytes)
+	}
+	return nil
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Pattern is one extraction rule.
@@ -363,11 +388,17 @@ func (s *Spec) Compile() error {
 		r := &s.Identity[i]
 		var err error
 		if r.MatchPath != "" {
+			if err = checkRegexSize("identity match_path", r.MatchPath); err != nil {
+				return err
+			}
 			if r.matchPath, err = regexp.Compile(r.MatchPath); err != nil {
 				return fmt.Errorf("extract: identity match_path: %w", err)
 			}
 		}
 		if r.Regex != "" {
+			if err = checkRegexSize("identity regex", r.Regex); err != nil {
+				return err
+			}
 			if r.regex, err = regexp.Compile(r.Regex); err != nil {
 				return fmt.Errorf("extract: identity regex: %w", err)
 			}
@@ -502,6 +533,9 @@ func (p *Profile) compile(s *Spec) error {
 		if f.Regex == "" {
 			return fmt.Errorf("timestamp format %q needs a regex", f.Layout)
 		}
+		if err := checkRegexSize("timestamp regex", f.Regex); err != nil {
+			return err
+		}
 		re, err := regexp.Compile(f.Regex)
 		if err != nil {
 			return fmt.Errorf("timestamp regex: %w", err)
@@ -592,10 +626,16 @@ func (p *Profile) compile(s *Spec) error {
 				mi+1, m.StartContains, first+1)
 		}
 		seenStart[m.StartContains] = mi
+		if err = checkRegexSize("multiline continue_regex", m.ContinueRegex); err != nil {
+			return err
+		}
 		if m.continueRe, err = regexp.Compile(m.ContinueRegex); err != nil {
 			return fmt.Errorf("multiline continue_regex: %w", err)
 		}
 		for i := range m.Join {
+			if err = checkRegexSize("multiline join regex", m.Join[i].Regex); err != nil {
+				return err
+			}
 			if m.Join[i].re, err = regexp.Compile(m.Join[i].Regex); err != nil {
 				return fmt.Errorf("multiline join regex: %w", err)
 			}
@@ -782,6 +822,9 @@ func (p *Profile) compile(s *Spec) error {
 			pat.labelSet[l] = struct{}{}
 		}
 		for i := range pat.Replace {
+			if err := checkRegexSize("replace regex", pat.Replace[i].Regex); err != nil {
+				return err
+			}
 			re, err := regexp.Compile(pat.Replace[i].Regex)
 			if err != nil {
 				return fmt.Errorf("replace regex: %w", err)
@@ -801,6 +844,9 @@ func (p *Profile) compile(s *Spec) error {
 		// have to know that.
 		pat.extract = nil
 		for _, ex := range pat.Extract {
+			if err := checkRegexSize("extract regex", ex); err != nil {
+				return err
+			}
 			re, err := regexp.Compile(ex)
 			if err != nil {
 				return fmt.Errorf("extract regex: %w", err)
@@ -808,6 +854,9 @@ func (p *Profile) compile(s *Spec) error {
 			pat.extract = append(pat.extract, re)
 		}
 		for i := range pat.Route {
+			if err := checkRegexSize("route regex", pat.Route[i].Regex); err != nil {
+				return err
+			}
 			re, err := regexp.Compile(pat.Route[i].Regex)
 			if err != nil {
 				return fmt.Errorf("route regex: %w", err)
@@ -815,6 +864,12 @@ func (p *Profile) compile(s *Spec) error {
 			pat.Route[i].re = re
 			if pat.Route[i].Set == "" {
 				pat.Route[i].Set = pat.Set
+			}
+			if strings.ContainsAny(pat.Route[i].Set, "${") {
+				return fmt.Errorf("route %d: set %q is not a literal name; a route cannot invent a set from the record", i+1, pat.Route[i].Set)
+			}
+			if len(s.RouteAllow) > 0 && !containsString(s.RouteAllow, pat.Route[i].Set) {
+				return fmt.Errorf("route %d: set %q is not in route_allow", i+1, pat.Route[i].Set)
 			}
 			// A route target is a destination set exactly as `set:` is,
 			// and it was the one that nothing checked. A spec routing to

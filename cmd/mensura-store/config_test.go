@@ -97,7 +97,6 @@ db:
 func TestUnimplementedLimitKeysAreRefusedByName(t *testing.T) {
 	for _, body := range []string{
 		"limits:\n  max_concurrent_requests: 16\n",
-		"limits:\n  write_rate_per_client: {rps: 2000, burst: 8000}\n",
 	} {
 		_, err := loadConfig(writeConfig(t, body))
 		if err == nil {
@@ -108,8 +107,13 @@ func TestUnimplementedLimitKeysAreRefusedByName(t *testing.T) {
 		}
 	}
 	// The keys that are implemented still load.
-	if _, err := loadConfig(writeConfig(t, "limits:\n  max_concurrent_writes: 8\n  max_concurrent_jobs: 4\n")); err != nil {
+	cfg, err := loadConfig(writeConfig(t, "limits:\n  max_concurrent_writes: 8\n  max_concurrent_jobs: 4\n  write_rate_per_client: {rps: 2000, burst: 8000}\n"))
+	if err != nil {
 		t.Fatalf("a supported limits block was refused: %v", err)
+	}
+	api := cfg.toAPIConfig("server")
+	if api.WriteRate != 2000 || api.WriteBurst != 8000 {
+		t.Fatalf("write rate did not reach the API config: %+v", api)
 	}
 }
 
@@ -126,7 +130,11 @@ func TestQueryListenerMayNotShareTheWriteAddress(t *testing.T) {
 	cfg := &fileConfig{}
 	cfg.Auth.Mode = "bearer"
 	cfg.Listen.Write.Addr = "0.0.0.0:9631"
+	cfg.Listen.Write.TLS.Cert = "cert.pem"
+	cfg.Listen.Write.TLS.Key = "key.pem"
 	cfg.Listen.Query.Addr = "0.0.0.0:9631"
+	cfg.Listen.Query.TLS.Cert = "cert.pem"
+	cfg.Listen.Query.TLS.Key = "key.pem"
 	err := checkAuthPosture(cfg)
 	if err == nil {
 		t.Fatal("expected the shared address to be refused")
@@ -138,6 +146,8 @@ func TestQueryListenerMayNotShareTheWriteAddress(t *testing.T) {
 	// A distinct address is fine, and so is leaving the query listener
 	// unset to serve everything on the write address.
 	cfg.Listen.Query.Addr = "0.0.0.0:9632"
+	cfg.Listen.Query.TLS.Cert = "cert.pem"
+	cfg.Listen.Query.TLS.Key = "key.pem"
 	if err := checkAuthPosture(cfg); err != nil {
 		t.Fatalf("distinct addresses were refused: %v", err)
 	}

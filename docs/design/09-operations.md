@@ -169,14 +169,14 @@ per flush, not percentages.
 
 | Surface | Posture |
 | --- | --- |
-| Write API | TLS required off-loopback; bearer or mTLS; per-client scopes; per-client rate limits |
-| Query API | Same; `query` scope only |
-| Debug API | Loopback listener only, never proxied, read-only, capped limits and per-request timeouts |
-| Metrics | Separate listener, typically loopback or a private interface |
+| Write API | TLS required off-loopback; bearer; mTLS when `tls.client_ca` is set; per-client scopes; optional `write_rate_per_client` |
+| Query API | Same; `query` scope only. Admin routes are not mounted when auth is off |
+| Debug API | Loopback only. With bearer auth it also requires the query scope |
+| Metrics | Separate listener. Off-loopback it needs the same auth and TLS as the query API. Ingest serves its own on `--metrics-listen` |
 | Ingest ↔ SSH | Public-key auth only, host-key verification on by default (`--ssh-strict-host-key=yes`), no interactive prompts; `=false` really does turn it off, rather than falling back to a client default that `BatchMode=yes` still refuses |
 | Sensitive values | Environment or referenced path only; never logged; auth failures log the client *name* and source address, never the credential |
-| Spec files | Treated as configuration, not untrusted input, but regexes compile under a size limit and `check` reports catastrophic-backtracking risk from nested quantifiers |
-| Receive listeners | Optional TLS and mTLS; per-connection and per-source rate limits; UDP source allow-list |
+| Spec files | Treated as configuration, not untrusted input. Regexes are refused past 8192 bytes and `check` warns (L009) on a quantified group that already contains a quantifier |
+| Receive listeners | Loopback may be plaintext. Anything else needs TLS, `--allow-source`, and for HTTP a `--receive-token`. UDP is refused off loopback because a datagram source address can be spoofed. TCP and HTTP share `--max-connections` |
 
 The store never executes anything derived from ingested data, has no template
 evaluation in queries, and writes no files outside `data_dir` and its log.

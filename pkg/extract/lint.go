@@ -105,6 +105,7 @@ func (s *Spec) Lint() []Lint {
 		out = append(out, p.lintUnreachablePatterns()...)
 		out = append(out, p.lintCaptures(stream)...)
 		out = append(out, p.lintAggregateCaptures()...)
+		out = append(out, p.lintNestedQuantifiers()...)
 	}
 	// Document-level, because the two halves of the collision can sit in
 	// different profiles.
@@ -265,6 +266,78 @@ func sortedNames(m map[string]columnOrigin) []string {
 //
 // Both are decidable from the spec and invisible at run time: the row is
 // well formed and the panel draws.
+// lintNestedQuantifiers warns about a group that is itself quantified
+// and contains a quantifier. RE2 will not backtrack, so this cannot hang
+// the process; it is still almost never what a spec author meant, and it
+// is the shape that becomes catastrophic if the pattern is ever moved to
+// an engine that does backtrack.
+func (p *Profile) lintNestedQuantifiers() []Lint {
+	var exprs []string
+	for _, f := range p.Timestamp.Formats {
+		exprs = append(exprs, f.Regex)
+	}
+	for _, m := range p.Framing.Multiline {
+		exprs = append(exprs, m.ContinueRegex)
+		for _, j := range m.Join {
+			exprs = append(exprs, j.Regex)
+		}
+	}
+	for _, pat := range p.Patterns {
+		exprs = append(exprs, pat.Extract...)
+		for _, r := range pat.Replace {
+			exprs = append(exprs, r.Regex)
+		}
+		for _, r := range pat.Route {
+			exprs = append(exprs, r.Regex)
+		}
+	}
+	var out []Lint
+	seen := map[string]bool{}
+	for _, re := range exprs {
+		if re == "" || seen[re] || !nestedQuantifier(re) {
+			continue
+		}
+		seen[re] = true
+		out = append(out, Lint{
+			Profile: p.Name,
+			Code:    "L009",
+			Msg:     fmt.Sprintf("regex %q quantifies a group that already contains a quantifier", re),
+		})
+	}
+	return out
+}
+
+func nestedQuantifier(s string) bool {
+	var groups []bool
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		switch s[i] {
+		case '(':
+			groups = append(groups, false)
+		case ')':
+			if len(groups) == 0 {
+				continue
+			}
+			inner := groups[len(groups)-1]
+			groups = groups[:len(groups)-1]
+			if inner && i+1 < len(s) {
+				switch s[i+1] {
+				case '*', '+', '{':
+					return true
+				}
+			}
+		case '*', '+':
+			if len(groups) > 0 {
+				groups[len(groups)-1] = true
+			}
+		}
+	}
+	return false
+}
+
 func (p *Profile) lintAggregateCaptures() []Lint {
 	var out []Lint
 	for _, pat := range p.Patterns {

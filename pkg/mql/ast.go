@@ -115,11 +115,17 @@ type Expr struct {
 type Compare struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
+	// Literal means Value is the text to match even when it looks like
+	// $name. Absent is the historical reading: $name is a variable.
+	Literal bool `json:"literal,omitempty"`
 }
 
 type InList struct {
 	Label  string   `json:"label"`
 	Values []string `json:"values"`
+	// Literal is parallel to Values. A true entry is literal text.
+	// A missing or short slice keeps the historical reading.
+	Literal []bool `json:"literal,omitempty"`
 }
 
 type MatchExpr struct {

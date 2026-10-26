@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rglonek/mensura/pkg/extract"
@@ -22,7 +23,9 @@ import (
 // Config is the ingest process configuration shared by every input.
 type Config struct {
 	Spec *extract.Spec
-	Sink *Sink
+	// SpecPath is the file ReloadSpec reads. Empty disables SIGHUP reload.
+	SpecPath string
+	Sink     *Sink
 	// Labels are attached to every sample from every input: the operator's
 	// declaration, which outranks anything discovered from content or path.
 	Labels map[string]string
@@ -44,7 +47,10 @@ type Config struct {
 
 // Ingest runs inputs against a spec and a sink.
 type Ingest struct {
-	cfg Config
+	cfg     Config
+	specMu  sync.RWMutex
+	spec    *extract.Spec
+	specGen atomic.Uint64
 }
 
 func New(cfg Config) (*Ingest, error) {
@@ -80,7 +86,45 @@ func New(cfg Config) (*Ingest, error) {
 	// The spec's `sets:` declarations travel with the first write, the
 	// same way field metadata does.
 	cfg.Sink.DeclareSets(cfg.Spec)
-	return &Ingest{cfg: cfg}, nil
+	ing := &Ingest{cfg: cfg, spec: cfg.Spec}
+	ing.specGen.Store(1)
+	return ing, nil
+}
+
+// Spec is the extraction spec currently in force. ReloadSpec may replace
+// it; callers that extract a record take the value they see at the start
+// of that record.
+func (i *Ingest) Spec() *extract.Spec {
+	i.specMu.RLock()
+	defer i.specMu.RUnlock()
+	return i.spec
+}
+
+// SpecGen changes each time ReloadSpec installs a spec that compiled.
+func (i *Ingest) SpecGen() uint64 { return i.specGen.Load() }
+
+// ReloadSpec loads SpecPath again. A spec that does not compile leaves
+// the running one in place and returns the error. A spec that compiles
+// applies to streams opened after this call, and to a followed file the
+// next time it is not holding a partial record.
+func (i *Ingest) ReloadSpec() error {
+	if i.cfg.SpecPath == "" {
+		return fmt.Errorf("ingest: no spec path to reload")
+	}
+	next, err := extract.Load(i.cfg.SpecPath)
+	if err != nil {
+		return err
+	}
+	i.cfg.Sink.DeclareSets(next)
+	for _, p := range next.Profiles {
+		i.cfg.Sink.DeclareFields(p)
+	}
+	i.specMu.Lock()
+	i.spec = next
+	i.cfg.Spec = next
+	i.specMu.Unlock()
+	i.specGen.Add(1)
+	return nil
 }
 
 func (i *Ingest) Progress() *Progress { return i.cfg.Progress }
@@ -302,7 +346,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		i.cfg.Progress.SkipBinary()
 		return nil
 	}
-	profile := i.cfg.Spec.SelectProfile(path, head, i.cfg.Labels, "")
+	profile := i.Spec().SelectProfile(path, head, i.cfg.Labels, "")
 	if profile == nil {
 		// Silently dropping unmatched files is the failure mode that
 		// wastes an afternoon, so it is counted and logged.
@@ -311,7 +355,7 @@ func (i *Ingest) processFile(ctx context.Context, path string) error {
 		return nil
 	}
 	labels := i.streamLabels(path, head)
-	stream, err := i.cfg.Spec.NewStream(profile, extract.StreamOptions{RefTime: mtime, From: i.cfg.From, To: i.cfg.To})
+	stream, err := i.Spec().NewStream(profile, extract.StreamOptions{RefTime: mtime, From: i.cfg.From, To: i.cfg.To})
 	if err != nil {
 		return err
 	}
@@ -450,7 +494,7 @@ func (i *Ingest) recordOutcome(err error) {
 // trustworthy source, so it never overrides the others.
 func (i *Ingest) streamLabels(path string, head []byte) map[string]string {
 	labels := map[string]string{}
-	for k, v := range i.cfg.Spec.DiscoverIdentity(path, head) {
+	for k, v := range i.Spec().DiscoverIdentity(path, head) {
 		labels[k] = v
 	}
 	for k, v := range i.cfg.Labels {

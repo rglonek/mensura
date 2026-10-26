@@ -116,6 +116,13 @@ type Sink struct {
 	gaveUp     chan struct{}
 	gaveUpOnce sync.Once
 
+	// inflight counts samples taken out of the buffer for a send that has
+	// not finished. They still occupy the cap, so a writer cannot fill
+	// the hole and force the in-flight batch to be dropped on the way
+	// back in.
+	inflight int
+	room     sync.Cond
+
 	// batchBytes is the body budget actually in force, which starts at
 	// SinkConfig.BatchBytes and is halved whenever the store answers
 	// 413. See shrinkBatchBytes.
@@ -226,6 +233,7 @@ func NewSink(client *wire.Client, cfg SinkConfig, log Logger) *Sink {
 		gaveUp:   make(chan struct{}),
 		now:      time.Now,
 	}
+	s.room.L = &s.mu
 	s.batchBytes.Store(int64(cfg.BatchBytes))
 	s.wg.Add(1)
 	go s.flushLoop()
@@ -330,11 +338,14 @@ func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[strin
 	for k, v := range r.Labels {
 		labels[k] = v
 	}
-	sample := model.Sample{TSMs: r.TSMs, Labels: labels, Fields: r.Fields, KeyHint: keyHint}
+	sample := model.Sample{TSMs: r.TSMs, SubUS: r.SubUS, Labels: labels, Fields: r.Fields, KeyHint: keyHint}
 	if !s.encodable(r.Set, &sample) {
 		return nil
 	}
 
+	if err := s.waitRoom(ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.buffers[r.Set] = append(s.buffers[r.Set], sample)
 	s.pending++
@@ -342,6 +353,42 @@ func (s *Sink) Add(ctx context.Context, r extract.Result, streamLabels map[strin
 	s.mu.Unlock()
 	if full {
 		return s.Flush(ctx)
+	}
+	return nil
+}
+
+// waitRoom blocks until one more sample fits under MaxBufferedSamples.
+// The cap used to drop the oldest samples. Follow can re-read a file;
+// a receiver cannot, so the writers stop instead and the bytes stay
+// where they can be read again.
+func (s *Sink) waitRoom(ctx context.Context) error {
+	if s.cfg.MaxBufferedSamples <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.pending+s.inflight >= s.cfg.MaxBufferedSamples {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				s.mu.Lock()
+				s.room.Broadcast()
+				s.mu.Unlock()
+			case <-done:
+			}
+		}()
+		s.room.Wait()
+		close(done)
+		if s.pending+s.inflight < s.cfg.MaxBufferedSamples {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -396,6 +443,9 @@ func isLogMilestone(n int64) bool {
 func (s *Sink) AddSample(ctx context.Context, set string, sample model.Sample) error {
 	if !s.encodable(set, &sample) {
 		return nil
+	}
+	if err := s.waitRoom(ctx); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	s.buffers[set] = append(s.buffers[set], sample)
@@ -586,6 +636,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 			if fatal.Status == http.StatusRequestEntityTooLarge {
 				if to, again := s.shrinkBatchBytes(); again {
 					s.requeueBatches(batches, count)
+					s.releaseInflight(count)
 					s.requeueMeta(meta, sets)
 					s.log.Printf("WARNING the store refused a %d-sample request as too large (%v); halving the body budget to %d bytes and retrying", count, fatal, to)
 					return false, err
@@ -600,6 +651,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 			s.Stats.FatalDrop++
 			drops := s.Stats.FatalDrop
 			s.Stats.mu.Unlock()
+			s.releaseInflight(count)
 			s.log.Printf("ERROR store rejected %d samples: %v (first set %q)", count, fatal, firstSet(batches))
 			// The samples are gone. Telling the observers so is what stops
 			// a later successful flush from advancing a checkpoint over
@@ -624,6 +676,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 		// checkpoints -- froze them on every clean shutdown too.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.requeueBatches(batches, count)
+			s.releaseInflight(count)
 			s.requeueMeta(meta, sets)
 			return false, err
 		}
@@ -635,6 +688,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 		var authErr *wire.ErrAuth
 		if errors.As(err, &authErr) {
 			s.requeueBatches(batches, count)
+			s.releaseInflight(count)
 			s.requeueMeta(meta, sets)
 			s.holdDelivery(deliveryHold)
 			s.log.Printf("ERROR %v; holding %d buffered sample(s) and retrying in %s", authErr, count, deliveryHold)
@@ -651,6 +705,7 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 		if s.bufferedRoom(count) {
 			hold := s.retryHoldFor(err)
 			s.requeueBatches(batches, count)
+			s.releaseInflight(count)
 			s.requeueMeta(meta, sets)
 			s.holdDelivery(hold)
 			s.Stats.mu.Lock()
@@ -659,20 +714,18 @@ func (s *Sink) flushRound(ctx context.Context, obs []DeliveryObserver) (bool, er
 			s.log.Printf("WARNING %v; holding %d buffered sample(s) and retrying in %s", err, count, hold)
 			return false, err
 		}
-		// The buffer is full: the store has been refusing writes for long
-		// enough that holding more would cost the whole process. Only now
-		// is anything dropped, and it is said out loud -- an uncounted
-		// drop is indistinguishable from success.
-		s.Stats.mu.Lock()
-		s.Stats.Dropped += int64(count)
-		s.Stats.mu.Unlock()
-		s.log.Printf("ERROR gave up delivering %d samples: %v; %d already buffered, which is the %d-sample limit (first set %q)",
-			count, err, s.buffered(), s.cfg.MaxBufferedSamples, firstSet(batches))
-		s.reportLost(obs, partial)
+		// The buffer is at its cap. The samples go back and the writers
+		// block in waitRoom; dropping them is how a receiver lost data it
+		// cannot re-read. The hold keeps this from spinning.
+		s.requeueBatches(batches, count)
+		s.releaseInflight(count)
 		s.requeueMeta(meta, sets)
 		s.holdDelivery(s.retryHoldFor(err))
+		s.log.Printf("WARNING %v; the buffer is at its %d-sample cap, so writers are waiting rather than dropping samples (first set %q)",
+			err, s.cfg.MaxBufferedSamples, firstSet(batches))
 		return false, err
 	}
+	s.releaseInflight(count)
 	s.holdMu.Lock()
 	s.holdUntil = time.Time{}
 	s.holdMu.Unlock()
@@ -765,7 +818,23 @@ func (s *Sink) takeLocked(budget int) ([]model.Batch, int, bool) {
 		break
 	}
 	s.pending -= taken
+	s.inflight += taken
 	return batches, taken, s.pending > 0
+}
+
+// releaseInflight returns samples to the cap. n is the count takeLocked
+// moved out, whether they were delivered, requeued or dropped.
+func (s *Sink) releaseInflight(n int) {
+	if n == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.inflight -= n
+	if s.inflight < 0 {
+		s.inflight = 0
+	}
+	s.room.Broadcast()
+	s.mu.Unlock()
 }
 
 // Per-sample and per-batch JSON overheads, each counted as the encoder
@@ -921,113 +990,15 @@ func (s *Sink) reportLost(obs []DeliveryObserver, partial bool) {
 	s.endFlush(obs, 0, true)
 }
 
-// enforceBufferCap drops the oldest buffered samples when a held delivery
-// has let the buffer pass MaxBufferedSamples.
-//
-// Holding is only worth doing while there is somewhere to put the batch.
-// The cap used to be consulted only where a batch was put back, so while
-// delivery was held -- 30 seconds after a rejected credential, or as long
-// as a Retry-After the store chose -- Add kept appending with nothing
-// bounding it at all, and the outage the cap exists to survive became an
-// out-of-memory kill instead.
+// enforceBufferCap used to drop the oldest buffered samples once a held
+// delivery had filled the cap. Writers now block in waitRoom instead, so
+// a receiver that cannot re-read its source does not lose the tail. The
+// method remains so the hold path has somewhere to wake waiters.
 func (s *Sink) enforceBufferCap(obs []DeliveryObserver) {
-	if s.cfg.MaxBufferedSamples <= 0 {
-		return
-	}
+	_ = obs
 	s.mu.Lock()
-	over := s.pending - s.cfg.MaxBufferedSamples
-	if over <= 0 {
-		s.mu.Unlock()
-		return
-	}
-	sets := make([]string, 0, len(s.buffers))
-	for set := range s.buffers {
-		sets = append(sets, set)
-	}
-	sort.Strings(sets)
-	// Every set gives up the same share of its own oldest end, rather
-	// than the first set alphabetically giving up everything.
-	//
-	// The buffers are per-set FIFOs with no cross-set ordering to read,
-	// so "the globally oldest samples" is not a thing this structure can
-	// name. Draining the sorted list in order was the worst available
-	// approximation of it: with sets `access` and `zzz` over the cap,
-	// the whole of `access` was discarded before `zzz` lost a single
-	// sample, so one stream went dark while another was untouched. A
-	// proportional cut takes the oldest samples *within* each set and
-	// leaves every stream equally thinned, which is what an operator
-	// reading "the oldest buffered samples are dropped" would expect to
-	// see on a dashboard.
-	dropped := 0
-	target := over
-	for _, set := range sets {
-		if over <= 0 {
-			break
-		}
-		b := s.buffers[set]
-		if len(b) == 0 {
-			delete(s.buffers, set)
-			continue
-		}
-		// Rounded up, so a set holding a handful of samples still
-		// contributes and the loop always makes progress.
-		n := (len(b)*target + s.pending - 1) / s.pending
-		if n > over {
-			n = over
-		}
-		if n > len(b) {
-			n = len(b)
-		}
-		if n <= 0 {
-			continue
-		}
-		if n == len(b) {
-			delete(s.buffers, set)
-		} else {
-			s.buffers[set] = append([]model.Sample(nil), b[n:]...)
-		}
-		over -= n
-		dropped += n
-	}
-	// A rounding shortfall is finished off in order; by construction it
-	// is at most one sample per set.
-	for _, set := range sets {
-		if over <= 0 {
-			break
-		}
-		b := s.buffers[set]
-		n := over
-		if n > len(b) {
-			n = len(b)
-		}
-		if n <= 0 {
-			continue
-		}
-		if n == len(b) {
-			delete(s.buffers, set)
-		} else {
-			s.buffers[set] = append([]model.Sample(nil), b[n:]...)
-		}
-		over -= n
-		dropped += n
-	}
-	s.pending -= dropped
-	// The observers hear that the sink took these samples and lost them:
-	// a checkpoint that moved past them would bury them for good.
-	s.beginFlush(obs)
+	s.room.Broadcast()
 	s.mu.Unlock()
-
-	s.Stats.mu.Lock()
-	s.Stats.Dropped += int64(dropped)
-	total := s.Stats.Dropped
-	s.Stats.mu.Unlock()
-	// On the milestones: a store that is refusing writes makes this fire
-	// on every flush tick, and a line each would bury everything else.
-	if isLogMilestone(total) {
-		s.log.Printf("ERROR delivery is held and the buffer is full: dropped %d sample(s) from the oldest end of every buffered set, %d dropped in total, which is the %d-sample limit",
-			dropped, total, s.cfg.MaxBufferedSamples)
-	}
-	s.endFlush(obs, 0, true)
 }
 
 // discardMeta drops declarations the store refused outright.

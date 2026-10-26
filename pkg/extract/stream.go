@@ -19,6 +19,7 @@ import (
 type Result struct {
 	Set    string
 	TSMs   int64
+	SubUS  int
 	Labels map[string]string
 	Fields map[string]model.Value
 	Line   string
@@ -992,7 +993,7 @@ func (st *Stream) process(line string, ts time.Time) ([]Result, error) {
 		return out, err
 	}
 
-	out = append(out, Result{Set: set, TSMs: ts.UnixMilli(), Labels: labels, Fields: fields, Line: line})
+	out = append(out, Result{Set: set, TSMs: ts.UnixMilli(), SubUS: subUS(ts), Labels: labels, Fields: fields, Line: line})
 	st.Stats.Samples += int64(len(out))
 	return out, nil
 }

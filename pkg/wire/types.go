@@ -86,6 +86,10 @@ type WriteResponse struct {
 	// more than len(Rejected) once the cap above is reached.
 	RejectedCount    int   `json:"rejected_count,omitempty"`
 	CatalogueVersion int64 `json:"catalogue_version"`
+	// Durable is true when the accepted rows will survive a process
+	// crash. It is false for durability: batch, which keeps no WAL, unless
+	// the store flushed the memtable before answering.
+	Durable bool `json:"durable,omitempty"`
 }
 
 // Reject records one refused sample, naming it while the response has
@@ -123,9 +127,17 @@ type QueryRequest struct {
 	Options    QueryOptions `json:"options,omitempty"`
 }
 
-// QueryOptions carries the per-query safety overrides that a dashboard
-// exposes as variables: during an incident the operator sometimes really
-// does want the expensive query.
+// HeaderRequireDurable asks the store to flush a non-WAL memtable before
+// it acknowledges the write. Follow and receive send it, because their
+// checkpoints move on that acknowledgement and a crash must not skip
+// bytes the memtable then lost. Batch import does not: the source files
+// are re-readable and the flush would throw away the throughput the
+// mode exists for.
+const HeaderRequireDurable = "X-Mensura-Require-Durable"
+
+// QueryOptions carries per-query flags. DisableSeriesSafety and
+// DisableSizeSafety are accepted so an old panel still decodes, and
+// ignored: the ceilings belong to the store configuration.
 type QueryOptions struct {
 	DisableSeriesSafety bool `json:"disable_series_safety,omitempty"`
 	DisableSizeSafety   bool `json:"disable_size_safety,omitempty"`

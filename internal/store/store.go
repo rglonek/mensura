@@ -596,7 +596,7 @@ func Open(cfg Config) (*Store, error) {
 		dict:         map[string]*dictionary{},
 		setRetention: map[string]time.Duration{},
 		setShard:     map[string]time.Duration{},
-		idem:         newIdempotencyCache(4096),
+		idem:         newIdempotencyCache(100_000),
 		jobs:         make(chan struct{}, cfg.MaxConcurrentJobs),
 		started:      time.Now(),
 		stopCh:       make(chan struct{}),
@@ -1424,7 +1424,7 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		return 0, ErrClosed
 	}
 	defer s.leaveEngine()
-	dropped, forgotten, trimmed := 0, 0, 0
+	dropped, forgotten, trimmed, rowsDeleted := 0, 0, 0, 0
 	emptied := map[string]struct{}{}
 	for _, name := range s.db.Sets() {
 		i := strings.LastIndex(name, "@")
@@ -1433,6 +1433,22 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 		}
 		logical, suffix := name[:i], name[i+1:]
 		if suffix == shardAll {
+			// The unsharded shard has no time range in its name, so a
+			// range delete cannot name it. Rows older than the horizon
+			// are deleted one by one. A set that is still "keep
+			// everything" is left alone, which is what retention 0 means.
+			retention := s.retentionFor(logical)
+			if retention <= 0 {
+				continue
+			}
+			n, err := s.db.DeleteOlderThan(name, now.Add(-retention).UnixMilli())
+			if err != nil {
+				return dropped, err
+			}
+			if n > 0 {
+				rowsDeleted += n
+				emptied[logical] = struct{}{}
+			}
 			continue
 		}
 		retention := s.retentionFor(logical)
@@ -1528,7 +1544,125 @@ func (s *Store) RunRetention(now time.Time) (int, error) {
 			s.cfg.Logger.Printf("ERROR saving catalogue after retention emptied %d set(s) and trimmed the observed start of %d: %v", forgotten, trimmed, err)
 		}
 	}
+	// Dictionary entries are indices into every live row, so they can be
+	// freed only after the rows that named them are gone. A value no
+	// remaining row carries goes back to the cardinality budget; the
+	// index slot stays a hole so every row that still names it keeps
+	// resolving to the same string.
+	if dropped > 0 || rowsDeleted > 0 {
+		if n, err := s.reclaimDictionaries(); err != nil {
+			s.cfg.Logger.Printf("ERROR reclaiming label dictionary entries: %v", err)
+		} else if n > 0 {
+			s.cfg.Logger.Printf("retention reclaimed %d unused label value(s)", n)
+		}
+	}
 	return dropped, nil
+}
+
+// WritesAreDurable reports whether a successful write survives a crash.
+// batch durability keeps no WAL, so an acknowledgement is not a promise
+// the rows are still there after kill -9. stream and paranoid are.
+func (s *Store) WritesAreDurable() bool {
+	return s.cfg.Durability != "batch"
+}
+
+// reclaimDictionaries blanks label values no remaining row references.
+func (s *Store) reclaimDictionaries() (int, error) {
+	if !s.enterEngine() {
+		return 0, ErrClosed
+	}
+	defer s.leaveEngine()
+	s.dictMu.RLock()
+	keys := make([]string, 0, len(s.dict))
+	for k := range s.dict {
+		keys = append(keys, k)
+	}
+	s.dictMu.RUnlock()
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	used := map[string]map[int32]struct{}{}
+	mark := func(key string, idx int32) {
+		m, ok := used[key]
+		if !ok {
+			m = map[int32]struct{}{}
+			used[key] = m
+		}
+		m[idx] = struct{}{}
+	}
+	for _, shard := range s.db.Sets() {
+		it, err := s.db.Scan(context.Background(), shard, keys...)
+		if err == engine.ErrUnknownSet {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		for it.Next() {
+			_, row := it.Record()
+			for _, k := range keys {
+				v, ok := row[k]
+				if !ok {
+					continue
+				}
+				idx, ok := v.AsInt()
+				if !ok || idx < 0 || idx > math.MaxInt32 {
+					continue
+				}
+				mark(k, int32(idx))
+			}
+		}
+		err = it.Err()
+		_ = it.Close()
+		if err != nil {
+			return 0, err
+		}
+	}
+	s.dictMu.Lock()
+	defer s.dictMu.Unlock()
+	freed := 0
+	for label, d := range s.dict {
+		changed := false
+		for i, value := range d.Entries {
+			if value == "" {
+				continue
+			}
+			if _, live := used[label][int32(i)]; live {
+				continue
+			}
+			d.Entries[i] = ""
+			changed = true
+			freed++
+			if err := s.db.DeleteDict(dictEntryKey(label, int32(i))); err != nil {
+				return freed, err
+			}
+		}
+		if !changed {
+			continue
+		}
+		d.rebuildIndex()
+		packedKey := dictPackedPrefix + label
+		if raw, ok, err := s.db.GetDict(packedKey); err != nil {
+			return freed, err
+		} else if ok {
+			var packed dictionary
+			if err := json.Unmarshal(raw, &packed); err == nil && len(packed.Entries) > 0 {
+				for i := range packed.Entries {
+					if i < len(d.Entries) {
+						packed.Entries[i] = d.Entries[i]
+					}
+				}
+				b, err := json.Marshal(&packed)
+				if err != nil {
+					return freed, err
+				}
+				if err := s.db.PutDict(packedKey, b); err != nil {
+					return freed, err
+				}
+			}
+		}
+	}
+	return freed, nil
 }
 
 // oldestShardStartMs is the earliest instant the shards of a set can still

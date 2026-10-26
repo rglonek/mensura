@@ -15,6 +15,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -245,7 +247,19 @@ func isLoopbackAddr(addr string) (bool, error) {
 	if host == "" {
 		return false, nil // ":9631" binds every interface
 	}
-	if host == "localhost" {
+	// localhost is a name, and a name is only loopback when every address
+	// it resolves to is. Treating the string itself as loopback accepted
+	// a hosts file that points it at a routable address.
+	if strings.EqualFold(host, "localhost") {
+		ips, err := net.LookupIP("localhost")
+		if err != nil || len(ips) == 0 {
+			return false, nil
+		}
+		for _, ip := range ips {
+			if !ip.IsLoopback() {
+				return false, nil
+			}
+		}
 		return true, nil
 	}
 	ip := net.ParseIP(host)
@@ -283,9 +297,7 @@ func checkAuthPosture(cfg *fileConfig) error {
 			return fmt.Errorf("debug listener %s is not loopback-bound: the debug API has no authentication, so bind it to 127.0.0.1 or leave it unset", cfg.Listen.Debug.Addr)
 		}
 	}
-	if cfg.Auth.Mode != "" && cfg.Auth.Mode != "none" {
-		return nil
-	}
+	open := cfg.Auth.Mode == "" || cfg.Auth.Mode == "none"
 	for _, l := range []listenSpec{cfg.Listen.Write, cfg.Listen.Query, cfg.Listen.Metrics} {
 		if l.Addr == "" {
 			continue
@@ -294,8 +306,14 @@ func checkAuthPosture(cfg *fileConfig) error {
 		if err != nil {
 			return err
 		}
-		if !ok {
+		if ok {
+			continue
+		}
+		if open {
 			return fmt.Errorf("listener %s is not loopback-bound and auth is disabled: set auth.mode: bearer, or bind to 127.0.0.1", l.Addr)
+		}
+		if l.TLS.Cert == "" || l.TLS.Key == "" {
+			return fmt.Errorf("listener %s is not loopback-bound and has no TLS certificate: a bearer token on a cleartext socket is not authentication", l.Addr)
 		}
 	}
 	return nil
@@ -311,7 +329,7 @@ func checkAuthPosture(cfg *fileConfig) error {
 // ...", and then sat on <-ctx.Done() serving nothing.
 func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger *log.Logger) ([]*http.Server, error) {
 	var servers []*http.Server
-	start := func(name, addr string, h http.Handler, tls listenSpec) error {
+	start := func(name, addr string, h http.Handler, spec listenSpec) error {
 		if addr == "" {
 			return nil
 		}
@@ -331,10 +349,17 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 			return fmt.Errorf("%s listener on %s: %w", name, addr, err)
 		}
 		servers = append(servers, srv)
+		tlsCfg, err := spec.serverConfig()
+		if err != nil {
+			return fmt.Errorf("%s listener: %w", name, err)
+		}
 		go func() {
 			var err error
-			if tls.TLS.Cert != "" && tls.TLS.Key != "" {
-				err = srv.ServeTLS(ln, tls.TLS.Cert, tls.TLS.Key)
+			if tlsCfg != nil {
+				srv.TLSConfig = tlsCfg
+				err = srv.Serve(tls.NewListener(ln, tlsCfg))
+			} else if spec.TLS.Cert != "" && spec.TLS.Key != "" {
+				err = srv.ServeTLS(ln, spec.TLS.Cert, spec.TLS.Key)
 			} else {
 				err = srv.Serve(ln)
 			}
@@ -351,7 +376,7 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 		spec listenSpec
 		h    http.Handler
 	}{
-		{"api", cfg.Listen.Write, api.Handler()},
+		{"api", cfg.Listen.Write, apiHandler(cfg, api)},
 		// The read surface only. An address an operator publishes to
 		// Grafana must not also accept /v1/write and /v1/admin/*.
 		// checkAuthPosture refuses a query address equal to the write
@@ -380,6 +405,43 @@ func startListeners(ctx context.Context, cfg *fileConfig, api *store.API, logger
 		shutdown(servers)
 	}()
 	return servers, nil
+}
+
+// apiHandler is the write listener. With auth off it does not mount
+// admin routes: every local process can open the loopback socket, and
+// dropping a set needs a bearer credential with the admin scope.
+func apiHandler(cfg *fileConfig, api *store.API) http.Handler {
+	if cfg.Auth.Mode == "" || cfg.Auth.Mode == "none" {
+		return api.DataHandler()
+	}
+	return api.Handler()
+}
+
+func (l listenSpec) serverConfig() (*tls.Config, error) {
+	if l.TLS.ClientCA == "" {
+		return nil, nil
+	}
+	if l.TLS.Cert == "" || l.TLS.Key == "" {
+		return nil, fmt.Errorf("tls.client_ca requires tls.cert and tls.key")
+	}
+	cert, err := tls.LoadX509KeyPair(l.TLS.Cert, l.TLS.Key)
+	if err != nil {
+		return nil, err
+	}
+	pem, err := os.ReadFile(l.TLS.ClientCA)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("tls.client_ca %s contains no certificates", l.TLS.ClientCA)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 func shutdown(servers []*http.Server) {

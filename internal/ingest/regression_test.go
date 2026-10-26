@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -663,11 +664,9 @@ func TestRetryExhaustionRequeuesRatherThanDropping(t *testing.T) {
 	}
 }
 
-// Holding is only worth doing while there is somewhere to put the batch.
-// Past the buffer cap the oldest batch is dropped, counted and reported as
-// a hole -- an unbounded buffer turns a store outage into an out-of-memory
-// kill that loses everything rather than the tail.
-func TestAFullBufferStillDropsAndSaysSo(t *testing.T) {
+// Past the buffer cap a writer blocks. Dropping the oldest samples is how
+// a receiver, which has nothing to re-read, lost data during an outage.
+func TestAFullBufferBlocksInsteadOfDropping(t *testing.T) {
 	guard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "0")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -683,21 +682,26 @@ func TestAFullBufferStillDropsAndSaysSo(t *testing.T) {
 	sink := NewSink(client, cfg, testLogger{t})
 	defer func() { _ = sink.Close(context.Background()) }()
 	ctx := context.Background()
-	for i := 1; i <= 3; i++ {
+	for i := 1; i <= 2; i++ {
 		if err := sink.AddSample(ctx, "lines", model.Sample{
 			TSMs: int64(1000 + i), Fields: map[string]model.Value{"n": model.Int(int64(i))},
 		}); err != nil {
 			t.Fatalf("add: %v", err)
 		}
 	}
-	// The hold is stepped over between flushes; each one finds the buffer
-	// fuller than the last.
-	for i := 0; i < 3; i++ {
-		sink.setClock(func() time.Time { return time.Now().Add(time.Duration(i+1) * 2 * retryHold) })
-		_ = sink.Flush(ctx)
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	err := sink.AddSample(short, "lines", model.Sample{
+		TSMs: 1003, Fields: map[string]model.Value{"n": model.Int(3)},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("add past the cap returned %v, want the context deadline", err)
 	}
-	if got := sink.Snapshot().Dropped; got == 0 {
-		t.Fatal("the buffer cap was passed and nothing was counted as dropped")
+	if got := sink.Snapshot().Dropped; got != 0 {
+		t.Fatalf("dropped %d sample(s) at the cap; writers should block", got)
+	}
+	if got := sink.buffered(); got != 2 {
+		t.Fatalf("buffered %d, want the two samples that fit", got)
 	}
 }
 
@@ -856,22 +860,27 @@ func TestAHeldDeliveryStillHonoursTheBufferCap(t *testing.T) {
 	sink.Observe(obs)
 
 	ctx := context.Background()
-	for i := 0; i < 400; i++ {
-		if err := sink.AddSample(ctx, "lines", sampleN(int64(i))); err != nil && i == 0 {
-			t.Fatalf("add: %v", err)
-		}
+	for i := 0; i < cfg.MaxBufferedSamples; i++ {
+		// A full batch is flushed and the store answers 503. The samples
+		// are put back; the error is the store's, not a refusal to hold them.
+		_ = sink.AddSample(ctx, "lines", sampleN(int64(i)))
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := sink.AddSample(short, "lines", sampleN(1000)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("add past the cap returned %v, want the context deadline", err)
 	}
 	if got := sink.buffered(); got > cfg.MaxBufferedSamples {
 		t.Errorf("buffered %d samples against a cap of %d: the hold ignores the limit", got, cfg.MaxBufferedSamples)
 	}
-	if got := sink.Snapshot().Dropped; got == 0 {
-		t.Error("samples were discarded past the cap without being counted")
+	if got := sink.Snapshot().Dropped; got != 0 {
+		t.Errorf("dropped %d sample(s); a full buffer should block the writer", got)
 	}
 	obs.mu.Lock()
 	drops := *obs.drops
 	obs.mu.Unlock()
-	if drops == 0 {
-		t.Error("the observers were not told the samples were lost, so a checkpoint could advance over them")
+	if drops != 0 {
+		t.Errorf("observers were told %d samples were lost", drops)
 	}
 }
 
@@ -1078,15 +1087,8 @@ func TestSplitCRLFIsStillATerminator(t *testing.T) {
 	}
 }
 
-// The buffer cap takes its cut from the oldest end of every buffered set
-// in proportion to its size.
-//
-// Draining the sorted set list in order was the worst available
-// approximation of "the oldest samples": with sets `access` and `zzz`
-// over the cap, the whole of `access` was discarded before `zzz` lost a
-// single sample, so one stream went dark on the dashboard while another
-// was untouched.
-func TestBufferCapDoesNotEmptyOneSetBeforeTouchingAnother(t *testing.T) {
+// A full buffer blocks rather than discarding one set to spare another.
+func TestBufferCapKeepsEverySet(t *testing.T) {
 	rs := newRejectingStore(false)
 	defer rs.srv.Close()
 	client := wire.NewClient(rs.srv.URL, "")
@@ -1100,7 +1102,7 @@ func TestBufferCapDoesNotEmptyOneSetBeforeTouchingAnother(t *testing.T) {
 	defer func() { _ = s.Close(context.Background()) }()
 
 	ctx := context.Background()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 50; i++ {
 		if err := s.AddSample(ctx, "access", sampleN(int64(i))); err != nil {
 			t.Fatalf("add access: %v", err)
 		}
@@ -1108,31 +1110,19 @@ func TestBufferCapDoesNotEmptyOneSetBeforeTouchingAnother(t *testing.T) {
 			t.Fatalf("add zzz: %v", err)
 		}
 	}
-	// Delivery is held, so Flush enforces the cap instead of writing.
 	s.holdDelivery(time.Hour)
 	if err := s.Flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-
 	s.mu.Lock()
 	access, zzz := len(s.buffers["access"]), len(s.buffers["zzz"])
-	pending := s.pending
-	s.mu.Unlock()
-	if pending != cfg.MaxBufferedSamples {
-		t.Fatalf("expected the buffer to be trimmed to %d, got %d", cfg.MaxBufferedSamples, pending)
-	}
-	if access == 0 || zzz == 0 {
-		t.Fatalf("one set was emptied while the other was spared: access=%d zzz=%d", access, zzz)
-	}
-	// Each set gave up roughly the same share, and each kept its newest.
-	if access < 40 || zzz < 40 {
-		t.Fatalf("the cut was not proportional: access=%d zzz=%d", access, zzz)
-	}
-	s.mu.Lock()
 	first, _ := s.buffers["access"][0].Fields["n"].AsInt()
 	s.mu.Unlock()
-	if first == 0 {
-		t.Fatal("the cut must come off the oldest end of each set")
+	if access != 50 || zzz != 50 {
+		t.Fatalf("a held flush changed the buffer: access=%d zzz=%d", access, zzz)
+	}
+	if first != 0 {
+		t.Fatalf("the oldest access sample is %d; nothing should have been trimmed", first)
 	}
 }
 

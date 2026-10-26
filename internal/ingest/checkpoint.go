@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -22,6 +23,20 @@ type Checkpoint struct {
 	Offset           int64 `json:"offset"`
 	AckedOffset      int64 `json:"acked_offset"`
 	UpdatedUnix      int64 `json:"updated_unix"`
+	// PendingTail is a rotated file whose unread bytes must be finished
+	// after a restart. The live path's checkpoint cannot name them: the
+	// replacement file is a different inode, and resuming it at the old
+	// offset skips the tail that was still in the renamed file.
+	PendingTail *RotatedTail `json:"pending_tail,omitempty"`
+}
+
+// RotatedTail is one renamed file that still holds bytes this process
+// had not yet acknowledged.
+type RotatedTail struct {
+	Path             string `json:"path"`
+	Offset           int64  `json:"offset"`
+	Fingerprint      string `json:"fingerprint,omitempty"`
+	FingerprintBytes int    `json:"fingerprint_bytes,omitempty"`
 }
 
 // CheckpointStore persists checkpoints as one small JSON file per stream,
@@ -122,4 +137,27 @@ func (c *CheckpointStore) Save(cp *Checkpoint) error {
 		_ = d.Close()
 	}
 	return nil
+}
+
+// List reads every checkpoint in the directory.
+func (c *CheckpointStore) List() ([]*Checkpoint, error) {
+	if c.dir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []*Checkpoint
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		stream := strings.TrimSuffix(name, ".json")
+		if cp, ok := c.Load(stream); ok && cp.PendingTail != nil {
+			out = append(out, cp)
+		}
+	}
+	return out, nil
 }

@@ -829,17 +829,17 @@ func (p *parser) parseUnary() (Expr, error) {
 	}
 	switch {
 	case p.acceptPunct("="):
-		v, err := p.valueOrVar()
+		v, lit, err := p.valueOrVar()
 		if err != nil {
 			return Expr{}, err
 		}
-		return Expr{Eq: &Compare{Label: label, Value: v}}, nil
+		return Expr{Eq: &Compare{Label: label, Value: v, Literal: lit}}, nil
 	case p.acceptPunct("!="):
-		v, err := p.valueOrVar()
+		v, lit, err := p.valueOrVar()
 		if err != nil {
 			return Expr{}, err
 		}
-		return Expr{Ne: &Compare{Label: label, Value: v}}, nil
+		return Expr{Ne: &Compare{Label: label, Value: v, Literal: lit}}, nil
 	case p.acceptPunct("=~"):
 		re, err := p.regex()
 		if err != nil {
@@ -857,12 +857,16 @@ func (p *parser) parseUnary() (Expr, error) {
 			return Expr{}, p.errf("expected ( after IN")
 		}
 		var vals []string
+		var lits []bool
+		anyLit := false
 		for {
-			v, err := p.valueOrVar()
+			v, lit, err := p.valueOrVar()
 			if err != nil {
 				return Expr{}, err
 			}
 			vals = append(vals, v)
+			lits = append(lits, lit)
+			anyLit = anyLit || lit
 			if !p.acceptPunct(",") {
 				break
 			}
@@ -870,7 +874,11 @@ func (p *parser) parseUnary() (Expr, error) {
 		if !p.acceptPunct(")") {
 			return Expr{}, p.errf("expected ) to close IN")
 		}
-		return Expr{In: &InList{Label: label, Values: vals}}, nil
+		in := &InList{Label: label, Values: vals}
+		if anyLit {
+			in.Literal = lits
+		}
+		return Expr{In: in}, nil
 	}
 	return Expr{}, p.errf("expected a comparison operator after %q", label)
 }
@@ -878,20 +886,27 @@ func (p *parser) parseUnary() (Expr, error) {
 // valueOrVar accepts a literal or a Grafana variable reference. Variables
 // stay in the AST as "$name" and are resolved at execution time, so the
 // stored panel query is exactly what the author wrote.
-func (p *parser) valueOrVar() (string, error) {
+// valueOrVar accepts a literal or a Grafana variable reference.
+//
+// A bare $name is a variable. A quoted "$name" is the literal text, which
+// is the only spelling that can query a label value that really is
+// "$name". The literal bit is what keeps the two apart in the JSON AST;
+// without it both were the string "$name" and the unsubstituted-variable
+// check refused the literal.
+func (p *parser) valueOrVar() (string, bool, error) {
 	t := p.cur()
 	switch t.kind {
-	case tokString, tokIdent, tokNumber:
+	case tokString:
 		p.i++
-		return t.text, nil
+		return t.text, IsVariable(t.text), nil
+	case tokIdent, tokNumber:
+		p.i++
+		return t.text, false, nil
 	case tokVariable:
-		// The reference stays in the AST as "$name"; Variables(q) walks
-		// it back out. Accumulating a second copy here was dead weight:
-		// nothing ever read it, because Parse does not return it.
 		p.i++
-		return "$" + t.text, nil
+		return "$" + t.text, false, nil
 	}
-	return "", p.errf("expected a value, found %s", p.describe(t))
+	return "", false, p.errf("expected a value, found %s", p.describe(t))
 }
 
 func (p *parser) regex() (string, error) {

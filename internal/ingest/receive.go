@@ -3,6 +3,8 @@ package ingest
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/rglonek/mensura/pkg/extract"
 	"github.com/rglonek/mensura/pkg/model"
+	"github.com/zeebo/xxh3"
 )
 
 // ReceiveOptions configure the network listeners. Received traffic is
@@ -47,16 +50,94 @@ type ReceiveOptions struct {
 	MaxPeers int
 	// PeerIdle is how long a peer's state is kept after its last record.
 	PeerIdle time.Duration
-	// MaxConnections bounds simultaneously served TCP connections. Each
-	// one holds a read buffer and a goroutine for up to connIdleTimeout,
+	// MaxConnections bounds simultaneously served TCP and HTTP connections.
+	// Each one holds a read buffer and a goroutine for up to connIdleTimeout,
 	// so accepting them without limit is an unbounded footprint that
 	// MaxPeers does not cover: one sender can open thousands.
 	MaxConnections int
+	// TLSCert and TLSKey wrap the TCP and HTTP listeners. A non-loopback
+	// bind requires them. UDP has no TLS; a non-loopback UDP bind requires
+	// AllowedSources instead, and the operator is told that a UDP source
+	// address can be spoofed.
+	TLSCert string
+	TLSKey  string
+	// Token is the bearer secret for the HTTP listener. A non-loopback
+	// HTTP bind requires it. Empty on loopback accepts anyone who can
+	// open the socket, which is the same posture as the store.
+	Token string
+}
+
+// CheckReceivePosture refuses an open ingest listener. The store will not
+// bind a cleartext write API off loopback; receive is that write API with
+// the ingester's credential behind it.
+func CheckReceivePosture(opts ReceiveOptions) error {
+	check := func(name, addr string, needsTLS, needsToken bool) error {
+		if addr == "" {
+			return nil
+		}
+		ok, err := loopbackListen(addr)
+		if err != nil {
+			return fmt.Errorf("%s listener: %w", name, err)
+		}
+		if ok {
+			return nil
+		}
+		if len(opts.AllowedSources) == 0 {
+			return fmt.Errorf("%s listener %s is not loopback-bound and --allow-source is empty: this process would accept records from anyone who can reach it", name, addr)
+		}
+		if needsTLS && (opts.TLSCert == "" || opts.TLSKey == "") {
+			return fmt.Errorf("%s listener %s is not loopback-bound and has no TLS certificate (--tls-cert and --tls-key)", name, addr)
+		}
+		if needsToken && opts.Token == "" {
+			return fmt.Errorf("http listener %s is not loopback-bound and --receive-token is empty", addr)
+		}
+		if name == "udp" {
+			return fmt.Errorf("udp listener %s cannot prove who sent a datagram: bind it to 127.0.0.1, or send the stream over TCP or HTTP with TLS", addr)
+		}
+		return nil
+	}
+	if err := check("tcp", opts.TCPAddr, true, false); err != nil {
+		return err
+	}
+	if err := check("udp", opts.UDPAddr, false, false); err != nil {
+		return err
+	}
+	return check("http", opts.HTTPAddr, true, true)
+}
+
+func loopbackListen(addr string) (bool, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false, fmt.Errorf("listen address %q: %w", addr, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false, nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		ips, err := net.LookupIP(host)
+		if err != nil || len(ips) == 0 {
+			return false, nil
+		}
+		for _, ip := range ips {
+			if !ip.IsLoopback() {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false, nil
+	}
+	return ip.IsLoopback(), nil
 }
 
 // Receive binds the configured listeners and serves until the context is
 // cancelled.
 func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
+	if err := CheckReceivePosture(opts); err != nil {
+		return err
+	}
 	if opts.MaxDatagramBytes <= 0 {
 		opts.MaxDatagramBytes = 64 << 10
 	}
@@ -129,6 +210,12 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 		if err != nil {
 			return abandon(fmt.Errorf("ingest: tcp listener on %s: %w", opts.TCPAddr, err))
 		}
+		wln, err := tlsWrap(ln, opts)
+		if err != nil {
+			_ = ln.Close()
+			return abandon(err)
+		}
+		ln = wln
 		bound = append(bound, ln)
 		listeners = append(listeners, listener{"tcp", func() error { return r.serveTCP(serveCtx, ln) }})
 	}
@@ -149,6 +236,12 @@ func (i *Ingest) Receive(ctx context.Context, opts ReceiveOptions) error {
 		if err != nil {
 			return abandon(fmt.Errorf("ingest: http listener on %s: %w", opts.HTTPAddr, err))
 		}
+		wln, err := tlsWrap(ln, opts)
+		if err != nil {
+			_ = ln.Close()
+			return abandon(err)
+		}
+		ln = &gateListener{Listener: wln, sem: r.conns, log: i.cfg.Log}
 		bound = append(bound, ln)
 		listeners = append(listeners, listener{"http", func() error { return r.serveHTTP(serveCtx, ln) }})
 	}
@@ -341,11 +434,11 @@ func (r *receiver) streamLocked(peer string) (*peerStream, map[string]string, []
 	if len(r.streams) >= r.opts.MaxPeers {
 		return nil, labels, evicted, fmt.Errorf("too many active senders (%d); %s is not being tracked", r.opts.MaxPeers, peer)
 	}
-	profile := r.ing.cfg.Spec.SelectProfile("", nil, labels, r.opts.Listener)
+	profile := r.ing.Spec().SelectProfile("", nil, labels, r.opts.Listener)
 	if profile == nil {
 		return nil, labels, evicted, fmt.Errorf("no profile matched listener %q", r.opts.Listener)
 	}
-	ex, err := r.ing.cfg.Spec.NewStream(profile, extract.StreamOptions{
+	ex, err := r.ing.Spec().NewStream(profile, extract.StreamOptions{
 		RefTime: now, From: r.ing.cfg.From, To: r.ing.cfg.To,
 	})
 	if err != nil {
@@ -691,6 +784,10 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
+		if !r.httpAuthorised(req) {
+			http.Error(w, "not authorised", http.StatusUnauthorized)
+			return
+		}
 		// Framed through readRecord, like every other acquisition path.
 		// Splitting the body on "\n" made this the one listener that did
 		// not share the framing: --max-record-bytes was silently ignored
@@ -831,6 +928,10 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			http.Error(w, "sender is not in allowed_sources", http.StatusForbidden)
 			return
 		}
+		if !r.httpAuthorised(req) {
+			http.Error(w, "not authorised", http.StatusUnauthorized)
+			return
+		}
 		// One byte of headroom past the cap, so a body that overran it is
 		// distinguishable from one that ended on it. A plain LimitReader
 		// at the cap handed the decoder a truncated document, so a sender
@@ -838,13 +939,22 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 		// "unexpected end of JSON input" -- which sends it looking for a
 		// bug in what it encoded. The lines endpoint beside it already
 		// answers 413 and says to split the request.
-		limited := &io.LimitedReader{R: req.Body, N: maxHTTPBodyBytes + 1}
-		derr := json.NewDecoder(limited).Decode(&body)
-		if limited.N == 0 {
+		raw, rerr := io.ReadAll(io.LimitReader(req.Body, maxHTTPBodyBytes+1))
+		if int64(len(raw)) > maxHTTPBodyBytes {
 			http.Error(w, fmt.Sprintf("request body is larger than the limit of %d bytes; split it across requests", maxHTTPBodyBytes),
 				http.StatusRequestEntityTooLarge)
 			return
 		}
+		if rerr != nil {
+			http.Error(w, rerr.Error(), http.StatusBadRequest)
+			return
+		}
+		// The hint is a hash of this body, not an arrival counter. A retry
+		// of the same request then names the same offset-key rows, instead
+		// of writing them again under a new sequence.
+		sum := xxh3.Hash128(raw).Bytes()
+		bodyKey := fmt.Sprintf("%x", sum[:])
+		derr := json.Unmarshal(raw, &body)
 		if derr != nil {
 			http.Error(w, derr.Error(), http.StatusBadRequest)
 			return
@@ -891,7 +1001,7 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 			// sample. A caller that supplied its own knows its stream
 			// better than this listener does, so it wins.
 			if s.KeyHint == "" {
-				s.KeyHint = keyHint(peer, r.arrivalPos(), i)
+				s.KeyHint = keyHint(peer, bodyKey, i)
 			}
 			// Checked here rather than left to the store: the sender is
 			// waiting for an answer, and the store's rejection reaches it
@@ -905,7 +1015,12 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 				continue
 			}
 			if err := r.ing.cfg.Sink.AddSample(req.Context(), body.Set, s); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": err.Error(), "accepted": accepted, "refused": refused,
+				})
 				return
 			}
 			accepted++
@@ -973,6 +1088,69 @@ func (r *receiver) serveHTTP(ctx context.Context, ln net.Listener) error {
 // the process from shutting down; one that will has to reach the sink
 // before the final flush.
 const httpDrainGrace = 10 * time.Second
+
+func tlsWrap(ln net.Listener, opts ReceiveOptions) (net.Listener, error) {
+	if opts.TLSCert == "" && opts.TLSKey == "" {
+		return ln, nil
+	}
+	cert, err := tls.LoadX509KeyPair(opts.TLSCert, opts.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("ingest: tls: %w", err)
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	return tls.NewListener(ln, cfg), nil
+}
+
+// gateListener caps accepted connections. A connection past the cap is
+// closed, the same way the TCP listener refuses one, so a slow HTTP
+// sender cannot hold an unbounded number of 32 MiB bodies.
+type gateListener struct {
+	net.Listener
+	sem chan struct{}
+	log Logger
+}
+
+func (g *gateListener) Accept() (net.Conn, error) {
+	for {
+		c, err := g.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case g.sem <- struct{}{}:
+			return &gatedConn{Conn: c, sem: g.sem}, nil
+		default:
+			if g.log != nil {
+				g.log.Printf("WARNING refused http connection from %s: connection limit reached", hostOf(c.RemoteAddr().String()))
+			}
+			_ = c.Close()
+		}
+	}
+}
+
+type gatedConn struct {
+	net.Conn
+	sem  chan struct{}
+	once sync.Once
+}
+
+func (c *gatedConn) Close() error {
+	c.once.Do(func() { <-c.sem })
+	return c.Conn.Close()
+}
+
+func (r *receiver) httpAuthorised(req *http.Request) bool {
+	if r.opts.Token == "" {
+		return true
+	}
+	h := req.Header.Get("Authorization")
+	const scheme = "bearer "
+	if len(h) < len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
+		return false
+	}
+	token := h[len(scheme):]
+	return subtle.ConstantTimeCompare([]byte(token), []byte(r.opts.Token)) == 1
+}
 
 func writeJSONOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

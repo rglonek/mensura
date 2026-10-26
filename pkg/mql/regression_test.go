@@ -65,6 +65,25 @@ func TestUnsubstitutedVariableIsAnError(t *testing.T) {
 	}
 }
 
+// A quoted "$host" is the literal text of a label value. The bare form is
+// the variable. Round-tripping keeps them apart.
+func TestQuotedDollarIsALiteralValue(t *testing.T) {
+	q, err := Parse(`FROM http SELECT inflight WHERE host = "$host"`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where.Eq == nil || !q.Where.Eq.Literal || q.Where.Eq.Value != "$host" {
+		t.Fatalf("quoted $host = %+v", q.Where.Eq)
+	}
+	if _, verr := Validate(q, testSchema{}, 0, 0); verr != nil {
+		t.Fatalf("a literal $host must validate: %v", verr)
+	}
+	again, err := Parse(Print(q))
+	if err != nil || again.Where.Eq == nil || !again.Where.Eq.Literal {
+		t.Fatalf("round trip lost the literal: %v %+v", err, again)
+	}
+}
+
 // A number with two decimal points is a parse error with a position, not a
 // bare strconv failure.
 func TestMalformedNumberIsAPositionedParseError(t *testing.T) {

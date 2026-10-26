@@ -45,7 +45,11 @@ const (
 // Sample is one extracted measurement: a timestamp, the labels that
 // identify its stream, and the fields it carries.
 type Sample struct {
-	TSMs    int64             `json:"ts_ms"`
+	TSMs int64 `json:"ts_ms"`
+	// SubUS is the microseconds within TSMs, 0..999. Storage and the
+	// render walk stay in milliseconds; the fraction exists so two events
+	// in the same millisecond do not collapse into one content key.
+	SubUS   int               `json:"sub_us,omitempty"`
 	Labels  map[string]string `json:"labels,omitempty"`
 	Fields  map[string]Value  `json:"fields"`
 	KeyHint string            `json:"key_hint,omitempty"`
@@ -68,6 +72,9 @@ func (s *Sample) Validate() error {
 	}
 	if s.TSMs > MaxTSMs {
 		return fmt.Errorf("sample timestamp %d is beyond %d (9999-12-31T23:59:59.999Z); a value this large is usually epoch nanoseconds or microseconds declared as milliseconds", s.TSMs, MaxTSMs)
+	}
+	if s.SubUS < 0 || s.SubUS > 999 {
+		return fmt.Errorf("sample sub_us %d is outside 0..999", s.SubUS)
 	}
 	if len(s.Fields) == 0 {
 		return ErrNoFields

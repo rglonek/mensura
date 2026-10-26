@@ -1,8 +1,9 @@
 # Grafana plugin package
 
 The backend datasource is implemented (`internal/plugin`, served by
-`mensura-store --mode=plugin`); the React query editor is not built yet, so
-this directory holds the packaging pieces rather than an installable plugin.
+`mensura-store --mode=plugin`). The query editor lives in `src/` and posts
+MQL text to the backend `parse` resource, which is the only parser. Build it
+with `npm install && npm run build`; Grafana loads `dist/module.js`.
 
 What is here:
 
@@ -12,8 +13,8 @@ What is here:
 - `provisioning/datasources/mensura.yaml` — datasource provisioning for both
   topologies.
 
-Until the frontend exists, a panel supplies its query as the MQL **AST** in
-the query model:
+A panel can still supply the MQL AST directly. The editor stores the same AST
+after a successful parse:
 
 ```json
 { "ast": { "from": "app",
