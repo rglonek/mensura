@@ -4559,6 +4559,46 @@ from "no array" before it can draw what the gate did return.
   `engine.DB.CounterSnapshot` — which is what this endpoint mostly
   reports.
 
+### 6.207 Year-less timestamps, mid-line strip, timestamp-less continuations, L008 on a route
+
+- **A year-less timestamp wrap only ever decremented.** Classic syslog
+  has no year. Applying `assume_year` and then rolling *back* a year when
+  the result is more than half a year ahead of the previous record is
+  the documented December line of a file whose mtime is in January. The
+  other half of the same wrap was missing: a `follow` or `receive` that
+  stayed open across New Year saw `Jan  1` after `Dec 31` and dated it
+  as last January, because that landing is in the *past* of the previous
+  record and the decrement never fired. A long-lived UDP syslog peer
+  never even gets a new `Stream`, so every record after midnight on
+  1 January was a year behind for as long as the peer kept sending. The
+  first record of a stream had no previous record to wrap against either,
+  so a batch whose first line was in December and whose mtime was in
+  January dated that December a year into the future. The wrap now steps
+  toward the previous record — or, for the first record, toward the
+  reference time — in either direction, and the stream's `assumeYear` is
+  updated from each resolved timestamp so a six-month gap after the wrap
+  does not stop wrapping.
+- **`strip: true` dropped the prefix of a mid-line timestamp.** The
+  match offset was used as a slice start, so everything *before* the
+  timestamp went with it. `anchor: anywhere` plus `strip: true` turned
+  `web1 app[42]: 2024-01-01T00:00:00Z n=5` into ` n=5`, and the pattern
+  that searched for `app[` never saw the line. Strip now splices the
+  match out and keeps the rest.
+- **A multiline continuation had to carry a timestamp.** `Process`
+  parsed the timestamp before it looked at `continue_regex`, so a Java
+  or Python stack frame with no timestamp of its own was counted as a
+  parse error and never joined. `continue_regex` is the only test the
+  design applies to a candidate continuation; the start line's timestamp
+  is the record's. Continuations are absorbed first. A continuation that
+  *does* carry a timestamp still trips the regression check.
+- **`L008` attributed every capture of a pattern to every destination
+  it can write.** A route uses the matching regex's own names, which is
+  the split `Declarations` already makes, so a parent extract group
+  named `code` and a later pattern that writes `code` as a label on the
+  *route's* set were reported as a fatal collision on a column the route
+  never actually produces. The lint now walks the same per-branch
+  captures `Declarations` does.
+
 
 ## 7. Known gaps worth naming
 

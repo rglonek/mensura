@@ -160,28 +160,38 @@ func (s *Spec) lintColumnNamespace() []Lint {
 	for _, p := range s.Profiles {
 		for pi, pat := range p.Patterns {
 			origin := columnOrigin{profile: p.Name, pattern: pi + 1}
-			for _, set := range patternDestinations(pat) {
-				for _, name := range patternCaptureNames(pat) {
+			var shared []string
+			for k := range pat.DefaultValues {
+				shared = append(shared, k)
+			}
+			if pat.Aggregate != nil && pat.Aggregate.Field != "" {
+				shared = append(shared, pat.Aggregate.Field)
+			}
+			for _, b := range patternBranches(pat) {
+				if b.set == "" {
+					continue
+				}
+				for _, name := range append(append([]string{}, b.captures...), shared...) {
 					if name == "" || name == "buckets" || name == "histogram" {
 						continue // payloads expand() consumes, never columns
 					}
 					if isDeclaredLabel(p, pat, name) {
-						note(labels, set, name, origin)
+						note(labels, b.set, name, origin)
 						continue
 					}
-					note(fields, set, name, origin)
+					note(fields, b.set, name, origin)
 				}
 				// The columns a bucket set expands into are fields like
 				// any other, and they are written straight onto the row.
 				if bs, ok := p.buckets[pat.BucketSet]; ok && pat.BucketSet != "" {
-					for _, b := range bs.Buckets {
-						note(fields, set, b, origin)
+					for _, col := range bs.Buckets {
+						note(fields, b.set, col, origin)
 						if bs.Cumulative {
-							note(fields, set, b+"plus", origin)
+							note(fields, b.set, col+"plus", origin)
 						}
 					}
 					if bs.Tail {
-						note(fields, set, tailField, origin)
+						note(fields, b.set, tailField, origin)
 					}
 				}
 			}
@@ -209,12 +219,9 @@ func (s *Spec) lintColumnNamespace() []Lint {
 // match, plus one per route.
 func patternDestinations(pat *Pattern) []string {
 	var out []string
-	if len(pat.extract) > 0 && pat.Set != "" {
-		out = append(out, pat.Set)
-	}
-	for i := range pat.Route {
-		if pat.Route[i].Set != "" {
-			out = append(out, pat.Route[i].Set)
+	for _, b := range patternBranches(pat) {
+		if b.set != "" {
+			out = append(out, b.set)
 		}
 	}
 	return out

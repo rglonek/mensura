@@ -129,3 +129,30 @@ profiles:
 		t.Fatalf("L008 reported for a fields: declaration on a label: %s", l.Msg)
 	}
 }
+
+// A route writes only the captures its own regex produces. Attributing
+// the parent extract groups to the route's destination made L008 fire
+// for a set that never actually received the colliding name.
+func TestLintColumnNamespaceRouteCapturesArePerBranch(t *testing.T) {
+	lints := lintCodes(t, `
+version: 1
+profiles:
+  - name: p
+    timestamp:
+      formats: [{layout: epoch_ms, regex: '^\d{13}'}]
+    patterns:
+      - set: a
+        search: 'X '
+        extract: ['X code=(?P<code>\d+) v=(?P<v>\d+)']
+        route:
+          - regex: 'X y=(?P<y>\d+)'
+            set: b
+      - set: b
+        search: 'Y '
+        labels: [code]
+        extract: ['Y code=(?P<code>\w+) y=(?P<y>\d+)']
+`)
+	if l := hasCode(lints, "L008"); l != nil {
+		t.Fatalf("L008 reported for a route that does not write the colliding name: %s", l.Msg)
+	}
+}

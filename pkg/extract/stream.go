@@ -79,6 +79,7 @@ type Stream struct {
 
 	loc        *time.Location
 	assumeYear int
+	refTime    time.Time
 	tsIdx      int
 	lastTS     time.Time
 	// lastWall is when lastTS was observed, so a quiet stream can tell
@@ -297,7 +298,7 @@ func (s *Spec) NewStream(p *Profile, opts StreamOptions) (*Stream, error) {
 		})
 	}
 	return &Stream{
-		spec: s, profile: p, loc: loc, assumeYear: year, tsIdx: -1,
+		spec: s, profile: p, loc: loc, assumeYear: year, refTime: opts.RefTime, tsIdx: -1,
 		from: opts.From, to: opts.To,
 		multiline:           map[string]*mlBuffer{},
 		aggs:                map[string]*aggregator{},
@@ -540,10 +541,16 @@ func (st *Stream) Process(line string) ([]Result, error) {
 		line = trimToRune(line[:n])
 		st.Stats.Oversize++
 	}
-	ts, off, err := st.scanTimestamp(line)
-	if err != nil {
+	ts, body, tsErr := st.scanTimestamp(line)
+	if tsErr != nil {
+		body = line
+	}
+	if out, err, handled := st.joinContinuation(body, ts, tsErr); handled {
+		return out, err
+	}
+	if tsErr != nil {
 		st.Stats.TSParseErrors++
-		return nil, err
+		return nil, tsErr
 	}
 	st.lastTS, st.lastWall = ts, time.Now()
 	if !st.from.IsZero() && ts.Before(st.from) {
@@ -552,46 +559,65 @@ func (st *Stream) Process(line string) ([]Result, error) {
 	if !st.to.IsZero() && ts.After(st.to) {
 		return nil, nil
 	}
-	if off > 0 {
-		line = line[off:]
-	}
+	line = body
 
-	// Multiline handling: a start marker opens (or replaces) a buffered
-	// record; continuation lines append their nominated capture.
+	// A start marker opens (or replaces) a buffered record. Continuation
+	// lines were already absorbed above: they must not require a
+	// timestamp of their own, and scanTimestamp is the first thing this
+	// function used to do.
 	for _, m := range st.profile.Framing.Multiline {
-		if strings.Contains(line, m.StartContains) {
-			var out []Result
-			var err error
-			if buf, ok := st.multiline[m.StartContains]; ok {
-				// The span of the record this line closes is recorded
-				// before it is processed: from here on a replay must not
-				// start between its first and last line.
-				st.holdRecord(buf, 0)
-				// The verdict on the record this line just closed is
-				// returned, not discarded.
-				//
-				// A multiline record is almost always flushed by the next
-				// start marker, and this call used to report success for
-				// every one of them. The drivers turn that verdict into
-				// the pipeline's counters -- Progress.UnmatchedLines,
-				// TSParseErrors, ExtractErrors -- so a profile whose
-				// joined records matched no pattern reported "0
-				// unmatched" on the console, in the progress document and
-				// in the _mensura_ingest set, while the stream's own
-				// Stats (which only `check --sample` reads) counted every
-				// one. The line in hand has been buffered rather than
-				// judged, so it is owed no verdict of its own and this is
-				// the only one there is to give.
-				out, err = st.processBuffered(buf)
-			}
-			st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark, lastMark: st.mark}
-			return out, err
-		}
-		buf, ok := st.multiline[m.StartContains]
-		if !ok || m.continueRe == nil || !m.continueRe.MatchString(line) {
+		if !strings.Contains(line, m.StartContains) {
 			continue
 		}
-		if ts.Before(buf.ts) {
+		var out []Result
+		var err error
+		if buf, ok := st.multiline[m.StartContains]; ok {
+			// The span of the record this line closes is recorded
+			// before it is processed: from here on a replay must not
+			// start between its first and last line.
+			st.holdRecord(buf, 0)
+			// The verdict on the record this line just closed is
+			// returned, not discarded.
+			//
+			// A multiline record is almost always flushed by the next
+			// start marker, and this call used to report success for
+			// every one of them. The drivers turn that verdict into
+			// the pipeline's counters -- Progress.UnmatchedLines,
+			// TSParseErrors, ExtractErrors -- so a profile whose
+			// joined records matched no pattern reported "0
+			// unmatched" on the console, in the progress document and
+			// in the _mensura_ingest set, while the stream's own
+			// Stats (which only `check --sample` reads) counted every
+			// one. The line in hand has been buffered rather than
+			// judged, so it is owed no verdict of its own and this is
+			// the only one there is to give.
+			out, err = st.processBuffered(buf)
+		}
+		st.multiline[m.StartContains] = &mlBuffer{line: line, ts: ts, seen: time.Now(), mark: st.mark, lastMark: st.mark}
+		return out, err
+	}
+	return st.process(line, ts)
+}
+
+// joinContinuation absorbs a line that belongs to an open multiline
+// buffer. continue_regex is the only test the design applies to a
+// candidate continuation, so a stack frame with no timestamp of its own
+// still joins: requiring a timestamp first counted every one as a
+// parse error and left the start line's join capture empty.
+//
+// handled is true when this line was a continuation, whether or not it
+// contributed a capture. The caller must not then judge it as a record
+// of its own.
+func (st *Stream) joinContinuation(body string, ts time.Time, tsErr error) ([]Result, error, bool) {
+	for _, m := range st.profile.Framing.Multiline {
+		if strings.Contains(body, m.StartContains) {
+			continue
+		}
+		buf, ok := st.multiline[m.StartContains]
+		if !ok || m.continueRe == nil || !m.continueRe.MatchString(body) {
+			continue
+		}
+		if tsErr == nil && ts.Before(buf.ts) {
 			// The buffered record is emitted, not thrown away. Deleting
 			// it lost a whole record every time a continuation line
 			// carried an earlier timestamp -- which interleaved writers
@@ -611,11 +637,11 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			// writer produced a continuation line with an earlier
 			// timestamp. recordOutcome unwraps a join, so each sentinel
 			// still reaches the counter it belongs to.
-			return out, errors.Join(verdict, fmt.Errorf("extract: multiline record timestamps moved backwards"))
+			return out, errors.Join(verdict, fmt.Errorf("extract: multiline record timestamps moved backwards")), true
 		}
 		for i := range m.Join {
 			j := &m.Join[i]
-			if g := j.re.FindStringSubmatch(line); len(g) > j.Capture {
+			if g := j.re.FindStringSubmatch(body); len(g) > j.Capture {
 				// Capped the way a single record is. Appending without a
 				// bound let a stream of continuation lines grow one
 				// string for as long as the idle timeout allowed, with
@@ -634,7 +660,7 @@ func (st *Stream) Process(line string) ([]Result, error) {
 				if st.mark > buf.lastMark {
 					buf.lastMark = st.mark
 				}
-				return nil, nil
+				return nil, nil, true
 			}
 		}
 		// The line is a continuation -- continue_regex claimed it -- but
@@ -650,9 +676,9 @@ func (st *Stream) Process(line string) ([]Result, error) {
 			buf.lastMark = st.mark
 		}
 		st.Stats.Unjoined++
-		return nil, ErrNoJoin
+		return nil, ErrNoJoin, true
 	}
-	return st.process(line, ts)
+	return nil, nil, false
 }
 
 // Flush closes every open multiline buffer and aggregation window. Follow

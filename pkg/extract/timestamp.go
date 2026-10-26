@@ -22,48 +22,61 @@ var (
 )
 
 // scanTimestamp finds the timestamp in a record and returns it plus the
-// offset at which the record body starts.
+// record body: the original line, or the line with only the matched
+// timestamp removed when `strip: true`.
 //
 // The index of the format that matched is cached on the stream and tried
 // first next time, so the steady state is one regex match per record.
-func (st *Stream) scanTimestamp(line string) (time.Time, int, error) {
+func (st *Stream) scanTimestamp(line string) (time.Time, string, error) {
 	formats := st.profile.Timestamp.Formats
 	if st.tsIdx >= 0 {
-		if ts, off, err := st.tryFormat(st.tsIdx, line); err == nil {
-			return ts, off, nil
+		if ts, body, err := st.tryFormat(st.tsIdx, line); err == nil {
+			return ts, body, nil
 		}
 	}
 	for i := range formats {
 		if i == st.tsIdx {
 			continue
 		}
-		if ts, off, err := st.tryFormat(i, line); err == nil {
+		if ts, body, err := st.tryFormat(i, line); err == nil {
 			st.tsIdx = i
-			return ts, off, nil
+			return ts, body, nil
 		}
 	}
-	return time.Time{}, 0, ErrNoTimestamp
+	return time.Time{}, "", ErrNoTimestamp
 }
 
-func (st *Stream) tryFormat(i int, line string) (time.Time, int, error) {
+func (st *Stream) tryFormat(i int, line string) (time.Time, string, error) {
 	f := st.profile.Timestamp.Formats[i]
 	loc := f.re.FindStringIndex(line)
 	if loc == nil {
-		return time.Time{}, 0, ErrNoTimestamp
+		return time.Time{}, "", ErrNoTimestamp
 	}
 	if st.profile.Timestamp.Anchor == "prefix" && loc[0] != 0 {
-		return time.Time{}, 0, ErrNoTimestamp
+		return time.Time{}, "", ErrNoTimestamp
 	}
 	text := line[loc[0]:loc[1]]
-	ts, err := parseTimestamp(f.Layout, text, st.loc, st.assumeYear, st.lastTS)
+	ts, err := parseTimestamp(f.Layout, text, st.loc, st.assumeYear, st.lastTS, st.refTime)
 	if err != nil {
-		return time.Time{}, 0, err
+		return time.Time{}, "", err
 	}
-	off := 0
+	// The resolved year is the one subsequent year-less records should
+	// start from. Without this a follow that crossed New Year would wrap
+	// every January record against a frozen assumeYear of the previous
+	// year, and a six-month gap after the wrap would stop wrapping.
+	if y := ts.Year(); y != 0 {
+		st.assumeYear = y
+	}
+	body := line
 	if st.profile.Timestamp.Strip {
-		off = loc[1]
+		// Only the match is removed. Slicing from loc[1] also dropped
+		// everything *before* the timestamp, so `anchor: anywhere` plus
+		// `strip: true` turned "web1 app[42]: 2024-01-01T00:00:00Z n=5"
+		// into " n=5" and the pattern that searched for "app[" never
+		// saw it.
+		body = line[:loc[0]] + line[loc[1]:]
 	}
-	return ts, off, nil
+	return ts, body, nil
 }
 
 // epochMillis converts an epoch count in a declared unit to milliseconds.
@@ -105,7 +118,7 @@ func floorDiv(a, b int64) int64 {
 	return q
 }
 
-func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, prev time.Time) (time.Time, error) {
+func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, prev, ref time.Time) (time.Time, error) {
 	switch layout {
 	case "epoch_s", "epoch_ms", "epoch_us", "epoch_ns":
 		n, err := strconv.ParseInt(trimSpace(text), 10, 64)
@@ -123,15 +136,33 @@ func parseTimestamp(layout, text string, loc *time.Location, assumeYear int, pre
 		return time.Time{}, err
 	}
 	// A year-less layout (classic syslog) parses into year 0. Resolve it
-	// against the declared reference year, then roll back a year only for
-	// the shape a December-to-January wrap actually has: a jump of most
-	// of a year forward. A plain multi-day gap — a weekly cron log, a
-	// host that was off over a weekend — is ordinary and must not be
-	// thrown a year into the past.
+	// against the declared reference year, then wrap if the result is
+	// more than half a year away from the previous record (or, for the
+	// first record of a stream, from the reference time).
+	//
+	// The decrement — a jump of most of a year *forward* — is the
+	// December line of a file whose mtime is in January: applying the
+	// assumed year puts it eleven months ahead, so it is last December.
+	// The increment is the other half of the same wrap, and it was
+	// missing: a follow or a receive that stayed open across New Year
+	// saw "Jan  1" after "Dec 31" and dated it as last January, because
+	// that landing is in the *past* of the previous record and the
+	// decrement never fired. A plain multi-day gap — a weekly cron log,
+	// a host that was off over a weekend — is ordinary and must not be
+	// thrown a year in either direction.
 	if ts.Year() == 0 {
 		ts = ts.AddDate(assumeYear, 0, 0)
-		if !prev.IsZero() && ts.Sub(prev) > yearWrapThreshold {
-			ts = ts.AddDate(-1, 0, 0)
+		anchor := prev
+		if anchor.IsZero() {
+			anchor = ref
+		}
+		if !anchor.IsZero() {
+			switch {
+			case ts.Sub(anchor) > yearWrapThreshold:
+				ts = ts.AddDate(-1, 0, 0)
+			case anchor.Sub(ts) > yearWrapThreshold:
+				ts = ts.AddDate(1, 0, 0)
+			}
 		}
 	}
 	return ts, nil

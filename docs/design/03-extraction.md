@@ -100,9 +100,14 @@ timestamp:
     - layout: epoch_ms                        # or epoch_s, epoch_us, epoch_ns
       regex:  '^\d{13}'
   anchor: prefix                              # prefix | anywhere
-  strip: true                                 # remove the matched timestamp from the line
+  strip: true                                 # remove only the matched timestamp from the line
   on_parse_error: count                       # count (the only value implemented)
 ```
+
+`strip: true` removes **only** the matched timestamp. A timestamp in the
+middle of a record (`anchor: anywhere`) keeps the prefix; slicing from the
+end of the match used to drop it, so a pattern that searched for a token
+before the timestamp never saw the line.
 
 `drop-stream` and `fail` are **not implemented**, and the compiler refuses
 them rather than accepting the declaration and counting anyway: an
@@ -128,13 +133,20 @@ Behaviour:
   in the source is truncated, not rounded, and this is stated in the field
   catalogue.
 - Year-less formats (classic syslog) resolve the year per `assume_year`, with
-  a December→January rollover rule: if applying the assumed year produces a
-  timestamp more than **half a year** ahead of the previous record, the year
-  is decremented. The threshold is half a year rather than a day because
-  the two shapes it has to tell apart are a real wrap, which lands about
-  eleven months ahead, and an ordinary gap in the log — a weekly cron
-  file, a host that was off over a weekend. A day-wide threshold called
-  every one of those a wrap and threw the records a year into the past.
+  a December↔January rollover rule: if applying the assumed year produces a
+  timestamp more than **half a year** away from the previous record, the year
+  is stepped toward that record. The decrement is a December line of a file
+  whose mtime is in January: applying the assumed year puts it eleven months
+  ahead, so it is last December. The increment is a follow or receive that
+  stays open across New Year: "Jan  1" after "Dec 31" lands in the past of
+  the previous record, so it is next January. The first record of a stream
+  wraps the same way against the reference time (`file-mtime` or `now`), so
+  a batch whose first line is in December is not dated a year into the
+  future. The threshold is half a year rather than a day because the two
+  shapes it has to tell apart are a real wrap, which lands about eleven
+  months away, and an ordinary gap in the log — a weekly cron file, a host
+  that was off over a weekend. A day-wide threshold called every one of
+  those a wrap and threw the records a year in the wrong direction.
 
 ## 4. Framing
 
@@ -153,8 +165,11 @@ framing:
 
 Multiline semantics: a line containing
 `start_contains` opens (or replaces) a buffered record; subsequent lines
-matching `continue_regex` have the nominated capture group appended; a new
-start line, a timestamp regression, stream close, or `idle_timeout` flushes it.
+matching `continue_regex` have the nominated capture group appended, and
+do not need a timestamp of their own — `continue_regex` is the only test
+applied to a candidate continuation, so a stack frame is still joined;
+a new start line, a timestamp regression, stream close, or `idle_timeout`
+flushes it.
 
 Both numbers are validated at compile time, because both fail *open* rather
 than closed. `max_record_bytes` is read everywhere as `n > 0`, so a negative

@@ -1096,6 +1096,32 @@ func patternCaptureNames(pat *Pattern) []string {
 	return out
 }
 
+// patternBranch is one destination a pattern can write, with the captures
+// that branch actually produces. A route does not inherit the parent
+// extract groups: process() uses the matching regex's own names.
+type patternBranch struct {
+	set      string
+	captures []string
+}
+
+// patternBranches lists the destinations a pattern can write, using the
+// same rule Declarations does: `set:` only when an `extract:` regex can
+// match, plus one per route.
+func patternBranches(pat *Pattern) []patternBranch {
+	var out []patternBranch
+	if len(pat.extract) > 0 {
+		var caps []string
+		for _, re := range pat.extract {
+			caps = append(caps, re.SubexpNames()...)
+		}
+		out = append(out, patternBranch{pat.Set, caps})
+	}
+	for i := range pat.Route {
+		out = append(out, patternBranch{pat.Route[i].Set, pat.Route[i].re.SubexpNames()})
+	}
+	return out
+}
+
 func (b *BucketSet) compile() error {
 	if b.Name == "" || len(b.Buckets) == 0 {
 		return fmt.Errorf("bucket set needs a name and buckets")
@@ -1421,25 +1447,7 @@ func (p *Profile) Declarations() []SetDeclaration {
 		if pat.Aggregate != nil {
 			shared = append(shared, pat.Aggregate.Field)
 		}
-		// One destination per branch, each with the captures that branch
-		// can actually produce. A pattern with no `extract:` never
-		// writes pat.Set, so it is not a destination at all.
-		type branch struct {
-			set      string
-			captures []string
-		}
-		var branches []branch
-		if len(pat.extract) > 0 {
-			var caps []string
-			for _, re := range pat.extract {
-				caps = append(caps, re.SubexpNames()...)
-			}
-			branches = append(branches, branch{pat.Set, caps})
-		}
-		for i := range pat.Route {
-			branches = append(branches, branch{pat.Route[i].Set, pat.Route[i].re.SubexpNames()})
-		}
-		for _, b := range branches {
+		for _, b := range patternBranches(pat) {
 			if b.set == "" {
 				continue
 			}
